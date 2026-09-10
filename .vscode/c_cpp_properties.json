@@ -1,0 +1,29 @@
+{
+    "version": 4,
+    "configurations": [
+        {
+            "name": "Win32",
+            "compileCommands": [
+                "${workspaceFolder}/build/compile_commands.json"
+            ],
+            "compilerPath": "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.41.34120/bin/Hostx64/x64/cl.exe",
+            "includePath": [
+                "${workspaceFolder}/cella_storage/include",
+                "${workspaceFolder}/cella_storage/include/cella/storage/api",
+                "${workspaceFolder}/cella_storage/include/cella/storage/common",
+                "${workspaceFolder}/cella_storage/include/cella/storage/table",
+                "${workspaceFolder}/cella_storage/src",
+                "${workspaceFolder}/cella_storage/tests",
+                "${workspaceFolder}/cella_sql/include",
+                "${workspaceFolder}/cella_sql/src",
+                "${workspaceFolder}/cella_db/include",
+                "${workspaceFolder}/cella_db/src",
+                "${workspaceFolder}/cella_db/tests"
+            ],
+            "defines": [],
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "windows-msvc-x64"
+        }
+    ]
+}

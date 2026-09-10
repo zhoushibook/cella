@@ -1,0 +1,23 @@
+[1/23] Building CXX object CMakeFiles\cella_storage.dir\src\cella\storage\page\meta_page.cpp.obj
+[2/23] Building CXX object CMakeFiles\cella_storage.dir\src\cella\storage\disk\mem_disk_manager.cpp.obj
+[3/23] Building CXX object CMakeFiles\cella_storage.dir\src\cella\storage\page\page.cpp.obj
+[4/23] Building CXX object CMakeFiles\cella_storage.dir\src\cella\storage\table\table_iterator.cpp.obj
+[5/23] Building CXX object CMakeFiles\cella_storage.dir\src\cella\storage\page\slotted_page_layout.cpp.obj
+[6/23] Building CXX object CMakeFiles\cella_storage.dir\src\cella\storage\table\table_heap.cpp.obj
+[7/23] Building CXX object CMakeFiles\cella_storage.dir\src\cella\storage\buffer\replacer_factory.cpp.obj
+[8/23] Building CXX object CMakeFiles\cella_storage.dir\src\cella\storage\common\logger.cpp.obj
+[9/23] Building CXX object CMakeFiles\cella_storage.dir\src\cella\storage\record\slotted_record_serializer.cpp.obj
+[10/23] Building CXX object CMakeFiles\cella_storage.dir\src\cella\storage\disk\file_disk_manager.cpp.obj
+[11/23] Building CXX object CMakeFiles\storage_tests.dir\tests\test_common.cpp.obj
+[12/23] Building CXX object CMakeFiles\storage_tests.dir\tests\test_buffer.cpp.obj
+[13/23] Building CXX object CMakeFiles\storage_tests.dir\tests\test_record_table.cpp.obj
+[14/23] Building CXX object CMakeFiles\crud_flow.dir\examples\crud_flow.cpp.obj
+[15/23] Building CXX object CMakeFiles\quickstart.dir\examples\quickstart.cpp.obj
+[16/23] Building CXX object CMakeFiles\cella_storage.dir\src\cella\storage\api\file_storage.cpp.obj
+[17/23] Building CXX object CMakeFiles\storage_tests.dir\tests\test_persistence.cpp.obj
+[18/23] Building CXX object CMakeFiles\storage_demo.dir\demo\storage_demo.cpp.obj
+[19/23] Linking CXX static library cella_storage.lib
+[20/23] Linking CXX executable quickstart.exe
+[21/23] Linking CXX executable storage_demo.exe
+[22/23] Linking CXX executable storage_tests.exe
+[23/23] Linking CXX executable crud_flow.exe

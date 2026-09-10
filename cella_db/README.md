@@ -1,0 +1,202 @@
+# cella_db —— 数据库层与整合层
+
+把 `cella_sql`（编译器前端）与 `cella_storage`（页式存储 + 缓冲池）连成一个能跑的数据库系统。
+本模块是**唯一**同时依赖两者的地方：编译器不认识存储，存储不认识 SQL。
+
+职责一览：
+
+| 组件 | 职责 |
+| --- | --- |
+| `DbEngine` | 门面：生命周期、组件装配（存储/目录/锁/事务/执行器）、诊断接口 |
+| `Session` | 会话：逐条语句调度、事务上下文、错误与回滚策略 |
+| `Executor` | 计划驱动执行：算子 → 存储调用；内存内做过滤/投影/连接/排序/分页 |
+| `ExprEval` | 表达式求值：类型提升、NULL 三值逻辑 |
+| `CatalogManager` | 表元数据（列/类型/长度/NOT NULL/首数据页）持久化与查询 |
+| `LockManager` | 表级 S/X 锁、条件变量等待、实时等待图死锁检测 |
+| `TxnManager` | 事务号、提交/回滚、语句级回滚水位、审计日志 |
+
+---
+
+## 1. 构建与运行
+
+```powershell
+# 在仓库根目录
+powershell -ExecutionPolicy Bypass -File build.ps1
+# 或整体验证（含三层测试与示例）
+powershell -ExecutionPolicy Bypass -File run_all.ps1
+```
+
+产物：`build/cella_db/cella_db.exe`、`cella_db_tests.exe`、`api_quickstart.exe`、`concurrency_demo.exe`
+
+---
+
+## 2. CLI 用法
+
+```
+用法: cella_db [选项] [SQL 文件 ...]
+
+  --data DIR          数据目录（默认 ./cella_data）
+  -f, --file FILE     执行 SQL 脚本（可重复；也可直接作为位置参数）
+  --db FILE           数据库文件名（默认 cella.db）
+  --page-size N       页大小字节数（2 的幂，默认 4096）
+  --pool N            缓冲池帧数（默认 64）
+  --replacer NAME     替换策略 LRU|FIFO|CLOCK（默认 LRU）
+  --log LEVEL         日志级别 debug|info|warn|error|off（默认 info）
+  --log-console       日志同时输出到控制台
+  --lock-timeout MS   锁等待超时毫秒（默认 5000）
+  --no-journal        不写事务审计日志
+  --checkpoint-on-commit  每次提交都把数据文件落盘（更安全，但更慢）
+  -v, --verbose       打印执行计划、算子调用次数、事务号
+  --show-plan         只编译并打印计划，不真正执行
+  --echo              回显每条语句
+  --timing            打印每条语句耗时
+  --stats             退出前打印缓冲池统计
+  -h, --help          帮助
+```
+
+退出码：`0` 全部成功；`1` 存在编译或执行失败；`2` 用法错误。
+
+```powershell
+# 交互式终端
+.\build\cella_db\cella_db.exe --data .\mydb
+
+# 跑脚本 + 打印计划 + 缓冲池统计
+.\build\cella_db\cella_db.exe --data .\mydb -f cella_db\sql\demo_query.sql --stats
+
+# 小缓冲池观察淘汰行为
+.\build\cella_db\cella_db.exe --data .\mydb --pool 4 --replacer CLOCK --stats -f cella_db\sql\demo_basic.sql
+```
+
+### REPL 元命令
+
+| 命令 | 作用 |
+| --- | --- |
+| `\?` / `\h` | 帮助 |
+| `\q` | 退出 |
+| `\d` | 列出所有表（含表号与首数据页） |
+| `\d 表名` | 显示表结构 |
+| `\plan <SQL>` | 只编译并打印计划（优化前 / 优化后对比） |
+| `\stats` | 缓冲池统计（命中率、淘汰、page_alloc/free） |
+| `\locks` | 当前锁表（持有者 / 等待者） |
+| `\waitfor` | 实时等待图（死锁检测依据） |
+| `\txn` | 事务表与提交/回滚计数 |
+| `\checkpoint` | 立即把数据文件落盘（存盘点） |
+| `\timing on\|off` | 打印每条语句耗时 |
+| `\echo on\|off` | 回显每条语句 |
+
+---
+
+## 3. SQL 方言（沿用编译器方言）
+
+| cella | 标准 SQL | | cella | 标准 SQL |
+| --- | --- | --- | --- | --- |
+| `get` | SELECT | | `join` / `on` | JOIN / ON |
+| `in` | FROM | | `left` / `right` / `middle` | 外连接 / 内连接 |
+| `limit` | WHERE | | `union` | UNION |
+| `grouped` | GROUP BY | | `distinct` | DISTINCT |
+| `having` | HAVING | | `as` | AS |
+| `ordered` | ORDER BY | | `among` | LIMIT 行数 |
+| `page 页码, 每页行数` | 分页 | | | |
+
+事务控制（编译器不识别，由会话拦截）：`BEGIN;` / `COMMIT;` / `ROLLBACK;`
+（也接受 `START TRANSACTION` / `END`）。
+
+> 注意：`GROUP BY`（`grouped`）在本方言里**没有聚合函数**（未定义 COUNT/SUM），
+> 因此实现为「按分组键去重，每组保留首行」，配合 `having` 使用。
+> 已知简化与边界见 [docs/INTEGRATION.md §6](docs/INTEGRATION.md)。
+
+---
+
+## 4. 错误码
+
+| 段 | 码 | 说明 |
+| --- | --- | --- |
+| 编译器 | `LEX-1xx` / `SYN-2xx` / `SEM-3xx` / `PLN-4xx` | 词法 / 语法 / 语义 / 计划（原样透传） |
+| 目录·执行 | `DB-501` | SQL 编译失败（携带编译器诊断原文） |
+| | `DB-502` / `DB-503` | 表不存在 / 表已存在 |
+| | `DB-504` / `DB-509` | 列不存在 / 目录与数据文件不一致 |
+| | `DB-505` / `DB-506` / `DB-507` / `DB-508` | 类型不匹配 / NOT NULL 违约 / 值个数不符 / 文本超长 |
+| | `DB-510` / `DB-511` | 记录超页 / 除零 |
+| | `DB-520` | 存储层返回失败（消息里附原始存储码） |
+| 事务·并发 | `DB-601` / `DB-602` | 无活动事务 / 重复 BEGIN |
+| | `DB-603` / `DB-604` / `DB-605` | 事务已中止 / 死锁（牺牲者）/ 锁等待超时 |
+| 目录·会话 | `DB-701` / `DB-702` / `DB-703` / `DB-704` | 目录文件错 / 会话状态错 / 未实现 / 内部错误 |
+
+---
+
+## 5. C++ API（30 秒速览）
+
+```cpp
+#include "cella/db/engine/db_engine.h"
+
+cella::db::EngineConfig cfg;
+cfg.data_dir = "./mydb";
+cfg.pool_size = 64;
+cfg.replacer = "LRU";
+
+cella::db::DbEngine engine;
+if (!engine.Open(cfg).ok()) { /* 处理错误 */ }
+
+cella::db::ScriptReport report;
+engine.default_session().Execute(
+    "CREATE TABLE t(id INT NOT NULL, v VARCHAR(16));"
+    "INSERT INTO t VALUES (1,'a'),(2,'b');"
+    "get id, v in t ordered id desc;",
+    &report);
+
+for (const auto& s : report.statements) {
+    std::cout << "[" << s.kind << "] ";
+    if (!s.status.ok())            std::cout << s.status.ToString() << "\n";
+    else if (s.result.IsQuery())   std::cout << "\n" << s.result.ToText() << "\n";
+    else                           std::cout << s.result.Summary() << "\n";
+}
+
+engine.Close();
+```
+
+完整示例见 [`examples/api_quickstart.cpp`](examples/api_quickstart.cpp)；
+多线程与死锁演示见 [`examples/concurrency_demo.cpp`](examples/concurrency_demo.cpp)。
+
+### 关键类型
+
+| 类型 | 说明 |
+| --- | --- |
+| `DbStatus` | `[[nodiscard]]` 统一返回状态（错误码 + 说明） |
+| `ScriptReport` | 一次调用的整体汇报：`statements[]`（每条含状态/结果/计划/耗时/事务号）+ 汇总 |
+| `StatementOutcome` | 单条语句：`kind`、`compiled`、`executed`、`auto_committed`、`rolled_back_here`、`implicit_commit`、`notice`、`plan_text`、`original_plan_text`、`operator_calls` |
+| `QueryResult` | `columns[]` + `rows[][]` + `affected` + `tag`，`ToText()` 输出对齐表格 |
+
+---
+
+## 6. 测试
+
+```powershell
+# 全部用例
+.\build\cella_db\cella_db_tests.exe
+
+# 按名字过滤（中文子串）
+.\build\cella_db\cella_db_tests.exe 事务
+
+# 同时写日志文件
+.\build\cella_db\cella_db_tests.exe --log .\build\test_report.log
+```
+
+当前：**70 用例 / 579 断言 / 0 失败**，明细见 [docs/TEST_REPORT.md](docs/TEST_REPORT.md)。
+
+---
+
+## 7. 目录
+
+```
+include/cella/db/
+  common/   db_status.h  db_logger.h  time_util.h  value_bridge.h
+  catalog/  catalog_manager.h
+  exec/     executor.h  expr_eval.h  row_set.h  query_result.h
+  txn/      transaction.h  lock_manager.h
+  engine/   db_engine.h  sql_text.h
+src/cella/db/   与头文件一一对应的实现
+sql/            demo_basic.sql  demo_query.sql  demo_txn.sql
+examples/       api_quickstart.cpp  concurrency_demo.cpp
+tests/          mini_test.h  test_util.h  test_main.cpp  test_{common,catalog,exec,txn,concurrency,e2e}.cpp
+docs/           INTEGRATION.md  ARCHITECTURE.md  TEST_REPORT.md
+```

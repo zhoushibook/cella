@@ -1,0 +1,12 @@
+CreateTable
+  table: student
+  columns: id INT, name VARCHAR(255), age INT, score INT
+
+Project [name]
+  Filter (age > 18 AND score < 90)
+    SeqScan [student]
+
+Insert
+  table: student
+  columns: id, name, age, score
+  rows: [1, 'Alice', 20, 85]

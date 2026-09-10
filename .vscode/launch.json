@@ -1,0 +1,68 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "调试: cella_db 完整系统 (CLI)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build_dbg/cella_db/cella_db.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}/build_dbg/cella_db",
+      "environment": [],
+      "console": "integratedTerminal",
+      "preLaunchTask": "build: 调试 Debug (Ninja → build_dbg)"
+    },
+    {
+      "name": "调试: cella_db 整合层测试",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build_dbg/cella_db/cella_db_tests.exe",
+      "args": [
+        "--log",
+        "${workspaceFolder}/build_dbg/test_report.log"
+      ],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}/build_dbg/cella_db",
+      "environment": [],
+      "console": "integratedTerminal",
+      "preLaunchTask": "build: 调试 Debug (Ninja → build_dbg)"
+    },
+    {
+      "name": "调试: 存储单元测试 (storage_tests)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build_dbg/cella_storage/storage_tests.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}/build_dbg/cella_storage",
+      "environment": [],
+      "console": "integratedTerminal",
+      "preLaunchTask": "build: 调试 Debug (Ninja → build_dbg)"
+    },
+    {
+      "name": "调试: 存储完整演示 (storage_demo)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build_dbg/cella_storage/storage_demo.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}/cella_storage",
+      "environment": [],
+      "console": "integratedTerminal",
+      "preLaunchTask": "build: 调试 Debug (Ninja → build_dbg)"
+    },
+    {
+      "name": "调试: SQL 编译器 (cella_sql)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build_dbg/cella_sql/cella_sql.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "console": "integratedTerminal",
+      "preLaunchTask": "build: 调试 Debug (Ninja → build_dbg)"
+    }
+  ]
+}

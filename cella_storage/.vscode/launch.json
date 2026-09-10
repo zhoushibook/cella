@@ -1,0 +1,53 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "调试: 单元测试 (storage_tests)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build_vscode/storage_tests.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}/build_vscode",
+      "environment": [],
+      "console": "integratedTerminal",
+      "preLaunchTask": "build: debug (Ninja → build_vscode)"
+    },
+    {
+      "name": "调试: 完整演示 (storage_demo)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build_vscode/storage_demo.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "console": "integratedTerminal",
+      "preLaunchTask": "build: debug (Ninja → build_vscode)"
+    },
+    {
+      "name": "调试: 30 秒上手 (quickstart)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build_vscode/quickstart.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}/build_vscode",
+      "environment": [],
+      "console": "integratedTerminal",
+      "preLaunchTask": "build: debug (Ninja → build_vscode)"
+    },
+    {
+      "name": "调试: 全流程示例 (crud_flow)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build_vscode/crud_flow.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}/build_vscode",
+      "environment": [],
+      "console": "integratedTerminal",
+      "preLaunchTask": "build: debug (Ninja → build_vscode)"
+    }
+  ]
+}

@@ -1,0 +1,67 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build: debug (Ninja → build_vscode)",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "Import-Module 'C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\Common7\\Tools\\Microsoft.VisualStudio.DevShell.dll'; Enter-VsDevShell -VsInstallPath 'C:\\Program Files\\Microsoft Visual Studio\\2022\\Community' -SkipAutomaticLocation -DevCmdArguments '-arch=x64'; & 'C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe' -S '${workspaceFolder}' -B '${workspaceFolder}\\build_vscode' -G Ninja -DCMAKE_MAKE_PROGRAM='C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\Ninja\\ninja.exe' -DCMAKE_CXX_COMPILER=cl -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; & 'C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe' --build '${workspaceFolder}\\build_vscode' --parallel"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$msCompile"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      }
+    },
+    {
+      "label": "build: release (脚本 → build_ninja)",
+      "type": "shell",
+      "command": "${workspaceFolder}\\scripts\\build_msvc.bat",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$msCompile"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "run: 单元测试",
+      "type": "shell",
+      "command": "${workspaceFolder}\\build_vscode\\storage_tests.exe",
+      "options": {
+        "cwd": "${workspaceFolder}/build_vscode"
+      },
+      "dependsOn": "build: debug (Ninja → build_vscode)",
+      "problemMatcher": []
+    },
+    {
+      "label": "run: 完整演示",
+      "type": "shell",
+      "command": "${workspaceFolder}\\build_vscode\\storage_demo.exe",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "dependsOn": "build: debug (Ninja → build_vscode)",
+      "problemMatcher": []
+    }
+  ]
+}
