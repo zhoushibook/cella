@@ -27,6 +27,16 @@ $ninjaDir = Join-Path $vsRoot "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninj
 
 if (-not (Test-Path $BuildDir)) { New-Item -ItemType Directory -Path $BuildDir | Out-Null }
 
+# Normalize PATH env-var casing: some managed environments inject a lowercase
+# "path", which makes Enter-VsDevShell throw "duplicate key Path/PATH" and
+# Start-Process fail ("An item with the same key has already been added").
+# Removing and re-adding with canonical casing fixes both.
+$procPath = [Environment]::GetEnvironmentVariable('path', 'Process')
+if ($null -ne $procPath) {
+    [Environment]::SetEnvironmentVariable('path', $null, 'Process')
+    [Environment]::SetEnvironmentVariable('Path', $procPath, 'Process')
+}
+
 Import-Module $devShell
 Enter-VsDevShell -VsInstallPath $vsRoot -SkipAutomaticLocation -DevCmdArguments "-arch=x64" | Out-Null
 $env:PATH = "$ninjaDir;$env:PATH"
