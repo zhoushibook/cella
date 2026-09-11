@@ -371,10 +371,6 @@ int main(int argc, char** argv) {
     std::cerr << "打开数据库失败: " << open_status.ToString() << "\n";
     return 1;
   }
-  // 启动时若发现「目录与数据文件不一致」并已自动修复，必须明确告知用户
-  if (engine.has_recoveries()) {
-    std::cout << "!! " << engine.RecoveryReport();
-  }
 
   int rc = 0;
   size_t ok = 0;

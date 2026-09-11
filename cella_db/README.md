@@ -114,7 +114,7 @@ powershell -ExecutionPolicy Bypass -File run_all.ps1
 | 编译器 | `LEX-1xx` / `SYN-2xx` / `SEM-3xx` / `PLN-4xx` | 词法 / 语法 / 语义 / 计划（原样透传） |
 | 目录·执行 | `DB-501` | SQL 编译失败（携带编译器诊断原文） |
 | | `DB-502` / `DB-503` | 表不存在 / 表已存在 |
-| | `DB-504` / `DB-509` | 列不存在 / 目录与数据文件不一致 |
+| | `DB-504` / `DB-512` | 列不存在 / 系统表禁止修改（只读） |
 | | `DB-505` / `DB-506` / `DB-507` / `DB-508` | 类型不匹配 / NOT NULL 违约 / 值个数不符 / 文本超长 |
 | | `DB-510` / `DB-511` | 记录超页 / 除零 |
 | | `DB-520` | 存储层返回失败（消息里附原始存储码） |
@@ -181,7 +181,7 @@ engine.Close();
 .\build\cella_db\cella_db_tests.exe --log .\build\test_report.log
 ```
 
-当前：**70 用例 / 579 断言 / 0 失败**，明细见 [docs/TEST_REPORT.md](docs/TEST_REPORT.md)。
+当前：**75 用例 / 616 断言 / 0 失败**，明细见 [docs/TEST_REPORT.md](docs/TEST_REPORT.md)。
 
 ---
 

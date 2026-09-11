@@ -117,11 +117,6 @@ class DbEngine {
   // StatsText 里累计历史值，观测不丢）。
   DbStatus Checkpoint();
 
-  // 启动时的自愈记录（目录与数据文件不一致并已自动修复时非空）
-  const std::vector<std::string>& recoveries() const { return recoveries_; }
-  bool has_recoveries() const { return !recoveries_.empty(); }
-  std::string RecoveryReport() const;
-
   const EngineConfig& config() const { return config_; }
   CatalogManager& catalog() { return catalog_; }
   LockManager& locks() { return *locks_; }
@@ -130,8 +125,6 @@ class DbEngine {
 
   // 诊断文本
   std::string StatsText();
-  // 目录与数据文件不一致时的自愈（Open 内部调用）
-  DbStatus ReconcileCatalogWithStorage();
   std::string LockText() const;
   std::string WaitForGraphText() const;
   std::string TxnText() const;
@@ -159,8 +152,6 @@ class DbEngine {
   // 存盘点会重建缓冲池（统计计数器清零），故把历史值累计在此，保证观测连续
   storage::BufferStats stats_before_checkpoints_;
   uint32_t checkpoint_count_ = 0;
-  // 启动时自愈记录
-  std::vector<std::string> recoveries_;
 };
 
 // ── 会话：一条 SQL 执行链路 ─────────────────────────────────

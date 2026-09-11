@@ -36,7 +36,7 @@
 | `include/cella/db/txn/` | 事务与锁 | ✅ |
 | `include/cella/db/engine/` | 门面、会话、SQL 文本工具 | ✅ |
 | `src/cella/db/**` | 与头文件一一对应的实现 | ❌ |
-| `tests/` | mini_test + 6 个测试文件（70 用例） | ❌ |
+| `tests/` | mini_test + 6 个测试文件（75 用例） | ❌ |
 | `examples/` | API 速览 + 并发现场演示 | ❌ |
 | `sql/` | 3 个可执行演示脚本 | ❌ |
 
@@ -206,17 +206,17 @@ BlockerLocked(txn) : txn 的待满足请求与当前锁表冲突的持有者集�
 
 ### 4.8 持久化与「存盘点」（Checkpoint）
 
-存储层没有 WAL，脏页只在 `Close()` 时 `FlushAllPages` 落盘；而数据库层的
-`catalog.meta` 在 DDL 时**立即**写盘。两者的持久性不对称，进程被强杀（关终端窗口 /
-Ctrl-C / 崩溃）后会出现「目录有表、数据文件没表」。
+存储层没有 WAL，脏页只在 `Close()` 时 `FlushAllPages` 落盘。目录（系统表 `cella_catalog`）
+与用户数据现在都住在同一个 `cella.db` 里、走同一条页式持久化路径，所以「目录有表、
+数据文件没表」这类**结构性不一致已不存在**——但 DDL 若不在进程被强杀前落盘，整张表
+（目录行 + 物理表目录）会一起丢。
 
-为此数据库层做了三点：
+为此数据库层保留了两点：
 
 | 机制 | 行为 |
 | --- | --- |
 | `DbEngine::Checkpoint()` | 用公开接口 `Close()+Open()` 组合实现一次「存盘」（`IStorage` 没有 flush-all），调用期间独占存储互斥量 |
-| DDL 后自动存盘 | `Session` 在 `CREATE/DROP TABLE` 自动提交成功后立刻 `Checkpoint()`，保证「目录里有的表，数据文件里也有」 |
-| 启动自愈 | `Open()` 发现目录里的表在数据文件里缺失时，**按目录结构重建该表**（记入 `recoveries_` 并告警），而不是报 DB-509 拒绝打开——数据库永远可打开，代价是这类表的数据不可恢复 |
+| DDL 后自动存盘 | `Session` 在 `CREATE/DROP TABLE` 自动提交成功后立刻 `Checkpoint()`，保证 DDL 的效果立即持久化 |
 
 数据（DML）默认仍是「干净退出才落盘」；需要更严格时可开启 `--checkpoint-on-commit`
 （每次提交都存盘），或在 REPL 里用 `\checkpoint` 手动触发。存盘点会重建缓冲池
@@ -270,7 +270,7 @@ OpSort   排序（可见列优先解析，解析不到才用隐藏列），最�
 | `LEX/SYN/SEM/PLN-xxx` | 编译器诊断（原样透传） | `SEM-307 不能向 NOT NULL 列插入 NULL` |
 | `DB-5xx` | 目录/执行 | `DB-502 表不存在`、`DB-505 类型不匹配`、`DB-508 文本超长`、`DB-511 除零` |
 | `DB-6xx` | 事务/并发 | `DB-601 无活动事务`、`DB-602 重复 BEGIN`、`DB-604 死锁`、`DB-605 锁超时` |
-| `DB-7xx` | 目录/会话/CLI | `DB-701 目录文件格式错误`、`DB-702 会话状态错误`、`DB-703 未实现`、`DB-704 内部错误` |
+| `DB-7xx` | 目录/会话/CLI | `DB-701 目录操作失败`、`DB-702 会话状态错误`、`DB-703 未实现`、`DB-704 内部错误` |
 
 `DbStatus` 带 `[[nodiscard]]`，忽略返回值即编译告警（与存储层 `Status` 一致）。
 存储层错误经 `FromStorage()` 映射，**保留原始信息**（消息里附 `[存储: ...]`）。
@@ -314,7 +314,7 @@ OpSort   排序（可见列优先解析，解析不到才用隐藏列），最�
 | 产物 | 说明 |
 | --- | --- |
 | `build/cella_db/cella_db.exe` | 完整系统 CLI（REPL / 脚本 / 元命令） |
-| `build/cella_db/cella_db_tests.exe` | 70 用例 / 579 断言 |
+| `build/cella_db/cella_db_tests.exe` | 75 用例 / 616 断言 |
 | `build/cella_db/api_quickstart.exe` | 30 秒 API 速览 |
 | `build/cella_db/concurrency_demo.exe` | 并发与死锁现场演示 |
 | `build/cella_sql/cella_sql.exe` | 原编译器 CLI（保留，行为不变） |

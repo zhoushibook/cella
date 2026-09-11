@@ -160,12 +160,14 @@ CatalogManager（权威）──ToCompilerCatalog()──▶ cella::CELLA_Catalo
         └──ToStorageSchema()──▶ storage::Schema（建表时下发给存储层）
 ```
 
-* 启动时 `CatalogManager::Load` 读 `<data_dir>/catalog.meta`；
-  随后对每张表调用 `IStorage::open_table` **互相校验**，缺失即报 **DB-509**（目录与数据文件不一致）。
+* 启动时 `DbEngine::Open()` bootstrap 系统表 `cella_catalog`（试探 `open_table` → 加载或创建）；
+  随后 `CatalogManager::LoadFromStorage()` 全表扫描重建内存目录，并逐表 `open_table` 校验、
+  补 `first_page_id`，物理表已不存在的陈旧条目直接剔除并告警。
 * 每条语句执行完毕后 `Session` 用 `CatalogManager::ToCompilerCatalog()` 重建
   `cella::CELLA_Catalog`，因此 `CREATE TABLE` 对后续语句立即可见，且语义阶段的目录突变
   不会污染权威目录。
-* 目录文件写入采用「临时文件 + 原子改名」，格式为带版本头的行式文本（`CELLA-CATALOG 1`）。
+* 目录持久化在 `cella.db` 内的系统表（一行一张用户表），与数据走同一条页式持久化路径；
+  旧版文本目录 `catalog.meta` 仅在启动时做一次迁移（读旧文本 → 写系统表 → 改名留档）。
 
 ---
 
@@ -282,8 +284,8 @@ BlockersLocked(txn) = { 与 txn 的待满足请求冲突的持有者 }
 | 6 | `GROUP BY` 无聚合函数 | 本方言未定义 `COUNT/SUM`，故实现为「按分组键去重，每组保留首行」 |
 | 7 | `UNION` 两臂列数不一致 | 编译器不校验（原设计），执行层按左臂对齐、不足补 `NULL` 并告警 |
 | 8 | 持久化 = 缓冲池刷盘 + 审计日志 | 事务提交默认不强制 `fsync`；`journal.log` 是审计轨迹，**不是**完整 ARIES/WAL 恢复。DDL 在自动提交后**立即存盘**；其余数据默认只在 `Close()`（干净退出）落盘，也可用 `\checkpoint` / `--checkpoint-on-commit` 手动保证 |
-| 8b | 目录与数据文件不一致 → 自愈 | `catalog.meta` 在 DDL 时立即写盘，而存储层表目录要到 `Close()` 才随页刷出，进程被强杀后两者会不一致。启动时不再报 DB-509 拒绝打开，而是按目录结构重建缺失的表并告警（数据不可恢复、结构保住） |
-| 9 | DDL 隐式提交前置事务 | 建表/删表立即改写目录文件，元数据不可回滚；避免「数据回滚、目录已变」的不一致 |
+| 8b | 目录 = 系统表（已随本次重构解决） | 目录由独立文本 `catalog.meta` 改为页式存储里的系统表 `cella_catalog`，与数据同文件同路径，`DB-509` 类「目录/数据不一致」已从机制上消失（旧文本只在启动时一次性迁移） |
+| 9 | DDL 隐式提交前置事务 | 建表/删表立即写目录行 + 存盘，元数据不可回滚；避免「数据回滚、目录已变」的不一致 |
 | 10 | `ORDER BY` 未投影列 | 计划形状固定为 `Project → Distinct → Sort`，执行期用「隐藏排序列」通道实现合法语义（详见 ARCHITECTURE.md §5.3） |
 | 11 | `CatalogTable::first_page_id` | `IStorage` 未导出「首数据页」查询，建表后用 `open_table` 句柄补齐，仅作诊断展示 |
 | 12 | 事务表只增不删 | `TxnManager` 保留已结束事务用于诊断；长期运行的进程需要定期重置（未来可加回收） |

@@ -27,6 +27,7 @@ enum class DbCode {
   kUnknownColumn,       // DB-509 目录元数据与存储 schema 不一致
   kRecordTooLarge,      // DB-510 记录超出单页容量
   kDivisionByZero,      // DB-511 表达式求值除零
+  kSystemTableProtected,// DB-512 系统表禁止修改（只读）
 
   // —— 存储层透传（DB-5xx）——
   kStorageError,        // DB-520 存储引擎返回失败（message 携带原始码）

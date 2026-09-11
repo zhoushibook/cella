@@ -250,27 +250,26 @@ MT_TEST(事务_会话状态行) {
   MT_CHECK(e.session().StatusLine().find("自动提交") != std::string::npos);
 }
 
-MT_TEST(事务_目录与数据文件不一致时自愈) {
-  Engine e("txn_selfheal");
+MT_TEST(事务_目录与数据同在单文件_删文件即空库) {
+  Engine e("txn_noselfheal");
   SeedAccounts(&e);
   MT_CHECK(e.Run("BEGIN;INSERT INTO account VALUES (9,900);COMMIT;").all_ok());
-  e.Close();  // 干净关闭：数据文件与目录一致
+  e.Close();  // 干净关闭
 
-  // 模拟「进程被强杀后目录有表、数据文件里没表」：删掉数据文件、保留 catalog.meta
+  // 目录与数据现在同在 cella.db 一个文件里，不再有 catalog.meta。
+  // 删掉数据文件 → 重开得到一个全新的空库（系统表自动重建），
+  // 不会再报 DB-509，也不需要「自愈重建」这种会丢数据的兜底。
   const std::string db_path = e.cfg.data_dir + "/" + e.cfg.db_file;
   std::error_code ec;
   MT_CHECK(std::filesystem::remove(db_path, ec));
 
-  // 重新打开：必须自愈而不是 DB-509 拒绝打开
   MT_CHECK(e.Reopen());
-  MT_CHECK(e.engine.has_recoveries());
-  MT_CHECK(e.engine.RecoveryReport().find("account") != std::string::npos);
-  // 表结构保住（空表），后续可继续写入
-  MT_CHECK(e.engine.catalog().FindTable("account") != nullptr);
-  const ScriptReport q = e.Run("get id in account;");
-  MT_CHECK(q.all_ok());
-  MT_EQ(q.statements[0].result.rows.size(), 0u);
-  MT_CHECK(e.Run("INSERT INTO account VALUES (1,100);").all_ok());
+  MT_CHECK(e.engine.catalog().FindTable("account") == nullptr);
+  MT_CHECK(e.engine.catalog().FindTable("cella_catalog") != nullptr);
+  // 空库仍可正常使用
+  MT_CHECK(e.Run("CREATE TABLE account(id INT NOT NULL, balance INT NOT NULL);"
+                 "INSERT INTO account VALUES (1,100);")
+               .all_ok());
   MT_EQ(RowsText(e.Run("get id in account;").statements[0].result), std::string("1"));
 }
 

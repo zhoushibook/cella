@@ -170,16 +170,10 @@ DbStatus DbEngine::Open(const EngineConfig& config) {
     DbLogger::Global().Attach(nullptr);
   }
 
-  // ② 目录（权威元数据）
-  const DbStatus cs = catalog_.Load(config_.data_dir);
-  if (!cs.ok()) {
-    return cs;
-  }
-
-  // ③ 锁管理器
+  // ② 锁管理器
   locks_ = std::make_unique<LockManager>(config_.lock_timeout);
 
-  // ④ 存储引擎（保留配置：存盘点需要用同样参数重开）
+  // ③ 存储引擎（保留配置：存盘点需要用同样参数重开）
   storage::StorageConfig sc;
   sc.page_size = config_.page_size;
   sc.pool_size = config_.pool_size;
@@ -190,7 +184,6 @@ DbStatus DbEngine::Open(const EngineConfig& config) {
   sc.log_path = config_.data_dir + "/cella-storage.log";
   sc.log_level = config_.log_level;
   storage_config_ = sc;
-  recoveries_.clear();
   stats_before_checkpoints_ = storage::BufferStats{};
   checkpoint_count_ = 0;
   storage_ = storage::CreateStorage(sc);
@@ -199,10 +192,56 @@ DbStatus DbEngine::Open(const EngineConfig& config) {
     return DbStatus::Error(DbCode::kStorageError, "存储引擎打开失败: " + os.ToString());
   }
 
-  // ⑤ 目录与存储互相校验（不一致时自愈，见 ReconcileCatalogWithStorage 说明）
-  const DbStatus rs = ReconcileCatalogWithStorage();
-  if (!rs.ok()) {
-    return rs;
+  // ④ 系统目录（页式存储里的特殊表 cella_catalog）
+  //    目录与数据走同一条持久化路径，不再有「目录/数据文件不一致」的问题。
+  catalog_.AttachStorage(storage_.get());
+  bool catalog_created = false;
+  {
+    std::lock_guard<std::recursive_mutex> guard(storage_mutex_);
+    const DbStatus cs = catalog_.EnsureSystemTable(&catalog_created);
+    if (!cs.ok()) {
+      return cs;
+    }
+  }
+
+  // ④b 旧文本目录一次性迁移（catalog.meta → 系统表），迁移完改名留档
+  const std::string legacy_meta = config_.data_dir + "/" + CatalogManager::LegacyFileName();
+  if (std::filesystem::exists(legacy_meta)) {
+    if (catalog_created) {
+      // 系统表刚新建（空）→ 解析旧文本并把每张表写进系统表
+      const DbStatus ms = catalog_.LoadLegacyText(config_.data_dir);
+      if (!ms.ok()) {
+        return ms;
+      }
+      std::lock_guard<std::recursive_mutex> guard(storage_mutex_);
+      for (const auto* t : catalog_.ListTables()) {
+        // 先确保物理表存在（迁移的旧目录可能只带文本、不带数据文件），
+        // 否则 LoadFromStorage 会把「无物理背板」的表当成陈旧条目剔除。
+        const DbStatus ps = catalog_.EnsurePhysicalTable(*t);
+        if (!ps.ok()) {
+          return ps;
+        }
+        const DbStatus ws = catalog_.WriteTableRow(*t);
+        if (!ws.ok()) {
+          return ws;
+        }
+      }
+      (void)Checkpoint();  // 迁移结果立即落盘
+    }
+    std::error_code rec;
+    std::filesystem::rename(legacy_meta,
+                            config_.data_dir + "/" + CatalogManager::MigratedFileName(), rec);
+    if (!rec) {
+      DbLogInfo(logcat::kCatalog, "旧目录文件已迁移并改名: " + legacy_meta);
+    }
+  }
+
+  {
+    std::lock_guard<std::recursive_mutex> guard(storage_mutex_);
+    const DbStatus ls = catalog_.LoadFromStorage();
+    if (!ls.ok()) {
+      return ls;
+    }
   }
 
   // ⑥ 事务管理器（含审计日志）
@@ -224,83 +263,6 @@ DbStatus DbEngine::Open(const EngineConfig& config) {
                                  std::to_string(config_.pool_size) + " 替换策略=" +
                                  config_.replacer + " 表数=" + std::to_string(catalog_.table_count()));
   return DbStatus::Ok();
-}
-
-// ═════════════════════════════════════════════════════════════
-// 目录 ↔ 数据文件 的一致性（自愈）
-// ═════════════════════════════════════════════════════════════
-
-// 两份元数据的持久性不同：catalog.meta 在 DDL 语句执行时立即原子落盘；
-// 而存储层的表目录是一个页，只有 Close() 时才随 FlushAllPages 写出（无 WAL）。
-// 一旦进程非正常结束（关终端窗口 / Ctrl-C / 崩溃），就会出现
-// 「目录里有表、数据文件里没有」。这里把它修好而不是报错退出：
-//   * 按目录里的表结构在数据文件中重建该表（结构保住，原有数据不可恢复）；
-//   * 记入 recoveries_，由 CLI 明确提示用户；
-//   * 重建后立刻存盘，避免下次打开再走一遍自愈。
-DbStatus DbEngine::ReconcileCatalogWithStorage() {
-  std::vector<const CatalogTable*> missing;
-  for (const auto* t : catalog_.ListTables()) {
-    std::shared_ptr<storage::TableHeap> heap;
-    const storage::Status s = storage_->open_table(t->name, &heap);
-    if (s.ok()) {
-      DbLogDebug(logcat::kCatalog, "校验通过: " + t->name + " 首数据页 " +
-                                       std::to_string(heap->first_page_id()));
-      continue;
-    }
-    if (s.code() != storage::StatusCode::kTableNotFound) {
-      return DbStatus::Error(DbCode::kStorageError,
-                             "校验表 " + t->name + " 时存储层返回错误: " + s.ToString());
-    }
-    missing.push_back(t);
-  }
-  if (missing.empty()) {
-    return DbStatus::Ok();
-  }
-
-  for (const auto* t : missing) {
-    // 用目录里的列定义重建物理表
-    cella::CELLA_Table ct;
-    ct.name = t->name;
-    for (const auto& c : t->columns) {
-      cella::CELLA_Column cc;
-      cc.name = c.name;
-      cc.type = c.type;
-      cc.len = c.len;
-      cc.notNull = c.not_null;
-      ct.columns.push_back(std::move(cc));
-    }
-    const storage::Schema schema = ToStorageSchema(ct);
-    const storage::Status cs = storage_->create_table(t->name, schema);
-    if (!cs.ok()) {
-      return DbStatus::Error(DbCode::kStorageError,
-                             "重建缺失表 " + t->name + " 失败: " + cs.ToString());
-    }
-    const std::string note = "目录中的表 " + t->name +
-                             " 在数据文件里缺失（上次进程可能未正常关闭），已按目录结构重建；"
-                             "该表的原有数据不可恢复，建议用 \\checkpoint 或在正常退出前提交以保"
-                             "证落盘";
-    recoveries_.push_back(note);
-    DbLogWarn(logcat::kCatalog, note);
-  }
-
-  // 自愈结果立即落盘，并刷新首数据页等诊断信息
-  const DbStatus cp = Checkpoint();
-  if (!cp.ok()) {
-    DbLogWarn(logcat::kCatalog, "自愈后存盘失败: " + cp.message());
-  }
-  return DbStatus::Ok();
-}
-
-std::string DbEngine::RecoveryReport() const {
-  if (recoveries_.empty()) {
-    return std::string();
-  }
-  std::ostringstream os;
-  os << "启动时检测到 " << recoveries_.size() << " 处不一致并已自动修复:\n";
-  for (const auto& r : recoveries_) {
-    os << "  - " << r << "\n";
-  }
-  return os.str();
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -387,9 +349,8 @@ void DbEngine::Close() {
   executor_.reset();
 
   if (storage_) {
-    storage_->Close();  // FlushAllPages：把脏页（含目录页）真正写盘
+    storage_->Close();  // FlushAllPages：把脏页（含目录表与目录页）真正写盘
   }
-  (void)catalog_.Save();
   txn_manager_.reset();
   if (logger_) {
     logger_->Flush();
@@ -706,9 +667,9 @@ DbStatus Session::ExecuteOne(const std::string& stmt_text, int line, int col, St
         out->elapsed_ms = MsSince(t0);
         return cs;
       }
-      // 自动提交 = 一次真正的事务提交。DDL 必须立刻存盘，否则进程被强杀时
-      // catalog.meta 已写入、数据文件的表目录却没刷出，下次打开会出现
-      // 「目录与数据文件不一致」。其余语句按 checkpoint_on_commit 决定。
+      // 自动提交 = 一次真正的事务提交。DDL 必须立刻存盘：目录行和物理表目录
+      // 都只是缓冲池里的脏页，进程被强杀会一起丢，下次打开目录里就没这张表。
+      // 其余语句按 checkpoint_on_commit 决定。
       if (is_ddl || engine_->config().checkpoint_on_commit) {
         const DbStatus cp = engine_->Checkpoint();
         if (!cp.ok() && is_ddl) {

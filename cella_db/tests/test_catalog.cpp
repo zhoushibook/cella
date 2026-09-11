@@ -1,13 +1,19 @@
-// test_catalog.cpp —— 元数据管理测试：登记/查询/落盘/重载/与存储层互相校验。
+// test_catalog.cpp —— 系统目录测试：内存目录（登记/查询/删除/编译器视图）、
+//                     系统表可查询、写保护、重启持久化、单文件自包含、旧格式迁移。
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <sstream>
 #include <string>
 
 #include "cella/db/catalog/catalog_manager.h"
+#include "cella/db/engine/db_engine.h"
 #include "mini_test.h"
 #include "test_util.h"
 
 using namespace cella::db;
+using testutil::Engine;
+using testutil::RowsText;
 
 namespace {
 
@@ -27,11 +33,41 @@ CatalogTable MakeTable(const std::string& name) {
   return t;
 }
 
+// 在「已存在的数据目录」上开一个引擎（不清理）
+std::unique_ptr<DbEngine> OpenOn(const std::string& dir) {
+  auto e = std::make_unique<DbEngine>();
+  EngineConfig c;
+  c.data_dir = dir;
+  c.enable_log = false;
+  c.enable_journal = true;
+  if (!e->Open(c).ok()) {
+    return nullptr;
+  }
+  return e;
+}
+
+std::string ReadFile(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    return std::string();
+  }
+  std::ostringstream ss;
+  ss << in.rdbuf();
+  return ss.str();
+}
+
 }  // namespace
 
+MT_TEST(目录_系统表识别) {
+  MT_CHECK(CatalogManager::IsSystemTable("cella_catalog"));
+  MT_CHECK(CatalogManager::IsSystemTable("CELLA_CATALOG"));
+  MT_CHECK(!CatalogManager::IsSystemTable("student"));
+  MT_CHECK(!CatalogManager::IsSystemTable(""));
+  MT_EQ(std::string(CatalogManager::kSystemTableName), std::string("cella_catalog"));
+}
+
 MT_TEST(目录_登记与查询) {
-  CatalogManager cat;
-  MT_CHECK(cat.Load(testutil::FreshDir("cat_reg")).ok());
+  CatalogManager cat;  // 纯内存目录，无需存储引擎
 
   MT_CHECK(cat.RegisterTable(MakeTable("student")).ok());
   MT_CHECK(cat.RegisterTable(MakeTable("Course")).ok());
@@ -62,42 +98,9 @@ MT_TEST(目录_登记与查询) {
   MT_EQ(static_cast<int>(cat.ListTables().size()), 2);
 }
 
-MT_TEST(目录_落盘与重载) {
-  const std::string dir = testutil::FreshDir("cat_persist");
-  {
-    CatalogManager cat;
-    MT_CHECK(cat.Load(dir).ok());
-    CatalogTable t = MakeTable("student");
-    t.table_id = 7;
-    t.first_page_id = 12345;
-    t.created_at = 1700000000;
-    MT_CHECK(cat.RegisterTable(t).ok());
-    MT_CHECK(cat.RegisterTable(MakeTable("course")).ok());
-    MT_CHECK(cat.Save().ok());
-    MT_EQ(cat.next_table_id(), 9u);  // 第二个表分到 id=8，故下一个可用表号为 9
-  }
-  {
-    CatalogManager cat;
-    MT_CHECK(cat.Load(dir).ok());
-    MT_EQ(static_cast<int>(cat.table_count()), 2);
-    const CatalogTable* t = cat.FindTable("student");
-    MT_CHECK(t != nullptr);
-    MT_EQ(t->table_id, 7u);
-    MT_EQ(static_cast<int>(t->first_page_id), 12345);
-    MT_EQ(static_cast<int>(t->columns.size()), 2);
-    MT_CHECK(t->columns[0].not_null);
-    MT_EQ(t->columns[1].len, 32);
-    MT_EQ(t->columns[1].name, std::string("name"));
-    MT_EQ(cat.next_table_id(), 9u);
-  }
-}
-
 MT_TEST(目录_删除表) {
-  const std::string dir = testutil::FreshDir("cat_drop");
   CatalogManager cat;
-  MT_CHECK(cat.Load(dir).ok());
   MT_CHECK(cat.RegisterTable(MakeTable("a")).ok());
-  MT_CHECK(cat.Save().ok());
   MT_CHECK(cat.RemoveTable("A").ok());
   MT_CHECK(cat.FindTable("a") == nullptr);
   const DbStatus s = cat.RemoveTable("a");
@@ -105,36 +108,8 @@ MT_TEST(目录_删除表) {
   MT_CHECK(s.code() == DbCode::kTableNotFound);
 }
 
-MT_TEST(目录_文件头校验) {
-  const std::string dir = testutil::FreshDir("cat_bad");
-  const std::string path = dir + "/catalog.meta";
-  {
-    std::ofstream out(path, std::ios::binary);
-    out << "WRONG-MAGIC 1\n";
-  }
-  CatalogManager cat;
-  const DbStatus s = cat.Load(dir);
-  MT_CHECK(!s.ok());
-  MT_CHECK(s.code() == DbCode::kCatalogError);
-
-  {
-    std::ofstream out(path, std::ios::binary);
-    out << "CELLA-CATALOG 99\n";
-  }
-  CatalogManager cat2;
-  const DbStatus s2 = cat2.Load(dir);
-  MT_CHECK(!s2.ok());
-  MT_CHECK(s2.code() == DbCode::kCatalogError);
-
-  // 目录不存在 → 视为空库
-  CatalogManager cat3;
-  MT_CHECK(cat3.Load(testutil::FreshDir("cat_empty")).ok());
-  MT_EQ(static_cast<int>(cat3.table_count()), 0);
-}
-
 MT_TEST(目录_编译器视图) {
   CatalogManager cat;
-  MT_CHECK(cat.Load(testutil::FreshDir("cat_compiler")).ok());
   MT_CHECK(cat.RegisterTable(MakeTable("student")).ok());
 
   const cella::CELLA_Catalog cc = cat.ToCompilerCatalog();
@@ -151,7 +126,6 @@ MT_TEST(目录_编译器视图) {
 
 MT_TEST(目录_缺省长度归一) {
   CatalogManager cat;
-  MT_CHECK(cat.Load(testutil::FreshDir("cat_len")).ok());
   CatalogTable t;
   t.name = "t";
   CatalogColumn c;
@@ -179,7 +153,169 @@ MT_TEST(目录_类型名往返) {
   }
   cella::CELLA_DataType unused = cella::CELLA_DataType::INT;
   MT_CHECK(!CatalogTypeFromName("BLOB", &unused));
-  // INTEGER 是 INT 的同义词
   MT_CHECK(CatalogTypeFromName("integer", &unused));
   MT_CHECK(unused == cella::CELLA_DataType::INT);
+}
+
+MT_TEST(目录_系统表可查询) {
+  Engine e("cat_query");
+  MT_CHECK(e.opened);
+  MT_CHECK(e.Run("CREATE TABLE student(id INT NOT NULL, name VARCHAR(32) NOT NULL);").all_ok());
+  MT_CHECK(e.Run("CREATE TABLE course(id INT, title TEXT);").all_ok());
+
+  // 目录能被 SQL 查询：只投影确定性的两列
+  const ScriptReport r = e.Run("get name, columns in cella_catalog ordered name asc;");
+  MT_CHECK(r.all_ok());
+  MT_EQ(testutil::ColsText(r.statements[0].result), std::string("name|columns"));
+  MT_EQ(RowsText(r.statements[0].result),
+        std::string("course|id INT 0 0, title TEXT 0 0\n"
+                    "student|id INT 0 1, name VARCHAR 32 1"));
+
+  // 按名字过滤取表号
+  const ScriptReport r2 = e.Run("get table_id in cella_catalog limit name = 'student';");
+  MT_CHECK(r2.all_ok());
+  MT_EQ(RowsText(r2.statements[0].result), std::string("1"));
+
+  // \d 视角也能看到系统表（表号 0）
+  MT_CHECK(e.engine.catalog().FindTable("cella_catalog") != nullptr);
+}
+
+MT_TEST(目录_系统表写保护) {
+  Engine e("cat_protect");
+  MT_CHECK(e.opened);
+  MT_CHECK(e.Run("CREATE TABLE t(id INT);").all_ok());
+
+  // CREATE：语义阶段即拦（表已存在）
+  const ScriptReport r1 = e.Run("CREATE TABLE cella_catalog(x INT);");
+  MT_CHECK(!r1.all_ok());
+  MT_CHECK(!r1.statements[0].compile_errors.empty());
+
+  // DROP / INSERT / DELETE / UPDATE：执行器拦（DB-512）
+  MT_CHECK(e.Run("DROP TABLE cella_catalog;").statements[0].status.code() ==
+           DbCode::kSystemTableProtected);
+  MT_CHECK(e.Run("INSERT INTO cella_catalog VALUES ('x',1,1,'y');")
+               .statements[0]
+               .status.code() == DbCode::kSystemTableProtected);
+  MT_CHECK(e.Run("DELETE in cella_catalog limit name = 'x';")
+               .statements[0]
+               .status.code() == DbCode::kSystemTableProtected);
+  MT_CHECK(e.Run("UPDATE cella_catalog SET name = 'z' limit name = 'x';")
+               .statements[0]
+               .status.code() == DbCode::kSystemTableProtected);
+
+  // 系统表仍在，用户表未受影响
+  MT_CHECK(e.engine.catalog().FindTable("cella_catalog") != nullptr);
+  MT_CHECK(e.engine.catalog().FindTable("t") != nullptr);
+}
+
+MT_TEST(目录_重启后结构持久化) {
+  Engine e("cat_persist");
+  MT_CHECK(e.opened);
+  MT_CHECK(e.Run("CREATE TABLE student(id INT NOT NULL, name VARCHAR(16) NOT NULL, "
+                 "score DOUBLE, note TEXT);")
+               .all_ok());
+  MT_CHECK(e.Run("CREATE TABLE course(id INT, title VARCHAR(8));").all_ok());
+  e.Close();
+  MT_CHECK(e.Reopen());
+
+  const CatalogTable* t = e.engine.catalog().FindTable("student");
+  MT_CHECK(t != nullptr);
+  MT_EQ(t->table_id, 1u);
+  MT_EQ(static_cast<int>(t->columns.size()), 4);
+  MT_CHECK(t->columns[0].not_null);
+  MT_EQ(t->columns[1].len, 16);
+  MT_CHECK(t->columns[2].type == cella::CELLA_DataType::DOUBLE);
+  MT_CHECK(t->columns[3].type == cella::CELLA_DataType::TEXT);
+  MT_CHECK(t->first_page_id != cella::storage::kInvalidPageId);
+  MT_CHECK(t->created_at > 0);
+  MT_CHECK(e.engine.catalog().FindTable("course") != nullptr);
+  // 系统表仍在，表号 0
+  MT_EQ(e.engine.catalog().FindTable("cella_catalog")->table_id, 0u);
+}
+
+MT_TEST(目录_单文件自包含) {
+  Engine e("cat_selfcontained");
+  MT_CHECK(e.opened);
+  MT_CHECK(e.Run("CREATE TABLE t(id INT NOT NULL, v VARCHAR(16));"
+                 "INSERT INTO t VALUES (1,'a'),(2,'b');")
+               .all_ok());
+  e.Close();
+
+  // 只拷 cella.db 一个文件到新目录即可打开（不再依赖 catalog.meta）
+  const std::string copy_dir = testutil::FreshDir("cat_selfcontained_copy");
+  std::error_code ec;
+  std::filesystem::copy(e.cfg.data_dir + "/" + e.cfg.db_file, copy_dir + "/cella.db", ec);
+  MT_CHECK(!ec);
+
+  auto e2 = OpenOn(copy_dir);
+  MT_CHECK(e2 != nullptr);
+  MT_CHECK(e2->catalog().FindTable("t") != nullptr);
+  ScriptReport r;
+  (void)e2->default_session().Execute("get id, v in t ordered id asc;", &r);
+  MT_CHECK(r.all_ok());
+  MT_EQ(testutil::RowsText(r.statements[0].result), std::string("1|a\n2|b"));
+  e2->Close();
+}
+
+MT_TEST(目录_旧库迁移) {
+  const std::string dir = testutil::FreshDir("cat_migrate");
+  // 手写一份旧格式 catalog.meta
+  {
+    std::ofstream out(dir + "/catalog.meta", std::ios::binary);
+    out << "CELLA-CATALOG 1\n"
+        << "table 7 student 2 12345 1700000000\n"
+        << "col id INT 0 1\n"
+        << "col name VARCHAR 32 0\n"
+        << "table 9 course 2 99999 1700000001\n"
+        << "col id INT 0 1\n"
+        << "col title VARCHAR 16 0\n";
+  }
+  auto e = OpenOn(dir);
+  MT_CHECK(e != nullptr);
+  if (e == nullptr) {
+    return;
+  }
+
+  // 迁移：表结构保真（含表号、NOT NULL、长度）
+  const CatalogTable* s = e->catalog().FindTable("student");
+  MT_CHECK(s != nullptr);
+  if (s != nullptr) {
+    MT_EQ(s->table_id, 7u);
+    MT_EQ(static_cast<int>(s->columns.size()), 2);
+    MT_CHECK(s->columns[0].not_null);
+    MT_EQ(s->columns[1].len, 32);
+    MT_CHECK(s->first_page_id != cella::storage::kInvalidPageId);  // 已从存储层重取真实值
+  }
+  MT_CHECK(e->catalog().FindTable("course") != nullptr);
+
+  // 旧文件改名留档，新格式不再有 catalog.meta
+  MT_CHECK(!std::filesystem::exists(dir + "/catalog.meta"));
+  MT_CHECK(std::filesystem::exists(dir + "/catalog.meta.migrated"));
+
+  // 迁移后仍可继续建表（表号接续，不冲突）
+  ScriptReport r;
+  (void)e->default_session().Execute("CREATE TABLE extra(id INT);", &r);
+  MT_CHECK(r.all_ok());
+  const CatalogTable* extra = e->catalog().FindTable("extra");
+  MT_CHECK(extra != nullptr);
+  if (extra != nullptr) {
+    MT_CHECK(extra->table_id >= 10u);
+  }
+  e->Close();
+}
+
+MT_TEST(目录_删数据文件后重开为空库) {
+  Engine e("cat_fresh_after_delete");
+  MT_CHECK(e.opened);
+  MT_CHECK(e.Run("CREATE TABLE t(id INT);").all_ok());
+  e.Close();
+
+  // 删掉数据文件 → 重开得到全新空库（不再报 DB-509 或自愈）
+  std::error_code ec;
+  MT_CHECK(std::filesystem::remove(e.cfg.data_dir + "/" + e.cfg.db_file, ec));
+  MT_CHECK(e.Reopen());
+  MT_CHECK(e.engine.catalog().FindTable("t") == nullptr);
+  MT_CHECK(e.engine.catalog().FindTable("cella_catalog") != nullptr);  // 系统表自动重建
+  // 空库可正常建表使用
+  MT_CHECK(e.Run("CREATE TABLE t2(id INT);").all_ok());
 }

@@ -217,9 +217,19 @@ DbStatus Executor::ExecCreateTable(const cella::CELLA_PlanNode& plan, const Exec
     (void)storage_->drop_table(entry.name);  // 元数据登记失败 → 撤销物理表
     return rs;
   }
-  const DbStatus ss = catalog_->Save();
-  if (!ss.ok()) {
-    return ss;
+  const CatalogTable* registered = catalog_->FindTable(entry.name);
+  if (registered == nullptr) {
+    return DbStatus::Error(DbCode::kInternal, "建表后目录查找失败: " + entry.name);
+  }
+  {
+    StorageGuard guard(storage_mutex_);
+    const DbStatus ss = catalog_->WriteTableRow(*registered);
+    if (!ss.ok()) {
+      // 目录行写失败 → 撤销物理表与内存条目，保证三者一致
+      (void)catalog_->RemoveTable(entry.name);
+      (void)storage_->drop_table(entry.name);
+      return ss;
+    }
   }
 
   out->tag = "CREATE TABLE " + entry.name;
@@ -240,6 +250,9 @@ DbStatus Executor::ExecDropTable(const cella::CELLA_PlanNode& plan, const ExecCo
     return DbStatus::Error(DbCode::kTableNotFound, "表不存在: " + st->tableName);
   }
   const std::string name = meta->name;
+  if (CatalogManager::IsSystemTable(name)) {
+    return DbStatus::Error(DbCode::kSystemTableProtected, "系统表禁止删除: " + name);
+  }
   const DbStatus ls = LockTable(name, LockMode::kExclusive, ctx);
   if (!ls.ok()) {
     return ls;
@@ -255,9 +268,12 @@ DbStatus Executor::ExecDropTable(const cella::CELLA_PlanNode& plan, const ExecCo
   if (!rs.ok()) {
     return rs;
   }
-  const DbStatus ss = catalog_->Save();
-  if (!ss.ok()) {
-    return ss;
+  {
+    StorageGuard guard(storage_mutex_);
+    const DbStatus ss = catalog_->DeleteTableRow(name);
+    if (!ss.ok()) {
+      return ss;
+    }
   }
   out->tag = "DROP TABLE " + name;
   DbLogInfo(logcat::kCatalog, out->tag);
@@ -277,6 +293,9 @@ DbStatus Executor::ExecInsert(const cella::CELLA_PlanNode& plan, const ExecConte
     return DbStatus::Error(DbCode::kTableNotFound, "表不存在: " + st->tableName);
   }
   const std::string name = meta->name;
+  if (CatalogManager::IsSystemTable(name)) {
+    return DbStatus::Error(DbCode::kSystemTableProtected, "系统表禁止修改: " + name);
+  }
   const DbStatus ls = LockTable(name, LockMode::kExclusive, ctx);
   if (!ls.ok()) {
     return ls;
@@ -407,6 +426,9 @@ DbStatus Executor::ExecDelete(const cella::CELLA_PlanNode& plan, const ExecConte
     return DbStatus::Error(DbCode::kTableNotFound, "表不存在: " + st->tableName);
   }
   const std::string name = meta->name;
+  if (CatalogManager::IsSystemTable(name)) {
+    return DbStatus::Error(DbCode::kSystemTableProtected, "系统表禁止修改: " + name);
+  }
   const DbStatus ls = LockTable(name, LockMode::kExclusive, ctx);
   if (!ls.ok()) {
     return ls;
@@ -456,6 +478,9 @@ DbStatus Executor::ExecUpdate(const cella::CELLA_PlanNode& plan, const ExecConte
     return DbStatus::Error(DbCode::kTableNotFound, "表不存在: " + st->tableName);
   }
   const std::string name = meta->name;
+  if (CatalogManager::IsSystemTable(name)) {
+    return DbStatus::Error(DbCode::kSystemTableProtected, "系统表禁止修改: " + name);
+  }
   const DbStatus ls = LockTable(name, LockMode::kExclusive, ctx);
   if (!ls.ok()) {
     return ls;
