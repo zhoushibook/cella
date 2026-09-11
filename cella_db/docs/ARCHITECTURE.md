@@ -36,7 +36,7 @@
 | `include/cella/db/txn/` | 事务与锁 | ✅ |
 | `include/cella/db/engine/` | 门面、会话、SQL 文本工具 | ✅ |
 | `src/cella/db/**` | 与头文件一一对应的实现 | ❌ |
-| `tests/` | mini_test + 6 个测试文件（75 用例） | ❌ |
+| `tests/` | mini_test + 7 个测试文件（83 用例） | ❌ |
 | `examples/` | API 速览 + 并发现场演示 | ❌ |
 | `sql/` | 3 个可执行演示脚本 | ❌ |
 
@@ -268,7 +268,7 @@ OpSort   排序（可见列优先解析，解析不到才用隐藏列），最�
 | 段 | 含义 | 例 |
 | --- | --- | --- |
 | `LEX/SYN/SEM/PLN-xxx` | 编译器诊断（原样透传） | `SEM-307 不能向 NOT NULL 列插入 NULL` |
-| `DB-5xx` | 目录/执行 | `DB-502 表不存在`、`DB-505 类型不匹配`、`DB-508 文本超长`、`DB-511 除零` |
+| `DB-5xx` | 目录/执行/多库 | `DB-502 表不存在`、`DB-505 类型不匹配`、`DB-508 文本超长`、`DB-511 除零`、`DB-512 系统表只读`、`DB-513 事务中禁切库`、`DB-514 库不存在/已存在/名非法`、`DB-515 目标库不可删除` |
 | `DB-6xx` | 事务/并发 | `DB-601 无活动事务`、`DB-602 重复 BEGIN`、`DB-604 死锁`、`DB-605 锁超时` |
 | `DB-7xx` | 目录/会话/CLI | `DB-701 目录操作失败`、`DB-702 会话状态错误`、`DB-703 未实现`、`DB-704 内部错误` |
 
@@ -314,7 +314,7 @@ OpSort   排序（可见列优先解析，解析不到才用隐藏列），最�
 | 产物 | 说明 |
 | --- | --- |
 | `build/cella_db/cella_db.exe` | 完整系统 CLI（REPL / 脚本 / 元命令） |
-| `build/cella_db/cella_db_tests.exe` | 75 用例 / 616 断言 |
+| `build/cella_db/cella_db_tests.exe` | 83 用例 / 697 断言 |
 | `build/cella_db/api_quickstart.exe` | 30 秒 API 速览 |
 | `build/cella_db/concurrency_demo.exe` | 并发与死锁现场演示 |
 | `build/cella_sql/cella_sql.exe` | 原编译器 CLI（保留，行为不变） |

@@ -28,6 +28,12 @@ std::vector<SqlStatement> SplitSqlStatements(const std::string& sql);
 // （BEGIN / COMMIT / ROLLBACK / END / START）。
 bool IsTxnControl(const std::string& stmt_text, std::string* keyword);
 
+// 是否为数据库控制语句（CREATE DATABASE / DROP DATABASE / USE / SHOW DATABASES）。
+// 与事务控制一样在会话层拦截，不进编译器。识别必须匹配前两个词
+// （CREATE|DROP + DATABASE），否则会误吞 CREATE TABLE。命中时 kind 返回
+// 上述四种之一；arg 返回库名原文（SHOW 无参数，缺名时为空串，由调用方报错）。
+bool IsDatabaseControl(const std::string& stmt_text, std::string* kind, std::string* arg);
+
 // 去掉首尾空白并转大写（诊断用）
 std::string TrimUpper(const std::string& s);
 

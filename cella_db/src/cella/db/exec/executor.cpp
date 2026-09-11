@@ -152,9 +152,12 @@ DbStatus Executor::LockTable(const std::string& table, LockMode mode, const Exec
   if (ctx.txn_id == kInvalidTxnId) {
     return DbStatus::Error(DbCode::kNoActiveTxn, "缺少事务上下文，无法加锁");
   }
-  const DbStatus s = locks_->Acquire(ctx.txn_id, table, mode);
+  // 锁资源带库前缀：同一路径里不会跨库（USE 在事务中被禁），
+  // 前缀是防「引擎切换库后，别的会话残留的旧库锁」与新城同名表误撞。
+  const std::string resource = ctx.lock_scope.empty() ? table : ctx.lock_scope + "." + table;
+  const DbStatus s = locks_->Acquire(ctx.txn_id, resource, mode);
   if (s.ok() && ctx.recording()) {
-    ctx.txn->TouchTable(table);
+    ctx.txn->TouchTable(table);  // undo/journal 记裸表名（回滚只在当前库内进行）
   }
   return s;
 }

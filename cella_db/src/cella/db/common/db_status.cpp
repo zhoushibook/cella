@@ -17,6 +17,9 @@ const char* ToString(DbCode c) {
     case DbCode::kRecordTooLarge:     return "DB-510";
     case DbCode::kDivisionByZero:     return "DB-511";
     case DbCode::kSystemTableProtected: return "DB-512";
+    case DbCode::kDatabaseTxnActive:  return "DB-513";
+    case DbCode::kDatabaseError:      return "DB-514";
+    case DbCode::kDatabaseProtected:  return "DB-515";
     case DbCode::kStorageError:       return "DB-520";
     case DbCode::kNoActiveTxn:        return "DB-601";
     case DbCode::kTxnAlreadyActive:   return "DB-602";

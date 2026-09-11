@@ -73,7 +73,7 @@ cella> \d
     ├── src/                    实现
     ├── sql/                    3 个可执行演示脚本
     ├── examples/               API 速览 + 并发现场演示
-    ├── tests/                  75 用例 / 616 断言
+    ├── tests/                  83 用例 / 697 断言
     └── docs/                   INTEGRATION.md / ARCHITECTURE.md / TEST_REPORT.md
 ```
 
@@ -84,7 +84,7 @@ cella> \d
 | 产物 | 说明 |
 | --- | --- |
 | `build/cella_db/cella_db.exe` | **完整系统 CLI**（交互 REPL / 脚本 / 元命令 / 表格化输出） |
-| `build/cella_db/cella_db_tests.exe` | 整合层测试（75 用例 / 616 断言） |
+| `build/cella_db/cella_db_tests.exe` | 整合层测试（83 用例 / 697 断言） |
 | `build/cella_db/api_quickstart.exe` | 30 秒 C++ API 速览 |
 | `build/cella_db/concurrency_demo.exe` | 并发锁 / 死锁检测现场演示 |
 | `build/cella_sql/cella_sql.exe` | 原编译器 CLI（保留，`-l/-a/-s/-p/-o/--all` 行为不变） |
@@ -98,7 +98,7 @@ cella> \d
 | --- | --- | --- | --- |
 | 编译器回归（原有） | 29 | 29 项 golden 比对 | 0 |
 | 存储层单元测试（原有） | 30 | 4620 | 0 |
-| 整合层测试（新增） | 75 | 616 | 0 |
+| 整合层测试（新增） | 83 | 697 | 0 |
 | 端到端 SQL 脚本 | 70 条语句 | — | 4（脚本刻意演示的错误路径） |
 
 构建零 error / 零 warning（MSVC `/W4 /WX`）。详见 [cella_db/docs/TEST_REPORT.md](cella_db/docs/TEST_REPORT.md)。
@@ -130,6 +130,7 @@ cella> \d
 表结构与元数据管理（`CatalogManager` + 系统表行读写，可被 SQL 查询）、
 记录增删改查（含 `UPDATE = 删旧+插新`）、
 基本事务处理（undo 日志 + 语句级原子性 + DDL 隐式提交）与并发控制（表级严格 2PL + 死锁检测）。
+多库：`CREATE DATABASE / DROP DATABASE（软删除）/ USE / SHOW DATABASES`，库 = 自包含单文件。
 
 **要求 3 · 整体系统**
 打通「查询输入 → 编译解析 → 计划优化 → 执行调度 → 数据存取 → 结果返回」全链路；

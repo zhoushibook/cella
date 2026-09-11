@@ -241,10 +241,11 @@ MT_TEST(目录_单文件自包含) {
                .all_ok());
   e.Close();
 
-  // 只拷 cella.db 一个文件到新目录即可打开（不再依赖 catalog.meta）
+  // 只拷数据文件一个文件到新目录即可打开（不再依赖 catalog.meta）
   const std::string copy_dir = testutil::FreshDir("cat_selfcontained_copy");
   std::error_code ec;
-  std::filesystem::copy(e.cfg.data_dir + "/" + e.cfg.db_file, copy_dir + "/cella.db", ec);
+  std::filesystem::copy(e.cfg.data_dir + "/" + e.cfg.db_file,
+                        copy_dir + "/" + e.cfg.db_file, ec);
   MT_CHECK(!ec);
 
   auto e2 = OpenOn(copy_dir);

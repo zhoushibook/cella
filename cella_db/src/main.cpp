@@ -54,7 +54,7 @@ void PrintUsage(std::ostream& os) {
         "选项:\n"
         "  --data DIR          数据目录（默认 ./cella_data）\n"
         "  -f, --file FILE     执行 SQL 脚本文件（可重复；也可直接作为位置参数）\n"
-        "  --db FILE           数据库文件名（默认 cella.db）\n"
+        "  --db NAME           启动数据库（库 = <data_dir>/NAME.db，默认 main）\n"
         "  --page-size N       页大小字节数（2 的幂，默认 4096）\n"
         "  --pool N            缓冲池帧数（默认 64）\n"
         "  --replacer NAME     替换策略 LRU|FIFO|CLOCK（默认 LRU）\n"
@@ -70,7 +70,7 @@ void PrintUsage(std::ostream& os) {
         "  --stats             退出前打印缓冲池统计\n"
         "  -h, --help          显示本帮助\n"
         "\n"
-        "REPL 元命令: \\? \\q \\d [表] \\plan <SQL> \\stats \\locks \\waitfor \\txn \\timing \\echo\n";
+        "REPL 元命令: \\? \\q \\d [表] \\l \\plan <SQL> \\stats \\locks \\waitfor \\txn \\timing \\echo\n";
 }
 
 bool ParseLevel(const std::string& s, cella::storage::LogLevel* out) {
@@ -232,6 +232,7 @@ void PrintReplHelp() {
                "  \\q                退出\n"
                "  \\d                列出所有表\n"
                "  \\d <表名>         显示表结构\n"
+               "  \\l                列出所有数据库\n"
                "  \\plan <SQL>       只编译并打印计划（优化前/后对比）\n"
                "  \\stats            缓冲池统计（命中率/淘汰/钉住）\n"
                "  \\locks            当前锁表\n"
@@ -240,12 +241,14 @@ void PrintReplHelp() {
                "  \\checkpoint       立即把数据文件落盘（存盘点）\n"
                "  \\timing on|off    打印每条语句耗时\n"
                "  \\echo on|off      回显每条语句\n"
-               "SQL 语句以分号 ';' 结束（可跨多行）；事务用 BEGIN; / COMMIT; / ROLLBACK;\n";
+               "SQL 语句以分号 ';' 结束（可跨多行）；事务用 BEGIN; / COMMIT; / ROLLBACK;\n"
+               "多库：CREATE DATABASE 名; / DROP DATABASE 名; / USE 名; / SHOW DATABASES;\n";
 }
 
 int RunRepl(DbEngine& engine, Options& opt) {
   Session& session = engine.default_session();
-  std::cout << "cella_db 已就绪 —— " << session.StatusLine() << "\n"
+  std::cout << "cella_db 已就绪 —— 当前库 " << engine.current_db() << "，"
+            << session.StatusLine() << "\n"
             << "数据目录: " << engine.config().data_dir << " / 页大小 " << engine.config().page_size
             << " / 缓冲池 " << engine.config().pool_size << " 帧 / 替换策略 "
             << engine.config().replacer << "\n"
@@ -256,7 +259,8 @@ int RunRepl(DbEngine& engine, Options& opt) {
   size_t failed = 0;
 
   while (true) {
-    std::cout << (buffer.empty() ? "cella> " : "    ...> ") << std::flush;
+    std::cout << (buffer.empty() ? ("cella(" + engine.current_db() + ")> ") : "    ...> ")
+              << std::flush;
     std::string line;
     if (!std::getline(std::cin, line)) {
       std::cout << "\n";
@@ -289,6 +293,14 @@ int RunRepl(DbEngine& engine, Options& opt) {
       } else if (trimmed == "\\CHECKPOINT") {
         const cella::db::DbStatus cp = engine.Checkpoint();
         std::cout << (cp.ok() ? "数据文件已落盘（存盘点完成）。" : cp.ToString()) << "\n";
+      } else if (trimmed == "\\L" || trimmed == "\\LIST") {
+        cella::db::QueryResult dbs;
+        const cella::db::DbStatus st = engine.ShowDatabases(&dbs);
+        if (st.ok()) {
+          std::cout << "当前库: " << engine.current_db() << "\n" << dbs.ToText();
+        } else {
+          std::cout << st.ToString() << "\n";
+        }
       } else if (trimmed.rfind("\\TIMING", 0) == 0) {
         const bool on = (trimmed.find("OFF") == std::string::npos);
         opt.timing = on;

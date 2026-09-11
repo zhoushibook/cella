@@ -28,6 +28,9 @@ enum class DbCode {
   kRecordTooLarge,      // DB-510 记录超出单页容量
   kDivisionByZero,      // DB-511 表达式求值除零
   kSystemTableProtected,// DB-512 系统表禁止修改（只读）
+  kDatabaseTxnActive,   // DB-513 数据库级操作前须结束当前事务
+  kDatabaseError,       // DB-514 数据库不存在/已存在/名字非法
+  kDatabaseProtected,   // DB-515 目标数据库不可删除（当前库/启动库）
 
   // —— 存储层透传（DB-5xx）——
   kStorageError,        // DB-520 存储引擎返回失败（message 携带原始码）

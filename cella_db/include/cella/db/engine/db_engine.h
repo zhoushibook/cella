@@ -45,7 +45,8 @@ namespace cella::db {
 // ── 引擎配置 ────────────────────────────────────────────────
 struct EngineConfig {
   std::string data_dir = "./cella_data";
-  std::string db_file = "cella.db";
+  // 数据文件名。默认 main.db = 默认库 main；`--db school` 等价于 db_file=school.db。
+  std::string db_file = "main.db";
   // 每次提交都做一次存盘点（把数据文件真正落盘）。默认关：会重置缓冲池统计计数器，
   // 批量导入时每次提交都刷盘也偏慢。交互式会话可用 CLI 的 \checkpoint 手动触发。
   bool checkpoint_on_commit = false;
@@ -123,6 +124,22 @@ class DbEngine {
   TxnManager& txn_manager() { return *txn_manager_; }
   storage::IStorage* storage() { return storage_.get(); }
 
+  // ── SQL 级多库（库 = <data_dir>/<db>.db 一个自包含文件）──
+  // 一个引擎实例同一时刻只打开一个库；「当前库」是引擎级状态，
+  // 跨库并发用多个引擎实例（多进程）解决。
+  const std::string& current_db() const { return current_db_; }
+  const std::string& startup_db() const { return startup_db_; }
+  // CREATE DATABASE：初始化 <data_dir>/<name>.db（已存在 → DB-514）
+  DbStatus CreateDatabase(const std::string& name, std::string* note);
+  // DROP DATABASE：软删除（改名 <name>.db.dropped-<时间戳>，可手工改回恢复）。
+  // 当前库/启动库不可删（DB-515）；不存在 → DB-514。
+  DbStatus DropDatabase(const std::string& name, std::string* note);
+  // USE：切换当前库。事务中调用会被会话层拦（DB-513）。
+  // 切换 = Close()（顺带把旧库刷盘）→ 换 db_file → Open() → 重载目录。
+  DbStatus UseDatabase(const std::string& name, std::string* note);
+  // SHOW DATABASES：列 <data_dir>/*.db 的库名（单列查询结果，字母序）
+  DbStatus ShowDatabases(QueryResult* out);
+
   // 诊断文本
   std::string StatsText();
   std::string LockText() const;
@@ -152,6 +169,9 @@ class DbEngine {
   // 存盘点会重建缓冲池（统计计数器清零），故把历史值累计在此，保证观测连续
   storage::BufferStats stats_before_checkpoints_;
   uint32_t checkpoint_count_ = 0;
+  // 当前库 / 启动库（库名 = db_file 去掉 .db 后缀）
+  std::string current_db_;
+  std::string startup_db_;
 };
 
 // ── 会话：一条 SQL 执行链路 ─────────────────────────────────

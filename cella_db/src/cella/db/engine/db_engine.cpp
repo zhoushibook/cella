@@ -15,6 +15,10 @@
 #include "cella/storage/common/logger.h"
 #include "cella/storage/table/table_heap.h"
 
+#include <cctype>
+#include <ctime>
+#include <set>
+
 namespace cella::db {
 namespace {
 
@@ -53,6 +57,52 @@ const char* StmtKindName(cella::CELLA_Stmt::Kind k) {
     case cella::CELLA_Stmt::Kind::DROP_TABLE:   return "DROP TABLE";
   }
   return "?";
+}
+
+// 库名 = 数据文件名去掉 .db 后缀（"main.db" → "main"）
+std::string DbNameFromFile(const std::string& db_file) {
+  const std::string suffix = ".db";
+  if (db_file.size() > suffix.size() &&
+      db_file.compare(db_file.size() - suffix.size(), suffix.size(), suffix) == 0) {
+    return db_file.substr(0, db_file.size() - suffix.size());
+  }
+  return db_file;
+}
+
+std::string DbFileOf(const std::string& db_name) { return db_name + ".db"; }
+
+// 库名合法性：标识符规则 [A-Za-z_][A-Za-z0-9_]*（首字符不能是数字），
+// 长度 1..64，且不与 SQL 保留字冲突
+bool ValidDbName(const std::string& name) {
+  if (name.empty() || name.size() > 64) {
+    return false;
+  }
+  const auto ident_start = [](char c) {
+    return std::isalpha(static_cast<unsigned char>(c)) != 0 || c == '_';
+  };
+  if (!ident_start(name[0])) {
+    return false;
+  }
+  for (const char c : name) {
+    if (std::isalnum(static_cast<unsigned char>(c)) == 0 && c != '_') {
+      return false;
+    }
+  }
+  static const char* kReserved[] = {"TABLE",     "DATABASE", "DATABASES", "USE",
+                                    "SHOW",      "CREATE",   "DROP",      "GET",
+                                    "INSERT",    "DELETE",   "UPDATE",    "SELECT",
+                                    "BEGIN",     "COMMIT",   "ROLLBACK"};
+  std::string upper;
+  upper.reserve(name.size());
+  for (const char c : name) {
+    upper += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  for (const char* r : kReserved) {
+    if (upper == r) {
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace
@@ -172,6 +222,36 @@ DbStatus DbEngine::Open(const EngineConfig& config) {
 
   // ② 锁管理器
   locks_ = std::make_unique<LockManager>(config_.lock_timeout);
+
+  // ②b 库名与旧布局迁移：库 = <data_dir>/<db>.db 单文件；库名取 db_file 的茎。
+  //     db_file 缺少 .db 后缀时补上（--db school → school.db）。
+  //     旧版默认数据文件叫 cella.db，首次用新版打开时改名为 main.db（一次性）。
+  {
+    const std::string suffix = ".db";
+    if (config_.db_file.size() <= suffix.size() ||
+        config_.db_file.compare(config_.db_file.size() - suffix.size(), suffix.size(), suffix) !=
+            0) {
+      config_.db_file += suffix;
+    }
+  }
+  current_db_ = DbNameFromFile(config_.db_file);
+  startup_db_ = current_db_;
+  if (!ValidDbName(current_db_)) {
+    return DbStatus::Error(DbCode::kDatabaseError,
+                           "数据库名非法: " + current_db_ + "（来自 --db " + config_.db_file + "）");
+  }
+  {
+    const std::string legacy_db = config_.data_dir + "/cella.db";
+    const std::string main_db = config_.data_dir + "/" + DbFileOf(current_db_);
+    if (current_db_ == "main" && std::filesystem::exists(legacy_db) &&
+        !std::filesystem::exists(main_db)) {
+      std::error_code rec;
+      std::filesystem::rename(legacy_db, main_db, rec);
+      if (!rec) {
+        DbLogInfo(logcat::kEngine, "旧布局迁移: cella.db → main.db");
+      }
+    }
+  }
 
   // ③ 存储引擎（保留配置：存盘点需要用同样参数重开）
   storage::StorageConfig sc;
@@ -296,6 +376,149 @@ DbStatus DbEngine::Checkpoint() {
   }
   ++checkpoint_count_;
   DbLogInfo(logcat::kEngine, "存盘点完成（第 " + std::to_string(checkpoint_count_) + " 次）");
+  return DbStatus::Ok();
+}
+
+// ═════════════════════════════════════════════════════════════
+// SQL 级多库：CREATE/DROP DATABASE、USE、SHOW DATABASES
+// ═════════════════════════════════════════════════════════════
+
+DbStatus DbEngine::CreateDatabase(const std::string& name, std::string* note) {
+  if (!ValidDbName(name)) {
+    return DbStatus::Error(DbCode::kDatabaseError,
+                           "数据库名非法: \"" + name + "\"（标识符规则，且不与保留字冲突）");
+  }
+  const std::string file = config_.data_dir + "/" + DbFileOf(name);
+  std::error_code ec;
+  if (std::filesystem::exists(file, ec)) {
+    return DbStatus::Error(DbCode::kDatabaseError, "数据库已存在: " + name);
+  }
+  // 用一次「打开 + 干净关闭」引导出空数据文件（含存储层目录页）。
+  // 系统表 cella_catalog 首次 USE 时由 bootstrap 创建。
+  storage::StorageConfig sc = storage_config_;
+  sc.db_file = DbFileOf(name);
+  std::unique_ptr<storage::IStorage> tmp = storage::CreateStorage(sc);
+  const storage::Status os = tmp->Open(sc);
+  if (!os.ok()) {
+    return DbStatus::Error(DbCode::kStorageError, "创建数据库 " + name + " 失败: " + os.ToString());
+  }
+  tmp->Close();  // FlushAllPages：把空目录页真正写盘
+  if (note != nullptr) {
+    *note = "数据库已创建: " + name;
+  }
+  DbLogInfo(logcat::kEngine, "CREATE DATABASE " + name);
+  return DbStatus::Ok();
+}
+
+DbStatus DbEngine::DropDatabase(const std::string& name, std::string* note) {
+  if (!ValidDbName(name)) {
+    return DbStatus::Error(DbCode::kDatabaseError,
+                           "数据库名非法: \"" + name + "\"（标识符规则，且不与保留字冲突）");
+  }
+  if (name == current_db_) {
+    return DbStatus::Error(DbCode::kDatabaseProtected,
+                           "不能删除当前数据库 " + name + "（先 USE 到别的库）");
+  }
+  if (name == startup_db_) {
+    return DbStatus::Error(DbCode::kDatabaseProtected,
+                           "不能删除启动数据库 " + name + "（它是重启后的落点）");
+  }
+  const std::string file = config_.data_dir + "/" + DbFileOf(name);
+  std::error_code ec;
+  if (!std::filesystem::exists(file, ec)) {
+    return DbStatus::Error(DbCode::kDatabaseError, "数据库不存在: " + name);
+  }
+  // 软删除：改名留档而非物理删除，手工改回文件名即可恢复
+  const std::string dropped = file + ".dropped-" + std::to_string(NowEpochSeconds());
+  std::filesystem::rename(file, dropped, ec);
+  if (ec) {
+    return DbStatus::Error(DbCode::kStorageError, "删除数据库 " + name + " 失败（改名留档未成功）");
+  }
+  if (note != nullptr) {
+    *note = "数据库已删除（软删除，文件改名 " + std::filesystem::path(dropped).filename().string() +
+            "，改回原名即可恢复）: " + name;
+  }
+  DbLogInfo(logcat::kEngine, "DROP DATABASE " + name);
+  return DbStatus::Ok();
+}
+
+DbStatus DbEngine::UseDatabase(const std::string& name, std::string* note) {
+  if (!ValidDbName(name)) {
+    return DbStatus::Error(DbCode::kDatabaseError,
+                           "数据库名非法: \"" + name + "\"（标识符规则，且不与保留字冲突）");
+  }
+  if (name == current_db_) {
+    if (note != nullptr) {
+      *note = "已经在数据库 " + name + " 中";
+    }
+    return DbStatus::Ok();
+  }
+  const std::string file = config_.data_dir + "/" + DbFileOf(name);
+  std::error_code ec;
+  if (!std::filesystem::exists(file, ec)) {
+    return DbStatus::Error(DbCode::kDatabaseError, "数据库不存在: " + name);
+  }
+
+  // 切换 = 关旧库（Close 内部 FlushAllPages，顺带完成旧库落盘）→ 换 db_file → 开新库。
+  // 与 Checkpoint 相同，独占存储互斥量，防止别的线程拿着旧缓冲池的句柄。
+  std::lock_guard<std::recursive_mutex> guard(storage_mutex_);
+  storage_->Close();
+  config_.db_file = DbFileOf(name);
+  storage_config_.db_file = config_.db_file;
+  const storage::Status s = storage_->Open(storage_config_);
+  if (!s.ok()) {
+    // 换回旧库文件名再重开，尽量保住引擎可用性
+    config_.db_file = DbFileOf(current_db_);
+    storage_config_.db_file = config_.db_file;
+    (void)storage_->Open(storage_config_);
+    return DbStatus::Error(DbCode::kStorageError, "切换到数据库 " + name + " 失败: " + s.ToString());
+  }
+  catalog_.AttachStorage(storage_.get());
+  // 新建的库还没有系统目录表（CreateDatabase 只引导出空数据文件），先走 bootstrap
+  const DbStatus cs = catalog_.EnsureSystemTable(nullptr);
+  if (!cs.ok()) {
+    return cs;
+  }
+  const DbStatus ls = catalog_.LoadFromStorage();
+  if (!ls.ok()) {
+    return ls;
+  }
+  current_db_ = name;
+  if (note != nullptr) {
+    *note = "已切换到数据库 " + name;
+  }
+  DbLogInfo(logcat::kEngine, "USE " + name + "（表数 " + std::to_string(catalog_.table_count()) +
+                                 "）");
+  return DbStatus::Ok();
+}
+
+DbStatus DbEngine::ShowDatabases(QueryResult* out) {
+  if (out == nullptr) {
+    return DbStatus::Error(DbCode::kInternal, "ShowDatabases: 输出为空");
+  }
+  out->Clear();
+  out->columns.push_back(ResultColumn{"name"});
+  std::set<std::string> names;
+  names.insert(current_db_);  // 当前库一定在（其文件可能刚建尚未落盘）
+  std::error_code ec;
+  for (const auto& entry : std::filesystem::directory_iterator(config_.data_dir, ec)) {
+    if (!entry.is_regular_file(ec)) {
+      continue;
+    }
+    const std::string fname = entry.path().filename().string();
+    const std::string suffix = ".db";
+    if (fname.size() <= suffix.size() ||
+        fname.compare(fname.size() - suffix.size(), suffix.size(), suffix) != 0) {
+      continue;  // 只认 *.db（.db.dropped-* 的软删除留档不会匹配）
+    }
+    names.insert(fname.substr(0, fname.size() - suffix.size()));
+  }
+  for (const std::string& n : names) {
+    std::vector<storage::Value> row;
+    row.push_back(storage::Value::Varchar(n));
+    out->rows.push_back(std::move(row));
+  }
+  out->tag = "SHOW DATABASES " + std::to_string(out->rows.size());
   return DbStatus::Ok();
 }
 
@@ -565,6 +788,44 @@ DbStatus Session::ExecuteOne(const std::string& stmt_text, int line, int col, St
     return st;
   }
 
+  // ── ①b 数据库控制语句（与事务控制同构：编译器不认识，会话层直接执行）──
+  // SHOW DATABASES 是只读的，事务中放行；CREATE/DROP/USE 会换库或动文件系统，
+  // 事务中一律拒绝（undo 记的是旧库表名，跨库切换会悬空）。
+  std::string db_kind;
+  std::string db_arg;
+  if (IsDatabaseControl(stmt_text, &db_kind, &db_arg)) {
+    out->kind = db_kind;
+    DbStatus st;
+    std::string note;
+    if (db_kind != "SHOW DATABASES" && in_transaction()) {
+      st = DbStatus::Error(DbCode::kDatabaseTxnActive,
+                           db_kind + " 前须结束当前事务（COMMIT / ROLLBACK）");
+    } else if (db_kind == "CREATE DATABASE") {
+      st = engine_->CreateDatabase(db_arg, &note);
+    } else if (db_kind == "DROP DATABASE") {
+      st = engine_->DropDatabase(db_arg, &note);
+    } else if (db_kind == "USE") {
+      if (db_arg.empty()) {
+        st = DbStatus::Error(DbCode::kDatabaseError, "USE 缺少数据库名");
+      } else {
+        st = engine_->UseDatabase(db_arg, &note);
+      }
+    } else {  // SHOW DATABASES
+      st = engine_->ShowDatabases(&out->result);
+      note = out->result.tag;
+    }
+    out->executed = true;
+    out->status = st;
+    out->result.tag = note;
+    out->elapsed_ms = MsSince(t0);
+    // USE 换库后权威目录已变，必须重建编译器视角目录，
+    // 否则后续语句还在按旧库的表结构做语义分析（静默错乱）。
+    EnsureCatalogInSync();
+    DbLogInfo(logcat::kSession, "[" + name_ + "] " + db_kind + " " +
+                                    (st.ok() ? "OK: " + note : st.ToString()));
+    return st;
+  }
+
   // ── ② 编译：词法 → 语法 → 语义 → 计划 ──
   std::vector<cella::CELLA_Error> errors;
   const auto tokens = cella::cella_tokenize(stmt_text, errors);
@@ -647,6 +908,7 @@ DbStatus Session::ExecuteOne(const std::string& stmt_text, int line, int col, St
   ExecContext ctx;
   ctx.txn_id = txn_;
   ctx.txn = txn_handle_.get();
+  ctx.lock_scope = engine_->current_db();
 
   Executor& executor = *engine_->executor_;
   executor.ResetOperatorCalls();

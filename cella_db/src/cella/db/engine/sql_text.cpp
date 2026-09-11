@@ -228,4 +228,85 @@ bool IsTxnControl(const std::string& stmt_text, std::string* keyword) {
   return hit;
 }
 
+namespace {
+
+// 从下标 i 取一个标识符词（原文大小写）。成功返回 true 并把 i 推进到词后。
+bool TakeWord(const std::string& s, size_t* i, std::string* word) {
+  const size_t n = s.size();
+  size_t j = SkipTrivia(s, *i);
+  size_t b = j;
+  while (j < n) {
+    const char c = s[j];
+    const bool ident = std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+    if (!ident) {
+      break;
+    }
+    ++j;
+  }
+  if (j == b) {
+    return false;
+  }
+  *word = s.substr(b, j - b);
+  *i = j;
+  return true;
+}
+
+// 剩余部分只允许空白/注释/结尾分号（语句文本自带分号）
+bool RestIsTrivia(const std::string& s, size_t i) {
+  const size_t n = s.size();
+  std::string tail;
+  while (i < n) {
+    if (s[i] == ';') {
+      ++i;
+      continue;
+    }
+    tail += s[i];
+    ++i;
+  }
+  return OnlyWhitespaceOrComments(tail);
+}
+
+std::string Upper(const std::string& w) { return TrimUpper(w); }
+
+}  // namespace
+
+bool IsDatabaseControl(const std::string& stmt_text, std::string* kind, std::string* arg) {
+  size_t i = 0;
+  std::string w1;
+  if (!TakeWord(stmt_text, &i, &w1)) {
+    return false;
+  }
+  const std::string u1 = Upper(w1);
+  std::string w2;
+  const bool has_w2 = TakeWord(stmt_text, &i, &w2);
+  const std::string u2 = has_w2 ? Upper(w2) : std::string();
+
+  if (u1 == "USE") {
+    if (!has_w2 || !RestIsTrivia(stmt_text, i)) {
+      return false;  // "USE" 缺名/带垃圾 → 交给编译器报标准语法错
+    }
+    if (kind != nullptr) *kind = "USE";
+    if (arg != nullptr) *arg = w2;
+    return true;
+  }
+  if ((u1 == "CREATE" || u1 == "DROP") && u2 == "DATABASE") {
+    std::string w3;
+    if (!TakeWord(stmt_text, &i, &w3) || !RestIsTrivia(stmt_text, i)) {
+      return false;
+    }
+    if (kind != nullptr) *kind = u1 + " DATABASE";
+    if (arg != nullptr) *arg = w3;
+    return true;
+  }
+  if (u1 == "SHOW" && u2 == "DATABASES") {
+    if (!RestIsTrivia(stmt_text, i)) {
+      return false;
+    }
+    if (kind != nullptr) *kind = "SHOW DATABASES";
+    if (arg != nullptr) arg->clear();
+    return true;
+  }
+  return false;
+}
+
 }  // namespace cella::db

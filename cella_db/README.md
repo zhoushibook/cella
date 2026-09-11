@@ -75,6 +75,7 @@ powershell -ExecutionPolicy Bypass -File run_all.ps1
 | `\q` | 退出 |
 | `\d` | 列出所有表（含表号与首数据页） |
 | `\d 表名` | 显示表结构 |
+| `\l` | 列出所有数据库（等价 `SHOW DATABASES;`） |
 | `\plan <SQL>` | 只编译并打印计划（优化前 / 优化后对比） |
 | `\stats` | 缓冲池统计（命中率、淘汰、page_alloc/free） |
 | `\locks` | 当前锁表（持有者 / 等待者） |
@@ -100,6 +101,17 @@ powershell -ExecutionPolicy Bypass -File run_all.ps1
 
 事务控制（编译器不识别，由会话拦截）：`BEGIN;` / `COMMIT;` / `ROLLBACK;`
 （也接受 `START TRANSACTION` / `END`）。
+
+多库控制（同样由会话拦截，编译器不识别）：
+
+```sql
+CREATE DATABASE school;   -- 建 <data_dir>/school.db（已存在 → DB-514）
+USE school;               -- 切换当前库（事务中 → DB-513）
+SHOW DATABASES;           -- 列出所有库（单列查询结果）
+DROP DATABASE school;     -- 软删除：改名 <db>.db.dropped-<时间戳>，改回即恢复（当前库/启动库 → DB-515）
+```
+
+库 = `<data_dir>/<库名>.db` 一个自包含文件（默认库 `main`）。跨库并发请用多个引擎实例（多进程）。
 
 > 注意：`GROUP BY`（`grouped`）在本方言里**没有聚合函数**（未定义 COUNT/SUM），
 > 因此实现为「按分组键去重，每组保留首行」，配合 `having` 使用。
@@ -181,7 +193,7 @@ engine.Close();
 .\build\cella_db\cella_db_tests.exe --log .\build\test_report.log
 ```
 
-当前：**75 用例 / 616 断言 / 0 失败**，明细见 [docs/TEST_REPORT.md](docs/TEST_REPORT.md)。
+当前：**83 用例 / 697 断言 / 0 失败**，明细见 [docs/TEST_REPORT.md](docs/TEST_REPORT.md)。
 
 ---
 

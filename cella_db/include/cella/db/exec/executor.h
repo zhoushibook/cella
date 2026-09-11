@@ -41,6 +41,9 @@ namespace cella::db {
 struct ExecContext {
   txn_id_t txn_id = kInvalidTxnId;
   Transaction* txn = nullptr;  // 可为空（只读探测场景），此时不记录 undo
+  // 锁资源名的库前缀（当前库名）：锁资源记作 "<db>.<table>"，
+  // 避免引擎切换数据库后两个库的同名表共享同一把锁（假冲突/假死锁）。
+  std::string lock_scope;
 
   bool recording() const { return txn != nullptr; }
 };
