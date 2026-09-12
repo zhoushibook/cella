@@ -48,7 +48,7 @@ function cellFromInput(text, type) {
 let tabSeq = 0;
 function addTab(tab) {
   tab.id = 'tab' + (++tabSeq);
-  state$.().tabs.push(tab);
+  state$().tabs.push(tab);
   activateTab(tab.id);
   return tab;
 }
@@ -492,7 +492,7 @@ function renderLocal(tab) {
 function renderServer(tab, d) {
   tab.ui.grid.setData(d.columns, d.rows);
   updateDataBar(tab, d.rows.length, d.page, tab.totalPages, d.totalKnown, d.total);
-  set({ statusText: `第 ${d.page} 页 · ${d.rows.length} 行` + (d.totalKnown ? ` · 共 ${d.total} 行` : ' · 共 ≈? 行'));
+  set({ statusText: `第 ${d.page} 页 · ${d.rows.length} 行` + (d.totalKnown ? ` · 共 ${d.total} 行` : ' · 共 ≈? 行') });
 }
 
 function updateDataBar(tab, rowCount, page, totalPages, totalKnown, total) {

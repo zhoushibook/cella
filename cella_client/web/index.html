@@ -16,7 +16,7 @@
     <span class="spacer"></span>
     <button id="btnRun" class="btn primary" title="执行 (Ctrl+Enter)">▶ 执行</button>
     <button id="btnFormat" class="btn" title="格式化 SQL">格式化</button>
-    <button id="btnExport" class="btn" title="导出当前结果">导出</button>
+    <button id="btnExport" class="btn" title="导出当前结果（右键=JSON）">导出</button>
     <span class="spacer"></span>
     <span id="txnBadge" class="txnbadge" title="事务状态">事务空闲</span>
     <button id="btnBegin" class="btn">BEGIN</button>
@@ -59,6 +59,26 @@
   </div>
 
   <div id="toasts" class="toasts"></div>
+
+  <script>
+    // 启动错误显性化：模块加载失败/运行时异常直接显示在页面上（而不是静默空白）
+    window.addEventListener('error', (e) => {
+      const d = document.getElementById('bootError');
+      if (d) {
+        d.style.display = 'block';
+        d.textContent = '启动失败: ' + (e.message || '未知错误') +
+          (e.filename ? ' @ ' + e.filename + ':' + e.lineno + ':' + e.colno : '');
+      }
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+      const d = document.getElementById('bootError');
+      if (d) {
+        d.style.display = 'block';
+        d.textContent = '启动失败: ' + (e.reason && e.reason.message ? e.reason.message : e.reason);
+      }
+    });
+  </script>
+  <div id="bootError" style="display:none; margin:16px; padding:12px; border:1px solid #dc2626; border-radius:6px; color:#dc2626; font-family:monospace; white-space:pre-wrap"></div>
 
   <script type="module" src="/assets/js/app.js"></script>
 </body>
