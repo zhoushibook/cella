@@ -117,9 +117,8 @@ CELLA_OptResult cella_optimizePlans(const std::vector<std::unique_ptr<CELLA_Plan
 
 两个刻意的设计点：
 
-* **Filter/Project 不下推到存储层**。存储层只提供原始全表扫描——这正是
-  `cella_storage/include/cella/storage/integration/plan_bridge.h` 里写明给「引擎组」的约定，
-  本层就是那个引擎组。谓词过滤、投影、Top-N 全在内存内完成。
+* **Filter/Project 不下推到存储层**。存储层只提供原始全表扫描，
+  本层负责谓词过滤、投影和 Top-N 等内存内运算。
 * **锁在扫描/写表前申请，而不是在语句入口统一申请**。这样 JOIN 的两张表按计划顺序加锁，
   `get` 只加 S 锁，DML 只加目标表的 X 锁；也天然避免了「先拿存储互斥量、再等数据库锁」的交叉等待。
 

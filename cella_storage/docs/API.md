@@ -198,15 +198,6 @@ class TableHeap {                      // 一张表 = 数据页双向链表
 class FreeSpaceManager { page_id_t hint_page() const; void update_hint(page_id_t); };
 ```
 
-### 2.6 集成 `integration/`
-
-```cpp
-// plan_bridge.h — 演示算子 → 接口映射（stub）
-Status SeqScan(IStorage*, table, emit);   // open_table + begin/end
-Status Insert(IStorage*, table, rec, out); // insert_record
-Status Delete(IStorage*, table, rid);      // delete_record
-```
-
 ---
 
 ## 3. 二进制格式（§8）

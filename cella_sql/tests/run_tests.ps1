@@ -6,12 +6,14 @@
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
+$aggregateRoot = Split-Path -Parent $root
 $candidates = @(
     (Join-Path $root "build\Debug\cella_sql.exe"),
     (Join-Path $root "build\Release\cella_sql.exe"),
     (Join-Path $root "build\MinSizeRel\cella_sql.exe"),
     (Join-Path $root "build\RelWithDebInfo\cella_sql.exe"),
-    (Join-Path $root "build\cella_sql.exe")
+    (Join-Path $root "build\cella_sql.exe"),
+    (Join-Path $aggregateRoot "build\cella_sql\cella_sql.exe")
 )
 $exe = $null
 foreach ($c in $candidates) {

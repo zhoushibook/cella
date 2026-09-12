@@ -83,14 +83,6 @@ if (-not $SkipBuild) {
 }
 
 # ------------------------------------------- 2. compiler regression (原编译器)
-# run_tests.ps1 的候选路径含 <模块根>/build/cella_sql.exe（独立构建产物位置）；
-# 聚合构建产物在 <root>/build/cella_sql/ 下，故复制一份到候选位置。
-$sqlExe    = Join-Path $BuildDir "cella_sql\cella_sql.exe"
-$sqlAltDir = Join-Path $Root "cella_sql\build"
-if (Test-Path $sqlExe) {
-    if (-not (Test-Path $sqlAltDir)) { New-Item -ItemType Directory -Path $sqlAltDir | Out-Null }
-    Copy-Item $sqlExe (Join-Path $sqlAltDir "cella_sql.exe") -Force
-}
 $sqlOut = [string](& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root "cella_sql\tests\run_tests.ps1") 2>&1 | Out-String)
 $code = $LASTEXITCODE
 $sum = PassFail (LastLine $sqlOut "==========")
