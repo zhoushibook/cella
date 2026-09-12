@@ -270,9 +270,12 @@ function mountDataTab(body, tab) {
   loadRows(tab);
 }
 
+let rowMenuEl = null;  // 连续右键多行时，先关掉上一个菜单
 function showRowMenu(x, y, tab, row) {
+  if (rowMenuEl) { rowMenuEl.remove(); rowMenuEl = null; }
   const menu = document.createElement('div');
   menu.className = 'ctxmenu';
+  rowMenuEl = menu;
   const del = document.createElement('div');
   del.textContent = '删除该行';
   del.className = 'danger';
@@ -289,7 +292,7 @@ function showRowMenu(x, y, tab, row) {
   });
   menu.append(copy, del);
   document.body.appendChild(menu);
-  const close = () => { menu.remove(); document.removeEventListener('click', close); };
+  const close = () => { menu.remove(); rowMenuEl = null; document.removeEventListener('click', close); };
   setTimeout(() => document.addEventListener('click', close), 0);
 }
 

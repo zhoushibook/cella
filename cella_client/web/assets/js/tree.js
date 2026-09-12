@@ -54,6 +54,7 @@ export function createTree(container, { store, actions }) {
       el.addEventListener('click', () => actions.openTable(t.name));
       el.addEventListener('contextmenu', (e) => {
         e.preventDefault();
+        e.stopPropagation();  // 否则事件冒泡到 document 的关闭监听器，菜单弹出即被关闭
         showMenu(e.clientX, e.clientY, [
           { label: '打开数据', fn: () => actions.openTable(t.name) },
           { label: '查看结构', fn: () => actions.openStruct(t.name) },
