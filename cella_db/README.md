@@ -102,6 +102,17 @@ powershell -ExecutionPolicy Bypass -File run_all.ps1
 事务控制（编译器不识别，由会话拦截）：`BEGIN;` / `COMMIT;` / `ROLLBACK;`
 （也接受 `START TRANSACTION` / `END`）。
 
+每张表还有一个**只读伪列 `rowid`**（物理行标识，不透明整数），可用于投影 / 条件 / 排序：
+
+```sql
+get rowid, id, name in t;                 -- 同值重复行也能区分
+delete in t limit rowid = 393216;         -- 精确删掉其中某一行（全列匹配做不到）
+update t set name = 'x' limit rowid = 393216;
+```
+
+`rowid` 不可声明为列名、不可作为 INSERT 列清单或 UPDATE 的 SET 目标；`UPDATE` 后该行 rowid 会变
+（删旧+插新），删除后槽位可能被复用 —— 客户端应在同一持锁事务内 fetch → 改，改完重新取一次 rowid。
+
 多库控制（同样由会话拦截，编译器不识别）：
 
 建表可声明列级主键（隐含 NOT NULL，唯一性由执行层校验，冲突报 `DB-516`）：
@@ -110,6 +121,17 @@ powershell -ExecutionPolicy Bypass -File run_all.ps1
 CREATE TABLE s(id INT PRIMARY KEY, name VARCHAR(16) NOT NULL);
 CREATE TABLE c(code VARCHAR(8) NOT NULL PRIMARY KEY, title TEXT);  -- 约束顺序任意
 ```
+
+每张表还有一个**只读伪列 `rowid`**（物理行标识，不透明整数），可用于投影 / 条件 / 排序：
+
+```sql
+get rowid, id, name in t;                 -- 同值重复行也能区分
+delete in t limit rowid = 393216;         -- 精确删掉其中某一行（全列匹配做不到）
+update t set name = 'x' limit rowid = 393216;
+```
+
+`rowid` 不可声明为列名、不可作为 INSERT 列清单或 UPDATE 的 SET 目标；`UPDATE` 后该行 rowid 会变
+（删旧+插新），删除后槽位可能被复用 —— 客户端应在同一持锁事务内 fetch → 改，改完重新取一次 rowid。
 
 多库控制（同样由会话拦截，编译器不识别）：
 
@@ -203,7 +225,7 @@ engine.Close();
 .\build\cella_db\cella_db_tests.exe --log .\build\test_report.log
 ```
 
-当前：**86 用例 / 740 断言 / 0 失败**，明细见 [docs/TEST_REPORT.md](docs/TEST_REPORT.md)。
+当前：**87 用例 / 765 断言 / 0 失败**，明细见 [docs/TEST_REPORT.md](docs/TEST_REPORT.md)。
 
 ---
 

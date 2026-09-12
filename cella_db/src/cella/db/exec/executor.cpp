@@ -1,9 +1,14 @@
 #include "cella/db/exec/executor.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <set>
 #include <sstream>
+#include <utility>
+#include <vector>
 
 #include "cella/db/common/db_logger.h"
 #include "cella/db/common/value_bridge.h"
@@ -13,8 +18,24 @@
 
 namespace cella::db
 {
+  // ── rowid 伪列：公共判定（会话层与执行器共用）─────────────────
+  bool IsRowidName(const std::string &column)
+  {
+    return cella::cella_toUpper(column) == "ROWID";
+  }
+
   namespace
   {
+    // 表达式树里是否引用了 rowid
+    bool ExprRefersRowid(const cella::CELLA_Expr *e)
+    {
+      if (e == nullptr)
+        return false;
+      if (e->kind == cella::CELLA_Expr::Kind::COLUMN_REF)
+        return IsRowidName(e->column);
+      return ExprRefersRowid(e->left.get()) || ExprRefersRowid(e->right.get()) ||
+             ExprRefersRowid(e->child.get());
+    }
 
     // 存储层错误码 → 整合层错误码（保留原始信息）
     DbStatus FromStorage(const storage::Status &s, const std::string &what)
@@ -48,11 +69,78 @@ namespace cella::db
       return DbStatus::Error(code, what + " [存储: " + s.ToString() + "]");
     }
 
-    // 扫描用的字段列表（限定符 = 表名或别名）
-    std::vector<FieldRef> MakeFields(const CatalogTable &table, const std::string &qualifier)
+    // ── rowid 伪列：物理行标识 ⇄ 不透明整数 ──────────────────────
+    // 编码 = (页号 << 16) | 槽号（页号 32 位、槽号 16 位，合起来在 int64 内不溢出）。
+    // 语义边界：不透明（禁止算术）；UPDATE 是删旧+插新 → rowid 会变；
+    // 删除后槽位可能被后续插入复用 → 陈旧 rowid 可能指向新行。
+    // 因此客户端应在「同一持锁事务内 fetch → 改」，改完重新取一次 rowid。
+    constexpr int kRowidSlotBits = 16;
+    constexpr uint64_t kRowidSlotMask = 0xFFFFull;
+    constexpr const char *kRowidName = "rowid";
+
+
+    int64_t RowidOf(const storage::Rid &rid)
+    {
+      return (static_cast<int64_t>(rid.page_id) << kRowidSlotBits) |
+             static_cast<int64_t>(rid.slot_id);
+    }
+
+    bool RidFromRowid(int64_t rowid, storage::Rid *out)
+    {
+      if (rowid < 0)
+        return false;
+      out->page_id = static_cast<storage::page_id_t>(static_cast<uint64_t>(rowid) >> kRowidSlotBits);
+      out->slot_id = static_cast<storage::slot_id_t>(static_cast<uint64_t>(rowid) & kRowidSlotMask);
+      return out->IsValid();
+    }
+
+    // 谓词是否恰为 `rowid = <非负整数字面量>`（两侧顺序不限）。
+    // 命中时可按物理地址直达目标行，省掉全表扫描。
+    bool TryRowidEqLiteral(const cella::CELLA_Expr *pred, int64_t *value)
+    {
+      if (pred == nullptr || pred->kind != cella::CELLA_Expr::Kind::BINARY ||
+          pred->bop != cella::CELLA_Expr::BinOp::EQ || !pred->left || !pred->right)
+      {
+        return false;
+      }
+      const cella::CELLA_Expr *col = nullptr;
+      const cella::CELLA_Expr *lit = nullptr;
+      if (pred->left->kind == cella::CELLA_Expr::Kind::COLUMN_REF &&
+          pred->right->kind == cella::CELLA_Expr::Kind::LITERAL)
+      {
+        col = pred->left.get();
+        lit = pred->right.get();
+      }
+      else if (pred->right->kind == cella::CELLA_Expr::Kind::COLUMN_REF &&
+               pred->left->kind == cella::CELLA_Expr::Kind::LITERAL)
+      {
+        col = pred->right.get();
+        lit = pred->left.get();
+      }
+      else
+      {
+        return false;
+      }
+      if (!IsRowidName(col->column) || lit->lit != cella::CELLA_LiteralKind::NUMBER)
+        return false;
+      if (lit->text.find('.') != std::string::npos)
+        return false; // 只接受整数
+      errno = 0;
+      const long long parsed = std::strtoll(lit->text.c_str(), nullptr, 10);
+      if (errno != 0)
+        return false;
+      *value = static_cast<int64_t>(parsed);
+      return true;
+    }
+
+    // 扫描用的字段列表（限定符 = 表名或别名）。
+    // 仅当语句确实引用了 rowid 时才在末尾追加伪列：它（故意）不在编译器目录里，
+    // 所以 `get *` 不会带出它；不引用时不追加，`get *` 的输出与改造前完全一致。
+    std::vector<FieldRef> MakeFields(const CatalogTable &table, const std::string &qualifier,
+                                     bool with_rowid)
     {
       std::vector<FieldRef> fields;
-      fields.reserve(table.columns.size());
+      fields.reserve(table.columns.size() + (with_rowid ? 1 : 0));
       for (const auto &c : table.columns)
       {
         FieldRef f;
@@ -60,7 +148,24 @@ namespace cella::db
         f.name = c.name;
         fields.push_back(std::move(f));
       }
+      if (with_rowid)
+      {
+        FieldRef rid;
+        rid.qualifier = qualifier;
+        rid.name = kRowidName;
+        fields.push_back(std::move(rid));
+      }
       return fields;
+    }
+
+    // 供谓词求值的行值：物理列值（+ 引用 rowid 时末尾补 rowid），与 MakeFields 布局一致
+    std::vector<storage::Value> ValuesWithRowid(const std::vector<storage::Value> &values,
+                                               const storage::Rid &rid, bool with_rowid)
+    {
+      std::vector<storage::Value> out = values;
+      if (with_rowid)
+        out.push_back(storage::Value::BigInt(RowidOf(rid)));
+      return out;
     }
 
     // 把一行拼成 "k1|k2|..." 便于去重（用渲染文本，避免引入哈希）
@@ -140,6 +245,39 @@ namespace cella::db
     };
 
   } // namespace
+
+  // 语句是否在任何位置引用了 rowid（投影 / 条件 / 分组 / 排序 / SET 表达式）
+  bool StmtRefersRowid(const cella::CELLA_Stmt *st)
+  {
+    if (st == nullptr)
+      return false;
+    for (const auto &si : st->selectItems)
+    {
+      if (ExprRefersRowid(si.expr.get()))
+        return true;
+    }
+    // 注意：GET 的条件存在 st->limit（方言里 limit = WHERE），
+    // DELETE/UPDATE 的条件存在 st->where —— 两处都要看
+    if (ExprRefersRowid(st->where.get()) || ExprRefersRowid(st->limit.get()) ||
+        ExprRefersRowid(st->having.get()))
+      return true;
+    for (const auto &cn : st->grouped)
+    {
+      if (IsRowidName(cn.column))
+        return true;
+    }
+    for (const auto &oi : st->ordered)
+    {
+      if (IsRowidName(oi.col.column))
+        return true;
+    }
+    for (const auto &kv : st->sets)
+    {
+      if (ExprRefersRowid(kv.second.get()))
+        return true;
+    }
+    return false;
+  }
 
   Executor::Executor(storage::IStorage *storage, CatalogManager *catalog, TxnManager *txn_manager,
                      LockManager *locks, std::recursive_mutex *storage_mutex)
@@ -395,7 +533,7 @@ namespace cella::db
     if (pk_idx >= 0)
     {
       std::vector<std::pair<storage::Rid, storage::Record>> existing;
-      const DbStatus ss = ScanMatching(*meta, nullptr, &existing);
+      const DbStatus ss = ScanMatching(*meta, nullptr, ctx.with_rowid, &existing);
       if (!ss.ok())
       {
         return ss;
@@ -492,6 +630,7 @@ namespace cella::db
   // ── DELETE / UPDATE 共用的匹配扫描 ──────────────────────────
 
   DbStatus Executor::ScanMatching(const CatalogTable &table, const cella::CELLA_Expr *pred,
+                                  bool with_rowid,
                                   std::vector<std::pair<storage::Rid, storage::Record>> *out)
   {
     StorageGuard guard(storage_mutex_);
@@ -502,14 +641,15 @@ namespace cella::db
       return FromStorage(os, "打开表 " + table.name);
     }
 
-    const std::vector<FieldRef> fields = MakeFields(table, table.name);
+    const std::vector<FieldRef> fields = MakeFields(table, table.name, with_rowid);
     for (auto it = heap->begin(); it != heap->end(); ++it)
     {
       if (pred != nullptr)
       {
         EvalRow row;
         row.fields = &fields;
-        const std::vector<storage::Value> &vals = it->values();
+        // 谓词里可以出现 rowid，故求值行值与字段布局保持一致（末尾补 rowid）
+        const std::vector<storage::Value> vals = ValuesWithRowid(it->values(), it.rid(), with_rowid);
         row.values = &vals;
         bool pass = false;
         const DbStatus es = ExprEval::EvalPredicate(*pred, row, &pass);
@@ -525,6 +665,59 @@ namespace cella::db
       out->emplace_back(it.rid(), *it);
     }
     return DbStatus::Ok();
+  }
+
+  // 谓词恰为 `rowid = <整数>` 时按物理地址直达（省掉全表扫描）。
+  // 命中返回 true 并填好 out；返回 false 表示「不适用或存储层出错」→ 调用方退回全表扫描。
+  // 注意：rowid 由物理位置推出，位置若已空则必然无匹配行，这与扫描结果一致。
+  bool Executor::DirectByRowid(const CatalogTable &table, const cella::CELLA_Expr *pred,
+                               std::vector<std::pair<storage::Rid, storage::Record>> *out)
+  {
+    int64_t rowid = 0;
+    if (!TryRowidEqLiteral(pred, &rowid))
+    {
+      return false;
+    }
+    storage::Rid rid;
+    if (!RidFromRowid(rowid, &rid))
+    {
+      out->clear(); // 越界的 rowid 不可能命中任何行
+      return true;
+    }
+    StorageGuard guard(storage_mutex_);
+    std::shared_ptr<storage::TableHeap> heap;
+    if (!storage_->open_table(table.name, &heap).ok())
+    {
+      return false; // 交给通用路径去报错
+    }
+    storage::Record rec;
+    const storage::Status s = heap->GetRecord(rid, &rec);
+    if (s.ok())
+    {
+      out->clear();
+      out->emplace_back(rid, std::move(rec));
+      return true;
+    }
+    if (s.code() == storage::StatusCode::kPageNotFound ||
+        s.code() == storage::StatusCode::kInvalidArgument)
+    {
+      out->clear(); // 该物理位置没有行（已删或从未存在）→ 空命中
+      return true;
+    }
+    return false; // 其它存储错误：退回扫描路径，由它给出准确诊断
+  }
+
+  // 目标行收集：rowid 直达优先（O(1)），否则退回全表扫描 + 谓词过滤
+  DbStatus Executor::CollectTargets(const CatalogTable &table, const cella::CELLA_Expr *pred,
+                                    bool with_rowid,
+                                    std::vector<std::pair<storage::Rid, storage::Record>> *out)
+  {
+    out->clear();
+    if (DirectByRowid(table, pred, out))
+    {
+      return DbStatus::Ok();
+    }
+    return ScanMatching(table, pred, with_rowid, out);
   }
 
   // ── DELETE ──────────────────────────────────────────────────
@@ -555,7 +748,7 @@ namespace cella::db
 
     // 两阶段：先收集命中行，再逐条打墓碑（避免边扫描边改页）
     std::vector<std::pair<storage::Rid, storage::Record>> hits;
-    const DbStatus ms = ScanMatching(*meta, st->where.get(), &hits);
+    const DbStatus ms = CollectTargets(*meta, st->where.get(), ctx.with_rowid, &hits);
     if (!ms.ok())
     {
       return ms;
@@ -634,13 +827,13 @@ namespace cella::db
     }
 
     std::vector<std::pair<storage::Rid, storage::Record>> hits;
-    const DbStatus ms = ScanMatching(*meta, st->where.get(), &hits);
+    const DbStatus ms = CollectTargets(*meta, st->where.get(), ctx.with_rowid, &hits);
     if (!ms.ok())
     {
       return ms;
     }
 
-    const std::vector<FieldRef> fields = MakeFields(*meta, name);
+    const std::vector<FieldRef> fields = MakeFields(*meta, name, ctx.with_rowid);
     StorageGuard guard(storage_mutex_);
     size_t updated = 0;
 
@@ -660,7 +853,7 @@ namespace cella::db
     if (pk_assigned)
     {
       std::vector<std::pair<storage::Rid, storage::Record>> all_rows;
-      const DbStatus as = ScanMatching(*meta, nullptr, &all_rows);
+      const DbStatus as = ScanMatching(*meta, nullptr, ctx.with_rowid, &all_rows);
       if (!as.ok())
       {
         return as;
@@ -877,10 +1070,11 @@ namespace cella::db
       return FromStorage(os, "打开表 " + real);
     }
     const std::string qualifier = alias.empty() ? real : alias;
-    out->fields = MakeFields(*meta, qualifier);
+    out->fields = MakeFields(*meta, qualifier, ctx.with_rowid);
     for (auto it = heap->begin(); it != heap->end(); ++it)
     {
-      out->rows.push_back(it->values());
+      // 只有语句引用了 rowid 时才在末尾补上（与 MakeFields 的伪列对齐）
+      out->rows.push_back(ValuesWithRowid(it->values(), it.rid(), ctx.with_rowid));
     }
     return DbStatus::Ok();
   }

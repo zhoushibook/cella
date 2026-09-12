@@ -1,0 +1,32 @@
+CreateTable
+  table: student
+  columns: id INT, name VARCHAR(16)
+
+Insert
+  table: student
+  columns: id, name
+  rows: [1, 'Alice']
+
+Insert
+  table: student
+  columns: id, name
+  rows: [2, 'Bob']
+
+Project [rowid, id, name]
+  SeqScan [student]
+
+Project [id]
+  Filter (rowid = 1)
+    SeqScan [student]
+
+Sort (rowid ASC)
+  Project [id]
+    SeqScan [student]
+
+Update
+  table: student
+  sets: name = 'Ann'
+  SeqScan [student]
+
+Delete (filter: rowid = 1)
+  SeqScan [student]

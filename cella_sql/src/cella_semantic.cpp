@@ -24,8 +24,18 @@ namespace cella
             return cat.findTable(e.name);
         }
 
+        // rowid：每张表都有的**只读伪列**（物理行标识）。可在投影 / 条件 / 排序里引用，
+        // 但不能作为列名声明、不能出现在 INSERT 列清单或 UPDATE 的 SET 目标里
+        //（后两者走 CELLA_Catalog::findColumn，天然找不到 rowid）。
+        bool isRowidName(const std::string &name)
+        {
+            return cella_toUpper(name) == "ROWID";
+        }
+
         bool tableHasColumn(const CELLA_Table &t, const std::string &name)
         {
+            if (isRowidName(name))
+                return true; // 伪列：每张表都有
             std::string key = cella_toUpper(name);
             for (const auto &c : t.columns)
             {
@@ -297,7 +307,10 @@ namespace cella
                 if (!resolveColumn(e.table, e.column, e.line, e.col, scope, cat, errors))
                     return false;
                 const CELLA_Column *c = scopeFindColumn(scope, cat, e.table, e.column);
-                t = c ? dataTypeToValue(c->type) : CELLA_ValueType::UNKNOWN;
+                if (c == nullptr && isRowidName(e.column))
+                    t = CELLA_ValueType::INT; // rowid 伪列：整数型物理行标识
+                else
+                    t = c ? dataTypeToValue(c->type) : CELLA_ValueType::UNKNOWN;
                 break;
             }
             case CELLA_Expr::Kind::UNARY:
@@ -526,6 +539,13 @@ namespace cella
                     res.errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-304", cd.line, cd.col,
                                                          "列 \"" + cd.name + "\" 在表 \"" + st.tableName +
                                                              "\" 中重复定义"));
+                    return false;
+                }
+                if (isRowidName(cd.name))
+                {
+                    res.errors.push_back(cella_makeError(
+                        CELLA_Phase::SEM, "SEM-314", cd.line, cd.col,
+                        "rowid 是每张表都有的只读伪列，不能用作列名（表 \"" + st.tableName + "\"）"));
                     return false;
                 }
                 if (cd.primaryKey && ++primary_key_count > 1)

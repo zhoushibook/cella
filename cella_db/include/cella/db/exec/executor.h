@@ -44,9 +44,17 @@ struct ExecContext {
   // 锁资源名的库前缀（当前库名）：锁资源记作 "<db>.<table>"，
   // 避免引擎切换数据库后两个库的同名表共享同一把锁（假冲突/假死锁）。
   std::string lock_scope;
+  // 语句是否引用了 rowid 伪列：只有引用时才在扫描结果末尾追加它，
+  // 从而保证 `get *` 的输出与不引用 rowid 的语句完全不受影响。
+  // 放在上下文里（而不是 Executor 成员）是因为引擎可能被多会话并发使用。
+  bool with_rowid = false;
 
   bool recording() const { return txn != nullptr; }
 };
+
+// 语句是否在任何位置引用了 rowid 伪列（投影 / 条件 / 分组 / 排序 / SET 表达式）。
+// 会话层用它决定是否让扫描附加 rowid（见 ExecContext::with_rowid）。
+bool StmtRefersRowid(const cella::CELLA_Stmt* st);
 
 class Executor {
  public:
@@ -91,8 +99,15 @@ class Executor {
   // ── 工具 ──
   DbStatus LockTable(const std::string& table, LockMode mode, const ExecContext& ctx);
   // 扫描一张表并按谓词过滤，收集 (Rid, 记录)（DELETE/UPDATE 两阶段修改用）
-  DbStatus ScanMatching(const CatalogTable& table, const cella::CELLA_Expr* pred,
+  DbStatus ScanMatching(const CatalogTable& table, const cella::CELLA_Expr* pred, bool with_rowid,
                         std::vector<std::pair<storage::Rid, storage::Record>>* out);
+  // 谓词恰为 `rowid = <整数>` 时按物理地址直达目标行（省掉全表扫描）。
+  // 返回 true = 已得出结论（可能为空）；false = 不适用/存储出错，调用方退回 ScanMatching。
+  bool DirectByRowid(const CatalogTable& table, const cella::CELLA_Expr* pred,
+                     std::vector<std::pair<storage::Rid, storage::Record>>* out);
+  // 目标行收集：先试 rowid 直达，否则全表扫描 + 谓词过滤（DELETE/UPDATE 共用）
+  DbStatus CollectTargets(const CatalogTable& table, const cella::CELLA_Expr* pred, bool with_rowid,
+                          std::vector<std::pair<storage::Rid, storage::Record>>* out);
   // 解析 SeqScan 的 detail 文本 "[name alias]"（tableRef 缺失时的兜底）
   static bool ParseTableDisplay(const std::string& detail, std::string* name, std::string* alias);
 

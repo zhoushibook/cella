@@ -97,6 +97,16 @@ primary     := const_expr | col_name | '(' expr ')' ;
 const_expr  := NUMBER | STRING | DATE | NULL | TRUE | FALSE ;
 ```
 
+**rowid 伪列（只读）**：
+
++ 每张表都有一个物理行标识伪列 `rowid`，值 = `(页号 << 16) | 槽号` 的**不透明整数**（禁止对它做算术）。
++ 可用于**投影 / 条件（limit）/ 排序**：`get rowid, id in t;`、`delete in t limit rowid = 393216;`、
+  `get id in t ordered rowid asc;`。它不参与 `get *` 的星号展开。
++ **只读**：不能作为列名声明（`SEM-314`），不能出现在 INSERT 列清单或 UPDATE 的 SET 目标里。
++ 由于它由物理位置推出：`UPDATE`（删旧+插新）后该行的 rowid 会变；删除后的槽位可能被后续插入复用。
++ 因此正确用法是「同一持锁事务内 fetch → 改」，改完重新取一次 rowid。
++ 多表连接里 `rowid` 有歧义（每张表都有），会按 `SEM-308` 报「列不明确」，需用 `表名.rowid` 限定。
+
 **主键（PRIMARY KEY）语义**：
 
 + 只支持**列级单列主键**；一张表至多一个，重复声明报 `SEM-313`。

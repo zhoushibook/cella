@@ -388,3 +388,62 @@ MT_TEST(执行_主键约束) {
   MT_CHECK(e.Run("INSERT INTO s VALUES (1,'dup');").statements[0].status.code() ==
            DbCode::kPrimaryKeyViolation);
 }
+
+MT_TEST(执行_rowid伪列) {
+  Engine e("exec_rowid");
+  // 两行**全列相同**：这正是全列匹配无法区分、只能靠 rowid 精确定位的场景
+  MT_CHECK(e
+               .Run("CREATE TABLE d(id INT, name VARCHAR(8));"
+                    "INSERT INTO d VALUES (1,'same'),(1,'same'),(2,'x');")
+               .all_ok());
+
+  // ① get * 不受影响：rowid 不会混进星号展开
+  const ScriptReport star = e.Run("get * in d;");
+  MT_CHECK(star.all_ok());
+  MT_EQ(testutil::ColsText(star.statements[0].result), std::string("id|name"));
+
+  // ② 投影 rowid：两行同值但 rowid 不同
+  const ScriptReport r = e.Run("get rowid, name in d;");
+  MT_CHECK(r.all_ok());
+  MT_EQ(testutil::ColsText(r.statements[0].result), std::string("rowid|name"));
+  MT_EQ(r.statements[0].result.rows.size(), 3u);
+  const int64_t rid0 = r.statements[0].result.rows[0][0].int64_val;
+  const int64_t rid1 = r.statements[0].result.rows[1][0].int64_val;
+  MT_CHECK(rid0 > 0 && rid1 > 0);
+  MT_CHECK(rid0 != rid1); // 同值行靠 rowid 区分
+
+  // ③ 按 rowid 只删掉其中一行（重复行场景的杀手锏）
+  MT_CHECK(e.Run("delete in d limit rowid = " + std::to_string(rid0) + ";").all_ok());
+  MT_EQ(RowsText(e.Run("get name in d ordered name asc;").statements[0].result),
+        std::string("same\nx"));
+  // 另一行的 rowid 仍在
+  MT_CHECK(e.Run("get id in d limit rowid = " + std::to_string(rid1) + ";").all_ok());
+
+  // ④ 按 rowid 精确改一行，且改后 rowid 会变（UPDATE = 删旧 + 插新，文档化行为）
+  MT_CHECK(e.Run("update d set name = 'z' limit rowid = " + std::to_string(rid1) + ";").all_ok());
+  const ScriptReport after = e.Run("get rowid, name in d ordered name asc;");
+  MT_CHECK(after.all_ok());
+  bool found_old_rid = false;
+  for (const auto &row : after.statements[0].result.rows) {
+    if (row[0].int64_val == rid1) {
+      found_old_rid = true;
+    }
+  }
+  MT_CHECK(!found_old_rid); // 旧 rowid 不再存在
+
+  // ⑤ 不存在的 rowid：空结果、不报错
+  MT_CHECK(e.Run("get id in d limit rowid = 999999999;").all_ok());
+  MT_EQ(RowsText(e.Run("get id in d limit rowid = 999999999;").statements[0].result),
+        std::string());
+  const ScriptReport del_none = e.Run("delete in d limit rowid = 999999999;");
+  MT_CHECK(del_none.all_ok());
+  MT_EQ(del_none.statements[0].result.affected, 0u);
+
+  // ⑥ 非法用法：不能声明 rowid 列、不能对它赋值 / 插入
+  MT_CHECK(!e.Run("CREATE TABLE bad(rowid INT);").all_ok());
+  MT_CHECK(!e.Run("INSERT INTO d(rowid, id) VALUES (9, 9);").all_ok());
+  MT_CHECK(!e.Run("UPDATE d SET rowid = 5;").all_ok());
+
+  // ⑦ 排序键也能用 rowid
+  MT_CHECK(e.Run("get id in d ordered rowid desc;").all_ok());
+}

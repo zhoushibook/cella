@@ -164,6 +164,42 @@
 7. [x] 整合层测试（见 3.4）
 8. [x] 文档 + 全量回归 + 提交
 
+### 3.3b 阶段二完成记录（2026-09-12）
+
+* 全部步骤完成；回归：编译器 **33/33**（新增 ok_rowid），整合层 **87/87（765 断言）**，
+  既有 golden 未动一字节。
+* 实施中的两个关键决策（与计划的偏差/澄清）：
+  1. **rowid 不进关键字表**：仍按普通标识符解析，只在语义的「列存在性」判定上把 rowid 视为
+     每张表都有的伪列。这样 INSERT 列清单 / SET 目标天然查不到它（走 `CELLA_Catalog::findColumn`），
+     连「禁止写入」都不需要额外代码；只有「声明为列名」需要显式拦（新码 SEM-314）。
+  2. **按需附加，而非总是附加**：`get *` 没有 Project 节点（星号展开在编译期完成），
+     若总是附加 rowid 就会泄漏成结果里的一列。改为按语句判定（`StmtRefersRowid` →
+     `ExecContext::with_rowid`），只有真正引用 rowid 的语句才附加，`get *` 输出与改造前逐字节一致。
+     标志放在 ExecContext（而非 Executor 成员）是因为引擎会被多会话并发使用。
+* 踩坑记录：GET 的条件存在 `st->limit`（方言 limit = WHERE），DELETE/UPDATE 的存在 `st->where` ——
+  语句级 rowid 判定必须两处都看，否则 `get ... limit rowid = X` 会报「列不存在」。
+* 快速路径：`rowid = <整数>` 走 `TableHeap::GetRecord` 直达（O(1)），越界值返回空命中而非报错，
+  存储错误时回退全表扫描；结果语义与扫描路径完全一致。
+* 存储层零改动（`GetRecord` / `DeleteRecord` 早已存在）。
+
+### 3.3b 阶段二完成记录（2026-09-12）
+
+* 全部步骤完成；回归：编译器 **33/33**（新增 ok_rowid），整合层 **87/87（765 断言）**，
+  既有 golden 未动一字节。
+* 实施中的两个关键决策（与计划的偏差/澄清）：
+  1. **rowid 不进关键字表**：仍按普通标识符解析，只在语义的「列存在性」判定上把 rowid 视为
+     每张表都有的伪列。这样 INSERT 列清单 / SET 目标天然查不到它（走 `CELLA_Catalog::findColumn`），
+     连「禁止写入」都不需要额外代码；只有「声明为列名」需要显式拦（新码 SEM-314）。
+  2. **按需附加，而非总是附加**：`get *` 没有 Project 节点（星号展开在编译期完成），
+     若总是附加 rowid 就会泄漏成结果里的一列。改为按语句判定（`StmtRefersRowid` →
+     `ExecContext::with_rowid`），只有真正引用 rowid 的语句才附加，`get *` 输出与改造前逐字节一致。
+     标志放在 ExecContext（而非 Executor 成员）是因为引擎会被多会话并发使用。
+* 踩坑记录：GET 的条件存在 `st->limit`（方言 limit = WHERE），DELETE/UPDATE 的存在 `st->where` ——
+  语句级 rowid 判定必须两处都看，否则 `get ... limit rowid = X` 会报「列不存在」。
+* 快速路径：`rowid = <整数>` 走 `TableHeap::GetRecord` 直达（O(1)），越界值返回空命中而非报错，
+  存储错误时回退全表扫描；结果语义与扫描路径完全一致。
+* 存储层零改动（`GetRecord` / `DeleteRecord` 早已存在）。
+
 ### 3.4 测试清单
 
 | 用例 | 断言 |

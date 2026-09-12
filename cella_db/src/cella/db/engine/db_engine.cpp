@@ -909,6 +909,9 @@ DbStatus Session::ExecuteOne(const std::string& stmt_text, int line, int col, St
   ctx.txn_id = txn_;
   ctx.txn = txn_handle_.get();
   ctx.lock_scope = engine_->current_db();
+  // rowid 伪列：只在该语句确实引用它时才让扫描在结果末尾附加（否则 `get *` 会多出一列）
+  ctx.with_rowid =
+      program->statements.empty() ? false : StmtRefersRowid(program->statements[0].get());
 
   Executor& executor = *engine_->executor_;
   executor.ResetOperatorCalls();
