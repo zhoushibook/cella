@@ -13,8 +13,10 @@
 //   -h, --help        显示本帮助
 //
 // 安全：只监听 127.0.0.1；同一数据目录只允许一个服务进程（lock 文件，PLAN §6.5）。
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -45,15 +47,20 @@ const char* const kUsage =
     "  --replacer NAME   替换策略 LRU|FIFO|CLOCK（默认 LRU）\n"
     "  -h, --help        显示本帮助\n";
 
-// 单实例锁：同一 data_dir 只允许一个服务进程（IStorage 无文件锁，PLAN §6.5）
+// 单实例锁：同一 data_dir 只允许一个服务进程（IStorage 无文件锁，PLAN §6.5）。
+// 锁文件记录 pid=N；启动时校验持有者进程是否仍存活 —— 强制结束的进程不会执行析构、
+// 会留下陈旧锁，这里自动识别并清理后照常接管（pid 复用导致的误判方向是保守的：拒绝启动）。
 class InstanceLock {
  public:
   explicit InstanceLock(const std::string& data_dir) : path_(data_dir + "/cella-client.lock") {
     std::error_code ec;
     std::filesystem::create_directories(data_dir, ec);
     if (std::filesystem::exists(path_, ec)) {
-      // 已有进程持有：拒绝启动（不做抢占，避免误伤）
-      return;
+      if (HolderAlive()) {
+        return;  // 真有进程在跑：拒绝启动
+      }
+      std::error_code rm_ec;
+      std::filesystem::remove(path_, rm_ec);  // 陈旧锁：清理后接管
     }
     std::ofstream f(path_, std::ios::binary | std::ios::trunc);
     if (f.is_open()) {
@@ -70,6 +77,35 @@ class InstanceLock {
   bool held() const { return held_; }
 
  private:
+  // 锁文件里存在可解析的 pid=N 且该进程仍存活 → true；文件缺失/无 pid/进程已死 → false
+  bool HolderAlive() const {
+    std::ifstream f(path_, std::ios::binary);
+    if (!f.is_open()) {
+      return false;
+    }
+    std::string line;
+    while (std::getline(f, line)) {
+      if (line.rfind("pid=", 0) != 0) {
+        continue;
+      }
+      const unsigned long pid = std::strtoul(line.c_str() + 4, nullptr, 10);
+      if (pid == 0) {
+        return false;
+      }
+#if defined(_WIN32)
+      HANDLE h = ::OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
+      if (h == nullptr) {
+        return false;  // 进程已不存在
+      }
+      ::CloseHandle(h);
+      return true;
+#else
+      return kill(static_cast<pid_t>(pid), 0) == 0 || errno != ESRCH;
+#endif
+    }
+    return false;
+  }
+
   std::string path_;
   bool held_ = false;
 };
