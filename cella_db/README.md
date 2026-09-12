@@ -104,6 +104,15 @@ powershell -ExecutionPolicy Bypass -File run_all.ps1
 
 多库控制（同样由会话拦截，编译器不识别）：
 
+建表可声明列级主键（隐含 NOT NULL，唯一性由执行层校验，冲突报 `DB-516`）：
+
+```sql
+CREATE TABLE s(id INT PRIMARY KEY, name VARCHAR(16) NOT NULL);
+CREATE TABLE c(code VARCHAR(8) NOT NULL PRIMARY KEY, title TEXT);  -- 约束顺序任意
+```
+
+多库控制（同样由会话拦截，编译器不识别）：
+
 ```sql
 CREATE DATABASE school;   -- 建 <data_dir>/school.db（已存在 → DB-514）
 USE school;               -- 切换当前库（事务中 → DB-513）
@@ -127,6 +136,7 @@ DROP DATABASE school;     -- 软删除：改名 <db>.db.dropped-<时间戳>，�
 | 目录·执行 | `DB-501` | SQL 编译失败（携带编译器诊断原文） |
 | | `DB-502` / `DB-503` | 表不存在 / 表已存在 |
 | | `DB-504` / `DB-512` | 列不存在 / 系统表禁止修改（只读） |
+| | `DB-516` | 主键冲突（唯一性被破坏） |
 | | `DB-505` / `DB-506` / `DB-507` / `DB-508` | 类型不匹配 / NOT NULL 违约 / 值个数不符 / 文本超长 |
 | | `DB-510` / `DB-511` | 记录超页 / 除零 |
 | | `DB-520` | 存储层返回失败（消息里附原始存储码） |
@@ -193,7 +203,7 @@ engine.Close();
 .\build\cella_db\cella_db_tests.exe --log .\build\test_report.log
 ```
 
-当前：**84 用例 / 706 断言 / 0 失败**，明细见 [docs/TEST_REPORT.md](docs/TEST_REPORT.md)。
+当前：**86 用例 / 740 断言 / 0 失败**，明细见 [docs/TEST_REPORT.md](docs/TEST_REPORT.md)。
 
 ---
 

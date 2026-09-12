@@ -20,6 +20,7 @@ const char* ToString(DbCode c) {
     case DbCode::kDatabaseTxnActive:  return "DB-513";
     case DbCode::kDatabaseError:      return "DB-514";
     case DbCode::kDatabaseProtected:  return "DB-515";
+    case DbCode::kPrimaryKeyViolation: return "DB-516";
     case DbCode::kStorageError:       return "DB-520";
     case DbCode::kNoActiveTxn:        return "DB-601";
     case DbCode::kTxnAlreadyActive:   return "DB-602";

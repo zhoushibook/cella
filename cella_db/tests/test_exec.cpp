@@ -344,3 +344,47 @@ MT_TEST(执行_NULL判空) {
   MT_EQ(RowsText(e.Run("get name in p limit id is null;").statements[0].result),
         std::string());
 }
+
+MT_TEST(执行_主键约束) {
+  Engine e("exec_pk");
+  MT_CHECK(e.Run("CREATE TABLE s(id INT PRIMARY KEY, name VARCHAR(16));").all_ok());
+  // 目录中记下主键，且隐含 NOT NULL
+  const CatalogTable *meta = e.engine.catalog().FindTable("s");
+  MT_CHECK(meta != nullptr);
+  MT_EQ(meta->PrimaryKeyColumnIndex(), 0);
+  MT_CHECK(meta->columns[0].not_null);
+
+  MT_CHECK(e.Run("INSERT INTO s VALUES (1,'a'),(2,'b');").all_ok());
+  // 重复主键 → DB-516
+  MT_CHECK(e.Run("INSERT INTO s VALUES (1,'dup');").statements[0].status.code() ==
+           DbCode::kPrimaryKeyViolation);
+  // 同一语句内的自冲突也要拦，且已插入的那行随语句级回滚一起撤销
+  MT_CHECK(e.Run("INSERT INTO s VALUES (3,'c'),(3,'d');").statements[0].status.code() ==
+           DbCode::kPrimaryKeyViolation);
+  MT_EQ(RowsText(e.Run("get id in s ordered id asc;").statements[0].result), std::string("1\n2"));
+  // NULL 入主键被 NOT NULL 拦（编译期语义检查）
+  MT_CHECK(!e.Run("INSERT INTO s VALUES (NULL,'x');").all_ok());
+
+  // 更新主键撞车 → 拒绝；改成自己原值 → 允许（排除自身）
+  MT_CHECK(e.Run("UPDATE s SET id = 2 limit id = 1;").statements[0].status.code() ==
+           DbCode::kPrimaryKeyViolation);
+  MT_CHECK(e.Run("UPDATE s SET id = 1 limit id = 1;").all_ok());
+  MT_CHECK(e.Run("UPDATE s SET name = 'z' limit id = 2;").all_ok());
+  // 一次更新把多行改成同一主键值 → 拒绝
+  MT_CHECK(e.Run("UPDATE s SET id = 9;").statements[0].status.code() ==
+           DbCode::kPrimaryKeyViolation);
+  // 删除后主键值可重用
+  MT_CHECK(e.Run("DELETE in s limit id = 2;").all_ok());
+  MT_CHECK(e.Run("INSERT INTO s VALUES (2,'reuse');").all_ok());
+  MT_EQ(RowsText(e.Run("get name in s ordered id asc;").statements[0].result),
+        std::string("a\nreuse"));
+
+  // 重启后主键定义保留，约束仍然生效
+  e.Close();
+  MT_CHECK(e.Reopen());
+  const CatalogTable *meta2 = e.engine.catalog().FindTable("s");
+  MT_CHECK(meta2 != nullptr);
+  MT_EQ(meta2->PrimaryKeyColumnIndex(), 0);
+  MT_CHECK(e.Run("INSERT INTO s VALUES (1,'dup');").statements[0].status.code() ==
+           DbCode::kPrimaryKeyViolation);
+}

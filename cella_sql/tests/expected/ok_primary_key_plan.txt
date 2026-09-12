@@ -1,0 +1,29 @@
+CreateTable
+  table: student
+  columns: id INT PRIMARY KEY, name VARCHAR(16) NOT NULL
+
+CreateTable
+  table: course
+  columns: code VARCHAR(8) NOT NULL PRIMARY KEY, title TEXT, credit INT NOT NULL
+
+CreateTable
+  table: score
+  columns: sid INT NOT NULL, cid INT NOT NULL PRIMARY KEY, pts INT
+
+Insert
+  table: student
+  columns: id, name
+  rows: [1, 'Alice']
+
+Insert
+  table: course
+  columns: code, title, credit
+  rows: ['C1', 'Math', 3]
+
+Update
+  table: student
+  sets: name = 'Bob'
+  SeqScan [student]
+
+Delete (filter: id = 1)
+  SeqScan [student]

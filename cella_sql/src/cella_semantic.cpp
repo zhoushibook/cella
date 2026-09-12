@@ -517,6 +517,7 @@ namespace cella
                 return false;
             }
             std::set<std::string> seen;
+            int primary_key_count = 0;
             for (const auto &cd : st.columns)
             {
                 std::string key = cella_toUpper(cd.name);
@@ -527,6 +528,13 @@ namespace cella
                                                              "\" 中重复定义"));
                     return false;
                 }
+                if (cd.primaryKey && ++primary_key_count > 1)
+                {
+                    res.errors.push_back(cella_makeError(
+                        CELLA_Phase::SEM, "SEM-313", cd.line, cd.col,
+                        "表 \"" + st.tableName + "\" 定义了多个主键（本方言只支持列级单列主键）"));
+                    return false;
+                }
             }
             CELLA_Table table;
             table.name = st.tableName;
@@ -535,7 +543,7 @@ namespace cella
                 CELLA_Column c;
                 c.name = cd.name;
                 c.type = cd.type;
-                c.notNull = cd.notNull;
+                c.notNull = cd.notNull || cd.primaryKey; // 主键隐含 NOT NULL
                 c.len = cd.hasLen ? cd.len : ((cd.type == CELLA_DataType::CHAR || cd.type == CELLA_DataType::VARCHAR) ? 255 : 0);
                 table.columns.push_back(std::move(c));
             }

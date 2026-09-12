@@ -85,6 +85,7 @@ namespace cella
         int len = 0;
         bool hasLen = false;
         bool notNull = false;
+        bool primaryKey = false; // 列级主键（隐含 NOT NULL，由语义阶段补齐）
         int line = 0, col = 0;
     };
 

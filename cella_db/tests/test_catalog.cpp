@@ -7,6 +7,7 @@
 #include <string>
 
 #include "cella/db/catalog/catalog_manager.h"
+#include "cella/storage/table/table_heap.h"
 #include "cella/db/engine/db_engine.h"
 #include "mini_test.h"
 #include "test_util.h"
@@ -168,8 +169,8 @@ MT_TEST(目录_系统表可查询) {
   MT_CHECK(r.all_ok());
   MT_EQ(testutil::ColsText(r.statements[0].result), std::string("name|columns"));
   MT_EQ(RowsText(r.statements[0].result),
-        std::string("course|id INT 0 0, title TEXT 0 0\n"
-                    "student|id INT 0 1, name VARCHAR 32 1"));
+        std::string("course|id INT 0 0 0, title TEXT 0 0 0\n"
+                    "student|id INT 0 1 0, name VARCHAR 32 1 0"));
 
   // 按名字过滤取表号
   const ScriptReport r2 = e.Run("get table_id in cella_catalog limit name = 'student';");
@@ -319,4 +320,33 @@ MT_TEST(目录_删数据文件后重开为空库) {
   MT_CHECK(e.engine.catalog().FindTable("cella_catalog") != nullptr);  // 系统表自动重建
   // 空库可正常建表使用
   MT_CHECK(e.Run("CREATE TABLE t2(id INT);").all_ok());
+}
+
+MT_TEST(目录_主键编码向后兼容) {
+  Engine e("cat_pk_compat");
+  MT_CHECK(e.opened);
+  // 模拟「主键改造之前建的库」：直接用存储层建物理表 + 写一行**4 段**编码的目录行
+  //（旧格式没有主键位）。新版本必须仍能解析，并把主键位视为「无主键」。
+  cella::storage::Schema schema;
+  schema.AddColumn("id", cella::storage::ValueType::kInt32, 0);
+  MT_CHECK(e.engine.storage()->create_table("old", schema).ok());
+
+  std::shared_ptr<cella::storage::TableHeap> heap;
+  MT_CHECK(e.engine.storage()->open_table("cella_catalog", &heap).ok());
+  cella::storage::Record rec;
+  rec.AddValue(cella::storage::Value::Varchar("old"));
+  rec.AddValue(cella::storage::Value::Int(99));
+  rec.AddValue(cella::storage::Value::Int(0));
+  rec.AddValue(cella::storage::Value::Varchar("id INT 0 1")); // 旧：名 类型 长度 非空
+  cella::storage::Rid rid;
+  MT_CHECK(heap->InsertRecord(rec, &rid).ok());
+
+  // 关掉重开 = 模拟「旧库用新版本打开」：Open 会重载目录，会话目录也随之重建
+  e.Close();
+  MT_CHECK(e.Reopen());
+  const CatalogTable *t = e.engine.catalog().FindTable("old");
+  MT_CHECK(t != nullptr);
+  MT_EQ(t->PrimaryKeyColumnIndex(), -1); // 旧行没有主键位 → 无主键
+  MT_CHECK(t->columns[0].not_null);      // 其余字段照常解析
+  MT_CHECK(e.Run("INSERT INTO old VALUES (1);").all_ok());
 }

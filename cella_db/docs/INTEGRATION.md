@@ -285,6 +285,7 @@ BlockersLocked(txn) = { 与 txn 的待满足请求冲突的持有者 }
 | 8 | 持久化 = 缓冲池刷盘 + 审计日志 | 事务提交默认不强制 `fsync`；`journal.log` 是审计轨迹，**不是**完整 ARIES/WAL 恢复。DDL 在自动提交后**立即存盘**；其余数据默认只在 `Close()`（干净退出）落盘，也可用 `\checkpoint` / `--checkpoint-on-commit` 手动保证 |
 | 8b | 目录 = 系统表（已随本次重构解决） | 目录由独立文本 `catalog.meta` 改为页式存储里的系统表 `cella_catalog`，与数据同文件同路径，`DB-509` 类「目录/数据不一致」已从机制上消失（旧文本只在启动时一次性迁移） |
 | 8c | 多库 = 一库一文件，引擎级当前库 | `CREATE/DROP DATABASE`、`USE`、`SHOW DATABASES` 在会话层拦截（不进编译器）；同一引擎实例同一时刻只开一个库，跨库并发用多进程；DROP 为软删除（改名留档） |
+| 8d | 主键 = 列级单列，无索引 | 只支持列级单列主键（`SEM-313` 拦多主键）；唯一性靠扫描比对（O(n)，语句内累积键集合避免批量插入 O(N²)）；主键是约束不是加速器，索引另立项 |
 | 9 | DDL 隐式提交前置事务 | 建表/删表立即写目录行 + 存盘，元数据不可回滚；避免「数据回滚、目录已变」的不一致 |
 | 10 | `ORDER BY` 未投影列 | 计划形状固定为 `Project → Distinct → Sort`，执行期用「隐藏排序列」通道实现合法语义（详见 ARCHITECTURE.md §5.3） |
 | 11 | `CatalogTable::first_page_id` | `IStorage` 未导出「首数据页」查询，建表后用 `open_table` 句柄补齐，仅作诊断展示 |

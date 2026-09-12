@@ -167,6 +167,8 @@ namespace cella
             }
             if (cd.notNull)
                 s += " NOT NULL";
+            if (cd.primaryKey)
+                s += " PRIMARY KEY";
             return s;
         }
 

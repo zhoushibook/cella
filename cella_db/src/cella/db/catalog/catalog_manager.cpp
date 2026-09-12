@@ -124,6 +124,15 @@ uint16_t CatalogTable::MaxLenAt(size_t index) const {
   return 0;  // TEXT / 定长类型：不做长度约束
 }
 
+int CatalogTable::PrimaryKeyColumnIndex() const {
+  for (size_t i = 0; i < columns.size(); ++i) {
+    if (columns[i].primary_key) {
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
 // ── CatalogManager：系统表 ─────────────────────────────────
 
 bool CatalogManager::IsSystemTable(const std::string& name) {
@@ -338,6 +347,7 @@ DbStatus CatalogManager::EnsurePhysicalTable(const CatalogTable& table) {
   return DbStatus::Ok();
 }
 
+// 列编码：`名 类型 长度 非空 主键`（主键为第 5 段；旧库只有 4 段，解码兼容）
 std::string CatalogManager::EncodeColumns(const std::vector<CatalogColumn>& cols) {
   std::ostringstream os;
   for (size_t i = 0; i < cols.size(); ++i) {
@@ -345,7 +355,8 @@ std::string CatalogManager::EncodeColumns(const std::vector<CatalogColumn>& cols
       os << ", ";
     }
     const CatalogColumn& c = cols[i];
-    os << c.name << " " << CatalogTypeName(c.type) << " " << c.len << " " << (c.not_null ? 1 : 0);
+    os << c.name << " " << CatalogTypeName(c.type) << " " << c.len << " " << (c.not_null ? 1 : 0)
+       << " " << (c.primary_key ? 1 : 0);
   }
   return os.str();
 }
@@ -359,7 +370,8 @@ bool CatalogManager::DecodeColumns(const std::string& text, std::vector<CatalogC
   std::string part;
   while (std::getline(is, part, ',')) {
     const std::vector<std::string> t = SplitWs(part);
-    if (t.size() != 4) {
+    // 兼容改造前的 4 段编码（无主键位）与新 5 段编码
+    if (t.size() != 4 && t.size() != 5) {
       return false;
     }
     CatalogColumn c;
@@ -369,6 +381,7 @@ bool CatalogManager::DecodeColumns(const std::string& text, std::vector<CatalogC
     }
     c.len = std::atoi(t[2].c_str());
     c.not_null = (t[3] == "1");
+    c.primary_key = (t.size() == 5 && t[4] == "1");
     cols->push_back(std::move(c));
   }
   return true;
@@ -580,7 +593,11 @@ std::string CatalogManager::DescribeTable(const std::string& name) const {
     return "表不存在: " + name;
   }
   std::ostringstream os;
-  os << t->name << " (表号 #" << t->table_id << ", 首数据页 " << t->first_page_id << ")\n";
+  os << t->name << " (表号 #" << t->table_id << ", 首数据页 " << t->first_page_id;
+  if (t->PrimaryKeyColumnIndex() >= 0) {
+    os << ", 主键 " << t->columns[static_cast<size_t>(t->PrimaryKeyColumnIndex())].name;
+  }
+  os << ")\n";
   for (size_t i = 0; i < t->columns.size(); ++i) {
     const CatalogColumn& c = t->columns[i];
     os << "  " << (i + 1) << ". " << c.name << " " << CatalogTypeName(c.type);
@@ -589,6 +606,9 @@ std::string CatalogManager::DescribeTable(const std::string& name) const {
     }
     if (c.not_null) {
       os << " NOT NULL";
+    }
+    if (c.primary_key) {
+      os << " PRIMARY KEY";
     }
     os << "\n";
   }

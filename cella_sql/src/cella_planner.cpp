@@ -186,6 +186,8 @@ namespace cella
                     }
                     if (cd.notNull)
                         s += " NOT NULL";
+                    if (cd.primaryKey)
+                        s += " PRIMARY KEY";
                     cols.push_back(s);
                 }
                 node->extra.push_back("columns: " + joinStrs(cols, ", "));

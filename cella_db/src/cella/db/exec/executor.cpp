@@ -234,7 +234,8 @@ namespace cella::db
       c.len = (cd.type == cella::CELLA_DataType::CHAR || cd.type == cella::CELLA_DataType::VARCHAR)
                   ? (cd.hasLen ? cd.len : 255)
                   : 0;
-      c.not_null = cd.notNull;
+      c.not_null = cd.notNull || cd.primaryKey; // 主键隐含 NOT NULL
+      c.primary_key = cd.primaryKey;
       entry.columns.push_back(c);
     }
 
@@ -386,6 +387,25 @@ namespace cella::db
     const size_t ncol = meta->columns.size();
     size_t inserted = 0;
 
+    // ── 主键唯一性：先一次性收集已有行的键，插入过程中累积比对 ──
+    // 语句内累积（而不是逐行重扫）避免批量插入退化为 O(N²)；冲突即返回，
+    // 语句级回滚会撤销本语句已插入的行。
+    const int pk_idx = meta->PrimaryKeyColumnIndex();
+    std::set<std::string> pk_keys;
+    if (pk_idx >= 0)
+    {
+      std::vector<std::pair<storage::Rid, storage::Record>> existing;
+      const DbStatus ss = ScanMatching(*meta, nullptr, &existing);
+      if (!ss.ok())
+      {
+        return ss;
+      }
+      for (const auto &er : existing)
+      {
+        pk_keys.insert(KeyOfRow(er.second.values(), std::vector<int>{pk_idx}));
+      }
+    }
+
     for (const auto &row : st->rows)
     {
       if (row.size() != targets.size())
@@ -433,6 +453,17 @@ namespace cella::db
           return DbStatus::Error(cs.code(), "列 " + meta->columns[i].name + ": " + cs.message());
         }
         rec.AddValue(std::move(coerced));
+      }
+
+      if (pk_idx >= 0)
+      {
+        const std::string key = KeyOfRow(rec.values(), std::vector<int>{pk_idx});
+        if (!pk_keys.insert(key).second)
+        {
+          return DbStatus::Error(DbCode::kPrimaryKeyViolation,
+                                 "主键冲突: 列 " + meta->columns[static_cast<size_t>(pk_idx)].name +
+                                     " 的值已存在（表 " + name + "）");
+        }
       }
 
       storage::Rid rid;
@@ -613,6 +644,43 @@ namespace cella::db
     StorageGuard guard(storage_mutex_);
     size_t updated = 0;
 
+    // ── 主键唯一性（仅当更新涉及主键列时检查）──
+    // 语义是「把命中行的主键值改成新值」：新值不能与**未命中行**冲突，
+    // 命中行之间也不能改成同一个新值；「排除自身」用命中 Rid 集合实现。
+    const int pk_idx = meta->PrimaryKeyColumnIndex();
+    bool pk_assigned = false;
+    for (const auto &a : assigns)
+    {
+      if (a.index == pk_idx && pk_idx >= 0)
+      {
+        pk_assigned = true;
+      }
+    }
+    std::set<std::string> pk_taken;
+    if (pk_assigned)
+    {
+      std::vector<std::pair<storage::Rid, storage::Record>> all_rows;
+      const DbStatus as = ScanMatching(*meta, nullptr, &all_rows);
+      if (!as.ok())
+      {
+        return as;
+      }
+      std::set<std::pair<storage::page_id_t, storage::slot_id_t>> hit_rids;
+      for (const auto &h : hits)
+      {
+        hit_rids.insert({h.first.page_id, h.first.slot_id});
+      }
+      for (const auto &row : all_rows)
+      {
+        // 命中行会被改写，其旧主键值不参与比对（这才是「排除自身」）
+        if (hit_rids.count({row.first.page_id, row.first.slot_id}) != 0)
+        {
+          continue;
+        }
+        pk_taken.insert(KeyOfRow(row.second.values(), std::vector<int>{pk_idx}));
+      }
+    }
+
     for (const auto &h : hits)
     {
       storage::Record fresh;
@@ -649,6 +717,18 @@ namespace cella::db
           return DbStatus::Error(cs.code(), "列 " + meta->columns[i].name + ": " + cs.message());
         }
         fresh.AddValue(std::move(coerced));
+      }
+
+      if (pk_assigned)
+      {
+        const std::string key = KeyOfRow(fresh.values(), std::vector<int>{pk_idx});
+        if (!pk_taken.insert(key).second)
+        {
+          return DbStatus::Error(DbCode::kPrimaryKeyViolation,
+                                 "主键冲突: 更新后的 " +
+                                     meta->columns[static_cast<size_t>(pk_idx)].name +
+                                     " 值与其它行重复（表 " + name + "）");
+        }
       }
 
       const storage::Status ds = storage_->delete_record(name, h.first);

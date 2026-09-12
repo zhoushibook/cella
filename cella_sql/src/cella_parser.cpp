@@ -289,11 +289,26 @@ namespace cella
                         if (!expectDelim(")"))
                             return nullptr;
                     }
-                    if (matchKw(CELLA_Keyword::NOT))
+                    // 列约束：NOT NULL / PRIMARY KEY，可任意顺序、可重复出现
+                    bool more_constraints = true;
+                    while (more_constraints)
                     {
-                        if (!expectKw(CELLA_KW_NULL))
-                            return nullptr;
-                        cd.notNull = true;
+                        if (matchKw(CELLA_Keyword::NOT))
+                        {
+                            if (!expectKw(CELLA_KW_NULL))
+                                return nullptr;
+                            cd.notNull = true;
+                        }
+                        else if (matchKw(CELLA_Keyword::PRIMARY))
+                        {
+                            if (!expectKw(CELLA_Keyword::KEY))
+                                return nullptr;
+                            cd.primaryKey = true;
+                        }
+                        else
+                        {
+                            more_constraints = false;
+                        }
                     }
                     st->columns.push_back(std::move(cd));
                     if (matchDelim(","))

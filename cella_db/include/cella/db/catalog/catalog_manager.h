@@ -44,6 +44,7 @@ struct CatalogColumn {
   cella::CELLA_DataType type = cella::CELLA_DataType::INT;
   int len = 0;                            // CHAR/VARCHAR 声明长度；其余为 0
   bool not_null = false;
+  bool primary_key = false;               // 主键列（隐含 not_null）
 };
 
 // ── 一张表的元数据 ──────────────────────────────────────────
@@ -59,6 +60,8 @@ struct CatalogTable {
   const CatalogColumn* FindColumn(const std::string& column) const;
   // 存储层最大长度（CHAR/VARCHAR 截断用；TEXT/定长返回 0）
   uint16_t MaxLenAt(size_t index) const;
+  // 主键列下标；无主键返回 -1
+  int PrimaryKeyColumnIndex() const;
 };
 
 // ── 目录管理器 ──────────────────────────────────────────────

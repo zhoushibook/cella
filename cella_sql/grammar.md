@@ -22,7 +22,7 @@
 ## 2. 保留字总表
 
 ```
-CREATE TABLE ALTER DROP TRUNCATE RENAME
+CREATE TABLE PRIMARY KEY ALTER DROP TRUNCATE RENAME
 INSERT INTO VALUES UPDATE SET DELETE FROM WHERE
 GET IN LIMIT GROUPED HAVING ORDERED AMONG PAGE
 JOIN ON LEFT RIGHT MIDDLE UNION DISTINCT AS
@@ -40,7 +40,7 @@ statement        := create_table_stmt | insert_stmt | get_stmt
                   | delete_stmt | update_stmt | drop_table_stmt ;
 
 create_table_stmt := CREATE TABLE table_name '(' column_def { ',' column_def } ')' ';' ;
-column_def        := column_name data_type [ NOT NULL ] ;
+column_def        := column_name data_type { NOT NULL | PRIMARY KEY } ;   % 两个约束可任意顺序
 data_type         := INT | INTEGER | FLOAT | DOUBLE
                    | CHAR [ '(' uint ')' ] | VARCHAR [ '(' uint ')' ] | TEXT
                    | DATE | TIME | DATETIME ;       % CHAR/VARCHAR 省略长度默认 255
@@ -96,6 +96,14 @@ unary       := '-' unary | primary ;
 primary     := const_expr | col_name | '(' expr ')' ;
 const_expr  := NUMBER | STRING | DATE | NULL | TRUE | FALSE ;
 ```
+
+**主键（PRIMARY KEY）语义**：
+
++ 只支持**列级单列主键**；一张表至多一个，重复声明报 `SEM-313`。
++ 主键**隐含 NOT NULL**（写入 NULL 由 `SEM-307` 拦在编译期）。
++ 唯一性由执行层在 INSERT/UPDATE 时校验，冲突报 `DB-516`；未命中行不受影响，
++  更新主键列时「排除自身」（允许把主键改回自己原值）。
++ 主键**不建索引**：查重是 O(n) 扫描（教学规模可接受），因此它是「约束」不是「加速器」。
 
 **优先级与结合性（实现为准）**：
 

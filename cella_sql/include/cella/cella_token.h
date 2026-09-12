@@ -45,6 +45,8 @@ namespace cella
         NONE,
         CREATE,
         TABLE,
+        PRIMARY,
+        KEY,
         ALTER,
         DROP,
         TRUNCATE,
@@ -121,6 +123,10 @@ namespace cella
             return "CREATE";
         case CELLA_Keyword::TABLE:
             return "TABLE";
+        case CELLA_Keyword::PRIMARY:
+            return "PRIMARY";
+        case CELLA_Keyword::KEY:
+            return "KEY";
         case CELLA_Keyword::ALTER:
             return "ALTER";
         case CELLA_Keyword::DROP:
@@ -225,6 +231,8 @@ namespace cella
         static const std::unordered_map<std::string, CELLA_Keyword> table = {
             {"CREATE", CELLA_Keyword::CREATE},
             {"TABLE", CELLA_Keyword::TABLE},
+            {"PRIMARY", CELLA_Keyword::PRIMARY},
+            {"KEY", CELLA_Keyword::KEY},
             {"ALTER", CELLA_Keyword::ALTER},
             {"DROP", CELLA_Keyword::DROP},
             {"TRUNCATE", CELLA_Keyword::TRUNCATE},
