@@ -10,8 +10,8 @@
 # cmake / ninja / cl are not on PATH on this machine: MSVC comes from the VS
 # DevShell, Ninja is taken straight from the VS install directory.
 param(
-    [string]$SourceDir = "D:\Desktop\cella",
-    [string]$BuildDir  = "D:\Desktop\cella\build",
+    [string]$SourceDir = "",
+    [string]$BuildDir  = "",
     [string]$Target    = "",
     [switch]$Reconfigure
 )
@@ -19,6 +19,21 @@ param(
 # NOTE: "Continue" on purpose -- CMake writes progress to stderr, and with
 #       "Stop" PS 5.1 turns that into a terminating NativeCommandError.
 $ErrorActionPreference = "Continue"
+
+$scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Definition
+if ([string]::IsNullOrWhiteSpace($SourceDir)) {
+    $SourceDir = $scriptRoot
+} elseif (-not [IO.Path]::IsPathRooted($SourceDir)) {
+    $SourceDir = Join-Path (Get-Location) $SourceDir
+}
+if ([string]::IsNullOrWhiteSpace($BuildDir)) {
+    $BuildDir = Join-Path $SourceDir "build"
+} elseif (-not [IO.Path]::IsPathRooted($BuildDir)) {
+    $BuildDir = Join-Path (Get-Location) $BuildDir
+}
+
+$SourceDir = [IO.Path]::GetFullPath($SourceDir)
+$BuildDir = [IO.Path]::GetFullPath($BuildDir)
 
 $vsRoot   = "C:\Program Files\Microsoft Visual Studio\2022\Community"
 $devShell = Join-Path $vsRoot "Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
