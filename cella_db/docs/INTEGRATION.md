@@ -268,6 +268,7 @@ BlockersLocked(txn) = { 与 txn 的待满足请求冲突的持有者 }
 | `cella_sql/tests/expected/ok_query_1_plan.txt` | 按修正后输入重生成（补上 Insert 段） | 与修正后的用例保持一致 |
 | `cella_storage/CMakeLists.txt` | 示例路径宏由 `CMAKE_BINARY_DIR` 改为 `CMAKE_CURRENT_BINARY_DIR` | 原写法只在「本工程为顶层工程」时正确；被聚合工程 `add_subdirectory` 嵌套后指向顶层 build 目录，导致 `test_examples` 的 2 个用例失败（既有缺陷，独立构建时两者等价，改动无风险） |
 | `cella_storage/**`（源码） | **零改动** | 存储模块契约稳定，无需为整合让路 |
+| `cella_db/src/cella/db/engine/sql_text.cpp` | **缺陷修复**（2026-09-12）：`SplitSqlStatements()` 两条收尾路径改用 `cur.substr(SkipTrivia(cur, 0))` 赋 `st.text` | 原实现里语句文本**带着前导换行**（语句以 `\n` 分隔，`cur` 在换行分支也累加），而 `st.line/col` 却是首个有效字符的**绝对**位置 —— 两者基准不一致，`ExecuteOne` 把文本原样喂给 `cella_tokenize` 后，**编译诊断行号恒比语句内行号多 1**（多语句脚本里诊断全部指向错误位置，CLI 输出同样受影响）。修复后 `st.text[0]` 即 `st.line/col` 指向的字符，诊断坐标成为干净的「语句内行列」，换算 `绝对行 = StatementOutcome.line + (诊断行 - 1)`。回归：编译器 33/33、存储 30/4620、整合 87/87 全绿（`test_common` 的切分用例用 `find()` 断言，不受影响） |
 
 ---
 

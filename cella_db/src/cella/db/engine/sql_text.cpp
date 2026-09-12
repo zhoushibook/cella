@@ -181,7 +181,9 @@ std::vector<SqlStatement> SplitSqlStatements(const std::string& sql) {
       ++i;
       ++col;
       SqlStatement st;
-      st.text = cur;
+      // 剥掉前导空白/注释：text 必须从首个有效字符开始，与 st.line/col（也是首个有效
+      // 字符的绝对位置）同一基准。否则编译器收到的文本首行是空的，诊断行号会整体偏移。
+      st.text = cur.substr(SkipTrivia(cur, 0));
       st.line = started ? start_line : line;
       st.col = started ? start_col : col;
       st.terminated = true;
@@ -209,7 +211,7 @@ std::vector<SqlStatement> SplitSqlStatements(const std::string& sql) {
 
   if (!OnlyWhitespaceOrComments(cur)) {
     SqlStatement st;
-    st.text = cur;
+    st.text = cur.substr(SkipTrivia(cur, 0));  // 同上：与 st.line/col 对齐基准
     st.line = started ? start_line : line;
     st.col = started ? start_col : col;
     st.terminated = false;
