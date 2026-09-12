@@ -36,3 +36,4 @@ Thumbs.db
 
 # ── 历史遗留（沿用 cella_sql 原有 .gitignore 的规则）────────────
 cella_prompt/
+sys_process.md
