@@ -8,7 +8,7 @@ SQL 文本 ─▶ 词法 ─▶ 语法 ─▶ 语义 ─▶ 执行计划 ─▶ 
            └──────────── cella_sql ────────────┘ └──── cella_db ────┘ └─ cella_storage ─┘
 ```
 
-三个模块可**各自独立构建**，也可由本目录的聚合工程一起构建。依赖严格单向、无环。
+四个模块可**各自独立构建**，也可由本目录的聚合工程一起构建。依赖严格单向、无环。
 
 ---
 
@@ -17,7 +17,7 @@ SQL 文本 ─▶ 词法 ─▶ 语法 ─▶ 语义 ─▶ 执行计划 ─▶ 
 前置：Visual Studio 2022（MSVC）+ CMake + Ninja（本机均不在 PATH，脚本会通过 VS DevShell 建环境）。
 
 ```powershell
-# ① 一键构建 + 全量验证（构建 → 三层测试 → 端到端脚本 → 示例）
+# ① 一键构建 + 全量验证（构建 → 三层测试 + 客户端测试 → 端到端脚本 → 示例）
 powershell -ExecutionPolicy Bypass -File run_all.ps1
 
 # ② 只构建
@@ -25,6 +25,9 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 
 # ③ 进入交互式 SQL 终端
 .\build\cella_db\cella_db.exe --data .\mydb
+
+# ④ 启动图形客户端（浏览器打开 http://127.0.0.1:8080）
+.\build\cella_client\cella_web.exe --data .\mydb --port 8080
 ```
 
 交互式终端示例：
@@ -52,7 +55,7 @@ cella> \d
 
 ```
 .
-├── CMakeLists.txt              聚合工程：add_subdirectory × 3
+├── CMakeLists.txt              聚合工程：add_subdirectory × 4
 ├── build.ps1                   构建脚本（VS DevShell + Ninja）
 ├── run_all.ps1                 一键构建 + 全量验证
 ├── README.md                   本文件
@@ -75,6 +78,13 @@ cella> \d
     ├── examples/               API 速览 + 并发现场演示
     ├── tests/                  87 用例 / 765 断言
     └── docs/                   INTEGRATION.md / ARCHITECTURE.md / TEST_REPORT.md
+
+cella_client/                   【图形客户端】内嵌 HTTP 服务 + 浏览器 SPA
+    ├── include/cella/client/   net（socket/HTTP/静态资源）/ api（json/router/sql_builder）/ server
+    ├── src/                    实现 + main.cpp（cella_web 服务入口）
+    ├── web/                    前端资源（纯 HTML/CSS/原生 ES Module，无构建步骤）
+    ├── tests/                  25 用例（JSON/HTTP/SQL 生成/API 端到端）
+    └── docs/                   PLAN_web_client.md（设计与实现约定）
 ```
 
 ---
@@ -87,6 +97,8 @@ cella> \d
 | `build/cella_db/cella_db_tests.exe` | 整合层测试（87 用例 / 765 断言） |
 | `build/cella_db/api_quickstart.exe` | 30 秒 C++ API 速览 |
 | `build/cella_db/concurrency_demo.exe` | 并发锁 / 死锁检测现场演示 |
+| `build/cella_client/cella_web.exe` | **图形客户端服务**（浏览器打开 `http://127.0.0.1:8080`） |
+| `build/cella_client/cella_client_tests.exe` | 客户端层测试（25 用例：JSON/HTTP/SQL 生成/API 端到端） |
 | `build/cella_sql/cella_sql.exe` | 原编译器 CLI（保留，`-l/-a/-s/-p/-o/--all` 行为不变） |
 | `build/cella_storage/*.exe` | 存储层 demo / quickstart / crud_flow / 测试（保留） |
 

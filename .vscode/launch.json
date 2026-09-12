@@ -63,6 +63,18 @@
       "environment": [],
       "console": "integratedTerminal",
       "preLaunchTask": "build: 调试 Debug (Ninja → build_dbg)"
+    },
+    {
+      "name": "调试: 图形客户端服务 (cella_web)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build_dbg/cella_client/cella_web.exe",
+      "args": ["--data", "${workspaceFolder}/mydb", "--port", "8080"],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "console": "integratedTerminal",
+      "preLaunchTask": "build: 调试 Debug (Ninja → build_dbg)"
     }
   ]
 }

@@ -7,10 +7,11 @@
 #   powershell -ExecutionPolicy Bypass -File run_all.ps1
 #
 # Steps:
-#   1. build all three modules (Ninja + MSVC via VS DevShell)
+#   1. build all four modules (Ninja + MSVC via VS DevShell)
 #   2. compiler regression      (cella_sql/tests/run_tests.ps1)
 #   3. storage unit tests       (storage_tests.exe)
 #   4. integration tests        (cella_db_tests.exe)
+#   4.5 client layer tests      (cella_client_tests.exe)
 #   5. end-to-end demo scripts  (cella_db.exe sql/*.sql)
 #   6. example programs         (api_quickstart.exe, concurrency_demo.exe)
 #
@@ -122,6 +123,19 @@ if ($sum -eq "pass= fail=") {
 }
 Add-Result "integration tests" $p.ExitCode $sum
 Write-Output "--- integration tests: exit $($p.ExitCode) $sum ---"
+
+# ------------------------------------------------------- 4.5 client layer tests
+$clientDir = Join-Path $BuildDir "cella_client"
+$clientOut = Join-Path $BuildDir "client_test_report.log"
+if (Test-Path (Join-Path $clientDir "cella_client_tests.exe")) {
+    Push-Location $clientDir
+    $p = Start-Process -FilePath (Join-Path $clientDir "cella_client_tests.exe") -ArgumentList "--log", $clientOut -NoNewWindow -Wait -PassThru `
+         -RedirectStandardOutput (Join-Path $BuildDir "client_stdout.log") -RedirectStandardError (Join-Path $BuildDir "client_stderr.log")
+    Pop-Location
+    $sum = PassFail (LastLine (ReadUtf8 $clientOut) "==========")
+    Add-Result "client tests" $p.ExitCode $sum
+    Write-Output "--- client tests: exit $($p.ExitCode) $sum ---"
+}
 
 # ------------------------------------------------------ 5. end-to-end scripts
 $demoOk = 0
