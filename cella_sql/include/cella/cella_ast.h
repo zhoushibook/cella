@@ -35,7 +35,9 @@ namespace cella
         enum class UnOp
         {
             NEG,
-            NOT
+            NOT,
+            IS_NULL,      // 后缀判空：x IS NULL（结果恒 TRUE/FALSE，不走三值比较）
+            IS_NOT_NULL   // 后缀判空：x IS NOT NULL
         };
         enum class BinOp
         {

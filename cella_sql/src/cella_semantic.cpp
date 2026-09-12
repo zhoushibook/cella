@@ -305,7 +305,13 @@ namespace cella
                 CELLA_ValueType ct;
                 if (!resolveExpr(*e.child, scope, cat, errors, &ct))
                     return false;
-                if (e.uop == CELLA_Expr::UnOp::NEG)
+                if (e.uop == CELLA_Expr::UnOp::IS_NULL ||
+                    e.uop == CELLA_Expr::UnOp::IS_NOT_NULL)
+                {
+                    // 判空接受任意类型操作数（NULL 也是合法值），结果恒为 BOOL
+                    t = CELLA_ValueType::BOOL;
+                }
+                else if (e.uop == CELLA_Expr::UnOp::NEG)
                 {
                     if (!isNumericType(ct))
                     {

@@ -314,3 +314,33 @@ MT_TEST(执行_列别名与表别名) {
   MT_EQ(RowsText(e.Run("get s.name in student s ordered s.name desc among 1;").statements[0].result),
         std::string("Eve"));
 }
+
+MT_TEST(执行_NULL判空) {
+  Engine e("exec_isnull");
+  // 含 NULL 行：age 为 NULL 的人
+  MT_CHECK(e
+               .Run("CREATE TABLE p(id INT NOT NULL, name VARCHAR(8) NOT NULL, age INT);"
+                    "INSERT INTO p VALUES (1,'Alice',20),(2,'Bob',NULL),(3,'Carol',22);")
+               .all_ok());
+  // IS NULL 精确筛出 NULL 行（= null 恒 UNKNOWN，查不出任何行）
+  MT_EQ(RowsText(e.Run("get name in p limit age is null;").statements[0].result),
+        std::string("Bob"));
+  // IS NOT NULL 是其补集
+  MT_EQ(RowsText(e.Run("get name in p limit age is not null ordered id asc;")
+                      .statements[0]
+                      .result),
+        std::string("Alice\nCarol"));
+  // 与普通谓词组合（AND）
+  MT_EQ(RowsText(e.Run("get name in p limit age is not null and id > 1;")
+                      .statements[0]
+                      .result),
+        std::string("Carol"));
+  // NOT + IS NULL 组合
+  MT_EQ(RowsText(e.Run("get name in p limit not age is null and id < 3;")
+                      .statements[0]
+                      .result),
+        std::string("Alice"));
+  // 非空值上判空
+  MT_EQ(RowsText(e.Run("get name in p limit id is null;").statements[0].result),
+        std::string());
+}

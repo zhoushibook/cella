@@ -127,6 +127,15 @@ namespace cella
                     hits++;
                     return makeBoolLit(!child->boolVal, e);
                 }
+                // 判空可静态折叠：对字面量（含 NULL 本身）直接得出 TRUE/FALSE
+                if ((e.uop == CELLA_Expr::UnOp::IS_NULL ||
+                     e.uop == CELLA_Expr::UnOp::IS_NOT_NULL) &&
+                    child->kind == CELLA_Expr::Kind::LITERAL)
+                {
+                    const bool isNull = (child->lit == CELLA_LiteralKind::NULL_LIT);
+                    hits++;
+                    return makeBoolLit(e.uop == CELLA_Expr::UnOp::IS_NULL ? isNull : !isNull, e);
+                }
                 auto n = std::make_unique<CELLA_Expr>();
                 n->kind = CELLA_Expr::Kind::UNARY;
                 n->line = e.line;

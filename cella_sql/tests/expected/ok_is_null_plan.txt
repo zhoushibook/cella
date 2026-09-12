@@ -1,0 +1,27 @@
+CreateTable
+  table: t
+  columns: id INT, b VARCHAR(8), n INT
+
+Insert
+  table: t
+  columns: id, b, n
+  rows: [1, 'x', 10]
+
+Insert
+  table: t
+  columns: id, b, n
+  rows: [2, NULL, NULL]
+
+Filter (b IS NULL)
+  SeqScan [t]
+
+Filter (b IS NOT NULL)
+  SeqScan [t]
+
+Project [id]
+  Filter (b IS NULL AND n IS NOT NULL)
+    SeqScan [t]
+
+Project [id]
+  Filter (NOT b IS NULL)
+    SeqScan [t]

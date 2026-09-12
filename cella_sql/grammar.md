@@ -88,7 +88,8 @@ expr        := or_expr ;
 or_expr     := and_expr { OR and_expr } ;
 and_expr    := not_expr { AND not_expr } ;
 not_expr    := NOT not_expr | comparison ;
-comparison  := add [ ( '=' | '==' | '!=' | '<>' | '<' | '<=' | '>' | '>=' ) add ] ;
+comparison  := add [ ( '=' | '==' | '!=' | '<>' | '<' | '<=' | '>' | '>=' ) add ]
+            | add IS [ NOT ] NULL   % 后缀判空：结果恒 TRUE/FALSE，不走三值比较
 add         := mul { ( '+' | '-' ) mul } ;
 mul         := unary { ( '*' | '/' ) unary } ;
 unary       := '-' unary | primary ;
@@ -103,6 +104,8 @@ const_expr  := NUMBER | STRING | DATE | NULL | TRUE | FALSE ;
    与之矛盾；本实现遵循文法，即 **NOT 作用于比较之上**，并在答辩材料中说明。）
 2. 算术层次：`-`(一元) > `*` `/` > `+` `-`；同层左结合。
 3. 逻辑层次：比较 > `NOT` > `AND` > `OR`。
+4. `IS [NOT] NULL` 是后缀判空谓词，绑定到左侧加法级操作数：`b IS NULL`、`NOT b IS NULL`
+   （= `NOT (b IS NULL)`）。注意 `x = NULL` 恒为 UNKNOWN、永远筛不出行，判 NULL 只能写 IS NULL。
 4. `(` `)` 可改变结合；`==` 与 `=` 等价（EQ），`<>` 与 `!=` 等价（NE）。
 
 ## 5. 表达式类型系统（语义阶段）

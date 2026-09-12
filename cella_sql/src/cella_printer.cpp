@@ -124,7 +124,21 @@ namespace cella
             case CELLA_Expr::Kind::UNARY:
             {
                 std::string inner = exprToStringMin(*e.child, 6);
-                s = (e.uop == CELLA_Expr::UnOp::NEG ? "-" : "NOT ") + inner;
+                switch (e.uop)
+                {
+                case CELLA_Expr::UnOp::NEG:
+                    s = "-" + inner;
+                    break;
+                case CELLA_Expr::UnOp::NOT:
+                    s = "NOT " + inner;
+                    break;
+                case CELLA_Expr::UnOp::IS_NULL:
+                    s = inner + " IS NULL"; // 后缀判空：整体即谓词，优先级等同 UNARY
+                    break;
+                case CELLA_Expr::UnOp::IS_NOT_NULL:
+                    s = inner + " IS NOT NULL";
+                    break;
+                }
                 break;
             }
             case CELLA_Expr::Kind::BINARY:

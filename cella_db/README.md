@@ -193,7 +193,7 @@ engine.Close();
 .\build\cella_db\cella_db_tests.exe --log .\build\test_report.log
 ```
 
-当前：**83 用例 / 697 断言 / 0 失败**，明细见 [docs/TEST_REPORT.md](docs/TEST_REPORT.md)。
+当前：**84 用例 / 706 断言 / 0 失败**，明细见 [docs/TEST_REPORT.md](docs/TEST_REPORT.md)。
 
 ---
 

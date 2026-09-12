@@ -763,6 +763,32 @@ namespace cella
                 auto l = parseAdd();
                 if (!l)
                     return nullptr;
+                // 后缀判空：x IS [NOT] NULL。绑定到左侧（加法级）操作数上，
+                // 结果恒为 TRUE/FALSE，不走三值比较 —— 这是判 NULL 的唯一合法写法
+                //（x = NULL 恒为 UNKNOWN，查不出任何行）。
+                if (peek().keyword == CELLA_Keyword::IS)
+                {
+                    const CELLA_Token isTok = peek();
+                    advance();
+                    bool negated = false;
+                    if (peek().keyword == CELLA_Keyword::NOT)
+                    {
+                        negated = true;
+                        advance();
+                    }
+                    if (peek().keyword != CELLA_Keyword::NULL)
+                    {
+                        errors.push_back(cella_makeError(
+                            CELLA_Phase::SYN, "SYN-201", isTok.line, isTok.col,
+                            negated ? "期望 关键字 NULL（判空写作 IS NOT NULL）"
+                                    : "期望 关键字 NULL（判空写作 IS NULL）"));
+                        return nullptr;
+                    }
+                    advance();
+                    return makeUnary(negated ? CELLA_Expr::UnOp::IS_NOT_NULL
+                                             : CELLA_Expr::UnOp::IS_NULL,
+                                     isTok, std::move(l));
+                }
                 const CELLA_Token &t = peek();
                 CELLA_Expr::BinOp op = CELLA_Expr::BinOp::EQ;
                 bool hasOp = false;

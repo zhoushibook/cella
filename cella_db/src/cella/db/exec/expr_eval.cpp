@@ -148,6 +148,18 @@ DbStatus ExprEval::Eval(const cella::CELLA_Expr& expr, const EvalRow& row, stora
       if (!expr.child) {
         return DbStatus::Error(DbCode::kInternal, "一元表达式缺少子节点");
       }
+      // 判空：结果恒为 TRUE/FALSE（不走三值比较），这是筛 NULL 行的唯一合法写法
+      if (expr.uop == cella::CELLA_Expr::UnOp::IS_NULL ||
+          expr.uop == cella::CELLA_Expr::UnOp::IS_NOT_NULL) {
+        storage::Value inner;
+        const DbStatus s = Eval(*expr.child, row, &inner);
+        if (!s.ok()) {
+          return s;
+        }
+        const bool is_null = inner.IsNull();
+        *out = Value::Bool(expr.uop == cella::CELLA_Expr::UnOp::IS_NULL ? is_null : !is_null);
+        return DbStatus::Ok();
+      }
       if (expr.uop == cella::CELLA_Expr::UnOp::NOT) {
         bool v = false;
         bool is_null = false;
