@@ -37,7 +37,7 @@ powershell -ExecutionPolicy Bypass -File run_all.ps1
 
   --data DIR          数据目录（默认 ./cella_data）
   -f, --file FILE     执行 SQL 脚本（可重复；也可直接作为位置参数）
-  --db FILE           数据库文件名（默认 cella.db）
+  --db NAME           启动库名（库 = <data_dir>/NAME.db，默认 main）
   --page-size N       页大小字节数（2 的幂，默认 4096）
   --pool N            缓冲池帧数（默认 64）
   --replacer NAME     替换策略 LRU|FIFO|CLOCK（默认 LRU）
@@ -46,6 +46,9 @@ powershell -ExecutionPolicy Bypass -File run_all.ps1
   --lock-timeout MS   锁等待超时毫秒（默认 5000）
   --no-journal        不写事务审计日志
   --checkpoint-on-commit  每次提交都把数据文件落盘（更安全，但更慢）
+  --auth              启用访问控制（需登录；首次自动创建管理员 root，空口令）
+  -u, --user NAME     登录用户名（配合 --auth）
+  -p, --password PW   登录口令（配合 --auth；交互模式省略则提示输入）
   -v, --verbose       打印执行计划、算子调用次数、事务号
   --show-plan         只编译并打印计划，不真正执行
   --echo              回显每条语句
@@ -82,6 +85,9 @@ powershell -ExecutionPolicy Bypass -File run_all.ps1
 | `\waitfor` | 实时等待图（死锁检测依据） |
 | `\txn` | 事务表与提交/回滚计数 |
 | `\checkpoint` | 立即把数据文件落盘（存盘点） |
+| `\whoami` | 显示当前登录用户与角色 |
+| `\users` | 列出所有用户（等价 `SHOW USERS;`） |
+| `\passwd <新口令>` | 修改自己的口令（等价 `SET PASSWORD = '...';`） |
 | `\timing on\|off` | 打印每条语句耗时 |
 | `\echo on\|off` | 回显每条语句 |
 
@@ -131,6 +137,25 @@ DROP DATABASE school;     -- 软删除：改名 <db>.db.dropped-<时间戳>，�
 
 库 = `<data_dir>/<库名>.db` 一个自包含文件（默认库 `main`）。跨库并发请用多个引擎实例（多进程）。
 
+访问控制（同样由会话拦截；默认关闭，`--auth` 开启，详见 [docs/AUTH.md](docs/AUTH.md)）：
+
+```sql
+CREATE USER alice IDENTIFIED BY 'pwd';   -- 口令可省略
+DROP USER alice;
+SHOW USERS;                              -- user | admin | created_at
+SET PASSWORD = 'newpwd';                 -- 改自己的；SET PASSWORD FOR alice = '...' 由管理员代改
+
+GRANT  get, insert ON main.student TO alice;   -- 单表读 + 写
+GRANT  all          ON main.*       TO alice; -- 整库
+GRANT  get          ON *.*          TO reporter;  -- 全局只读
+GRANT  admin                        TO dba;    -- 提升管理员
+REVOKE insert       ON main.student FROM alice;
+SHOW GRANTS;                             -- 或 SHOW GRANTS FOR alice;
+```
+
+认证启用而未登录时任何语句都被拒（`DB-806`）；管理员全放行；系统表 `cella_catalog` 读放行。
+`cella_auth` 是保留库名，不出现在 `SHOW DATABASES` 里。
+
 > 注意：`GROUP BY`（`grouped`）在本方言里**没有聚合函数**（未定义 COUNT/SUM），
 > 因此实现为「按分组键去重，每组保留首行」，配合 `having` 使用。
 > 已知简化与边界见 [docs/INTEGRATION.md §6](docs/INTEGRATION.md)。
@@ -146,12 +171,15 @@ DROP DATABASE school;     -- 软删除：改名 <db>.db.dropped-<时间戳>，�
 | | `DB-502` / `DB-503` | 表不存在 / 表已存在 |
 | | `DB-504` / `DB-512` | 列不存在 / 系统表禁止修改（只读） |
 | | `DB-516` | 主键冲突（唯一性被破坏） |
+| | `DB-513` / `DB-514` / `DB-515` | 事务中禁切库 / 库不存在·已存在·名非法 / 目标库不可删除 |
 | | `DB-505` / `DB-506` / `DB-507` / `DB-508` | 类型不匹配 / NOT NULL 违约 / 值个数不符 / 文本超长 |
 | | `DB-510` / `DB-511` | 记录超页 / 除零 |
 | | `DB-520` | 存储层返回失败（消息里附原始存储码） |
 | 事务·并发 | `DB-601` / `DB-602` | 无活动事务 / 重复 BEGIN |
 | | `DB-603` / `DB-604` / `DB-605` | 事务已中止 / 死锁（牺牲者）/ 锁等待超时 |
 | 目录·会话 | `DB-701` / `DB-702` / `DB-703` / `DB-704` | 目录文件错 / 会话状态错 / 未实现 / 内部错误 |
+| 访问控制 | `DB-801` / `DB-802` / `DB-803` | 认证失败 / 权限不足 / 用户不存在·已存在·名非法 |
+| | `DB-804` / `DB-805` / `DB-806` | 最后一个管理员 / 无权授予（需管理员）/ 未登录 |
 
 ---
 
@@ -212,7 +240,7 @@ engine.Close();
 .\build\cella_db\cella_db_tests.exe --log .\build\test_report.log
 ```
 
-当前：**87 用例 / 765 断言 / 0 失败**，明细见 [docs/TEST_REPORT.md](docs/TEST_REPORT.md)。
+当前：**96 用例 / 848 断言 / 0 失败**，明细见 [docs/TEST_REPORT.md](docs/TEST_REPORT.md)。
 
 ---
 

@@ -38,6 +38,8 @@ using cella::db::StatementOutcome;
 struct Options {
   EngineConfig engine;
   std::vector<std::string> files;
+  std::string user;      // --user（--auth 时的登录名）
+  std::string password;  // --password（注意：命令行参数会出现在进程列表里）
   bool verbose = false;
   bool show_plan = false;
   bool echo = false;
@@ -63,6 +65,9 @@ void PrintUsage(std::ostream& os) {
         "  --lock-timeout MS   锁等待超时毫秒（默认 5000）\n"
         "  --no-journal        不写事务审计日志\n"
         "  --checkpoint-on-commit  每次提交都把数据文件落盘（更安全，但更慢）\n"
+        "  --auth              启用访问控制（需登录；首次自动创建管理员 root，空口令）\n"
+        "  -u, --user NAME     登录用户名（配合 --auth）\n"
+        "  -p, --password PW   登录口令（配合 --auth；交互模式下省略则提示输入）\n"
         "  -v, --verbose       打印计划、耗时、算子调用次数\n"
         "  --show-plan         只编译并打印执行计划，不真正执行\n"
         "  --echo              回显每条语句\n"
@@ -70,7 +75,8 @@ void PrintUsage(std::ostream& os) {
         "  --stats             退出前打印缓冲池统计\n"
         "  -h, --help          显示本帮助\n"
         "\n"
-        "REPL 元命令: \\? \\q \\d [表] \\l \\plan <SQL> \\stats \\locks \\waitfor \\txn \\timing \\echo\n";
+        "REPL 元命令: \\? \\q \\d [表] \\l \\plan <SQL> \\stats \\locks \\waitfor \\txn \\timing \\echo\n"
+        "              \\whoami \\users \\passwd <新口令>\n";
 }
 
 bool ParseLevel(const std::string& s, cella::storage::LogLevel* out) {
@@ -154,6 +160,12 @@ bool ParseArgs(int argc, char** argv, Options* opt, std::string* err) {
       opt->stats_at_exit = true;
     } else if (a == "--checkpoint-on-commit") {
       opt->engine.checkpoint_on_commit = true;
+    } else if (a == "--auth") {
+      opt->engine.enable_auth = true;
+    } else if (a == "-u" || a == "--user") {
+      if (!need_value(&opt->user)) return false;
+    } else if (a == "-p" || a == "--password") {
+      if (!need_value(&opt->password)) return false;
     } else if (!a.empty() && a[0] == '-') {
       *err = "未知选项: " + a;
       return false;
@@ -226,6 +238,20 @@ void RunSql(Session& session, const std::string& sql, const Options& opt, size_t
   }
 }
 
+// SQL 字符串字面量转义（单引号翻倍）
+std::string EscapeSqlString(const std::string& s) {
+  std::string out;
+  out.reserve(s.size() + 4);
+  for (char c : s) {
+    if (c == '\'') {
+      out += "''";
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
 void PrintReplHelp() {
   std::cout << "可用元命令（以 \\ 开头）：\n"
                "  \\?                显示本帮助\n"
@@ -239,10 +265,15 @@ void PrintReplHelp() {
                "  \\waitfor          等待图（死锁检测依据）\n"
                "  \\txn              事务表\n"
                "  \\checkpoint       立即把数据文件落盘（存盘点）\n"
+               "  \\whoami           显示当前登录用户与角色\n"
+               "  \\users            列出所有用户（等价 SHOW USERS;）\n"
+               "  \\passwd <新口令>  修改自己的口令（等价 SET PASSWORD = '...';）\n"
                "  \\timing on|off    打印每条语句耗时\n"
                "  \\echo on|off      回显每条语句\n"
                "SQL 语句以分号 ';' 结束（可跨多行）；事务用 BEGIN; / COMMIT; / ROLLBACK;\n"
-               "多库：CREATE DATABASE 名; / DROP DATABASE 名; / USE 名; / SHOW DATABASES;\n";
+               "多库：CREATE DATABASE 名; / DROP DATABASE 名; / USE 名; / SHOW DATABASES;\n"
+               "访问控制：CREATE USER 名 IDENTIFIED BY '口令'; / DROP USER 名;\n"
+               "          GRANT get, insert ON 库.表 TO 名; / SHOW GRANTS;\n";
 }
 
 int RunRepl(DbEngine& engine, Options& opt) {
@@ -259,8 +290,11 @@ int RunRepl(DbEngine& engine, Options& opt) {
   size_t failed = 0;
 
   while (true) {
-    std::cout << (buffer.empty() ? ("cella(" + engine.current_db() + ")> ") : "    ...> ")
-              << std::flush;
+    std::string prompt = "cella(" + engine.current_db() + ")";
+    if (!session.user().empty()) {
+      prompt += " " + session.user();
+    }
+    std::cout << (buffer.empty() ? (prompt + "> ") : "    ...> ") << std::flush;
     std::string line;
     if (!std::getline(std::cin, line)) {
       std::cout << "\n";
@@ -300,6 +334,26 @@ int RunRepl(DbEngine& engine, Options& opt) {
           std::cout << "当前库: " << engine.current_db() << "\n" << dbs.ToText();
         } else {
           std::cout << st.ToString() << "\n";
+        }
+      } else if (trimmed == "\\WHOAMI" || trimmed == "\\WHO") {
+        if (session.user().empty()) {
+          std::cout << "未启用访问控制（所有操作按管理员处理）。\n";
+        } else {
+          std::cout << "当前用户: " << session.user()
+                    << (session.is_admin() ? "（管理员）" : "（普通用户）") << " / 当前库 "
+                    << engine.current_db() << "\n";
+        }
+      } else if (trimmed == "\\USERS" || trimmed == "\\U") {
+        RunSql(session, "SHOW USERS;", opt, &ok, &failed);
+      } else if (trimmed.rfind("\\PASSWD", 0) == 0) {
+        std::string pwd = line.substr(7);
+        while (!pwd.empty() && (pwd.front() == ' ' || pwd.front() == '\t')) {
+          pwd.erase(pwd.begin());
+        }
+        if (pwd.empty()) {
+          std::cout << "用法: \\passwd <新口令>\n";
+        } else {
+          RunSql(session, "SET PASSWORD = '" + EscapeSqlString(pwd) + "';", opt, &ok, &failed);
         }
       } else if (trimmed.rfind("\\TIMING", 0) == 0) {
         const bool on = (trimmed.find("OFF") == std::string::npos);
@@ -382,6 +436,41 @@ int main(int argc, char** argv) {
   if (!open_status.ok()) {
     std::cerr << "打开数据库失败: " << open_status.ToString() << "\n";
     return 1;
+  }
+
+  // 访问控制：认证启用时必须先登录，否则后续语句一律报 DB-806
+  if (engine.auth_enabled()) {
+    std::string user = opt.user;
+    std::string pass = opt.password;
+    if (user.empty()) {
+      if (!opt.files.empty()) {
+        std::cerr << "认证已启用：非交互模式请用 --user/--password 提供凭据\n";
+        engine.Close();
+        return 2;
+      }
+      std::cout << "用户名: " << std::flush;
+      if (!std::getline(std::cin, user)) {
+        engine.Close();
+        return 1;
+      }
+      std::cout << "口令: " << std::flush;
+      if (!std::getline(std::cin, pass)) {
+        engine.Close();
+        return 1;
+      }
+    }
+    bool is_admin = false;
+    const cella::db::DbStatus ast = engine.Authenticate(user, pass, &is_admin);
+    if (!ast.ok()) {
+      std::cerr << ast.ToString() << "\n";
+      engine.Close();
+      return 1;
+    }
+    engine.default_session().SetIdentity(user, is_admin);
+    std::cout << "已登录: " << user << (is_admin ? "（管理员）" : "（普通用户）") << "\n";
+  }
+  if (!engine.auth_bootstrap_note().empty()) {
+    std::cout << "\n*** 安全提示 *** " << engine.auth_bootstrap_note() << "\n\n";
   }
 
   int rc = 0;

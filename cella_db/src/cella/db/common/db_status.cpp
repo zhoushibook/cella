@@ -31,6 +31,12 @@ const char* ToString(DbCode c) {
     case DbCode::kSessionError:       return "DB-702";
     case DbCode::kNotImplemented:     return "DB-703";
     case DbCode::kInternal:           return "DB-704";
+    case DbCode::kAuthFailed:         return "DB-801";
+    case DbCode::kPermissionDenied:   return "DB-802";
+    case DbCode::kUserError:          return "DB-803";
+    case DbCode::kLastAdmin:          return "DB-804";
+    case DbCode::kGrantDenied:        return "DB-805";
+    case DbCode::kNoCredentials:      return "DB-806";
   }
   return "DB-???";
 }

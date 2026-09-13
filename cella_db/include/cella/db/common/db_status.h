@@ -4,7 +4,7 @@
 //   * 编译器用 std::vector<CELLA_Error>（阶段 + 错误码 + 位置）报告前端错误；
 //   * 存储层用 [[nodiscard]] Status（StatusCode + message）报告物理错误；
 //   * 本层把二者收敛为 DbStatus：对外只暴露「错误码 + 说明」，并保留来源。
-// 错误码分段：DB-5xx 目录/执行，DB-6xx 事务/并发，DB-7xx 会话/CLI。
+// 错误码分段：DB-5xx 目录/执行，DB-6xx 事务/并发，DB-7xx 会话/CLI，DB-8xx 访问控制。
 #pragma once
 
 #include <string>
@@ -48,6 +48,14 @@ enum class DbCode {
   kSessionError,        // DB-702 会话状态错误（如未在事务中 COMMIT）
   kNotImplemented,      // DB-703 未实现的特性
   kInternal,            // DB-704 内部不变量被破坏
+
+  // —— 访问控制（DB-8xx）——
+  kAuthFailed,          // DB-801 认证失败（用户名或口令错误）
+  kPermissionDenied,    // DB-802 权限不足
+  kUserError,           // DB-803 用户不存在 / 已存在 / 名字非法
+  kLastAdmin,           // DB-804 不能删除最后一个管理员 / 不能撤销自身管理员
+  kGrantDenied,         // DB-805 无权授予或撤销（需要管理员）
+  kNoCredentials,       // DB-806 认证已启用但尚未登录（缺少凭据）
 };
 
 // "DB-501" 形式的错误码文本

@@ -28,6 +28,8 @@
 #include "cella/cella_catalog.h"
 #include "cella/cella_common.h"
 #include "cella/cella_planner.h"
+#include "cella/db/auth/auth_parser.h"
+#include "cella/db/auth/auth_store.h"
 #include "cella/db/catalog/catalog_manager.h"
 #include "cella/db/common/db_logger.h"
 #include "cella/db/common/db_status.h"
@@ -59,6 +61,10 @@ struct EngineConfig {
   storage::LogLevel log_level = storage::LogLevel::kInfo;
   std::chrono::milliseconds lock_timeout{5000};
   bool enable_journal = true;            // 写 <data_dir>/journal.log
+  // 访问控制（默认关：关掉时跳过全部权限检查、免登录，行为与引入本特性前一致）。
+  // 用户/权限语句本身始终可用（会按需创建身份库），「强制」由本开关控制。
+  bool enable_auth = false;
+  std::string auth_file;                 // 身份库文件名；空 → cella_auth.db
 };
 
 // ── 单条语句的执行记录 ──────────────────────────────────────
@@ -124,6 +130,17 @@ class DbEngine {
   TxnManager& txn_manager() { return *txn_manager_; }
   storage::IStorage* storage() { return storage_.get(); }
 
+  // ── 访问控制（身份库 = <data_dir>/cella_auth.db，独立于当前库）──
+  AuthStore& auth() { return auth_; }
+  bool auth_enabled() const { return config_.enable_auth; }
+  // 打开身份库（幂等；用户/权限语句与认证都会按需调用）。
+  // enable_auth 且库中尚无用户时，自动引导创建管理员 root（空口令）。
+  DbStatus EnsureAuthOpen();
+  // 认证：成功返回 Ok 并给出管理员标志；失败 → DB-801（不区分用户名/口令错）。
+  DbStatus Authenticate(const std::string& user, const std::string& password, bool* out_is_admin);
+  // 首次开启认证时自动建 root 的说明（空 = 无话说），供 CLI 打印醒目警告
+  const std::string& auth_bootstrap_note() const { return auth_bootstrap_note_; }
+
   // ── SQL 级多库（库 = <data_dir>/<db>.db 一个自包含文件）──
   // 一个引擎实例同一时刻只打开一个库；「当前库」是引擎级状态，
   // 跨库并发用多个引擎实例（多进程）解决。
@@ -162,6 +179,11 @@ class DbEngine {
   std::unique_ptr<TxnManager> txn_manager_;
   std::unique_ptr<Executor> executor_;
   std::unique_ptr<Session> default_session_;
+  // 身份库：独立于当前库的一份存储实例（USE 切库不影响它）
+  std::unique_ptr<storage::IStorage> auth_storage_;
+  AuthStore auth_;
+  bool auth_opened_ = false;
+  std::string auth_bootstrap_note_;
   std::recursive_mutex storage_mutex_;  // 存储层访问串行化（存储层非线程安全）
 
   // 存盘点需要重开存储引擎，故保留一份存储层配置
@@ -184,6 +206,17 @@ class Session {
 
   const std::string& name() const { return name_; }
 
+  // ── 身份（访问控制）────────────────────────────────────────
+  const std::string& user() const { return user_; }
+  void SetIdentity(const std::string& user, bool is_admin) {
+    user_ = user;
+    is_admin_ = is_admin;
+  }
+  // 认证已启用但尚未登录
+  bool need_login() const { return engine_->config().enable_auth && user_.empty(); }
+  // 是否按管理员对待（访问控制关闭时一律视为管理员，等价于「无访问控制」）
+  bool is_admin() const { return !engine_->config().enable_auth || is_admin_; }
+
   // 执行一段 SQL（可含多条语句）。逐条编译、逐条执行、逐条汇报。
   DbStatus Execute(const std::string& sql, ScriptReport* report);
   // 执行单条语句
@@ -205,9 +238,13 @@ class Session {
   // 让编译器视角的目录与权威目录（CatalogManager）保持一致
   void EnsureCatalogInSync();
   txn_id_t BeginInternal();
+  // 执行一条用户管理语句（调用前已完成登录检查）；SHOW USERS 会把结果写进 result
+  DbStatus ApplyUserCommand(const UserCommand& cmd, std::string* note, QueryResult* result);
 
   DbEngine* engine_;
   std::string name_;
+  std::string user_;          // 登录用户名（空 = 未登录）
+  bool is_admin_ = false;     // 登录身份是否管理员
   txn_id_t txn_ = kInvalidTxnId;
   std::shared_ptr<Transaction> txn_handle_;
   cella::CELLA_Catalog compiler_catalog_;  // 编译器视角的目录（每条语句后与 Catalog 对齐）

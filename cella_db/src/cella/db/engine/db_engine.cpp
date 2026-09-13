@@ -337,11 +337,89 @@ DbStatus DbEngine::Open(const EngineConfig& config) {
   // ⑧ 默认会话
   default_session_ = std::make_unique<Session>(this, "main");
 
+  // ⑨ 认证启用时立即打开身份库并（必要时）引导管理员 root ——
+  //    这样「首次开启认证」的安全提示能在登录之前给出，而不是等第一条语句。
+  if (config_.enable_auth) {
+    const DbStatus as = EnsureAuthOpen();
+    if (!as.ok()) {
+      return as;
+    }
+  }
+
   opened_ = true;
   DbLogInfo(logcat::kEngine, "引擎已打开: 数据目录=" + config_.data_dir + " 页大小=" +
                                  std::to_string(config_.page_size) + " 缓冲池=" +
                                  std::to_string(config_.pool_size) + " 替换策略=" +
                                  config_.replacer + " 表数=" + std::to_string(catalog_.table_count()));
+  return DbStatus::Ok();
+}
+
+// ═════════════════════════════════════════════════════════════
+// 访问控制：身份库（<data_dir>/cella_auth.db）
+// ═════════════════════════════════════════════════════════════
+
+DbStatus DbEngine::EnsureAuthOpen() {
+  if (auth_opened_) {
+    return DbStatus::Ok();
+  }
+  if (storage_ == nullptr) {
+    return DbStatus::Error(DbCode::kStorageError, "引擎未打开，无法打开身份库");
+  }
+  // 身份库与当前库共用一套存储参数，但文件独立；USE 切库不会触碰它。
+  storage::StorageConfig sc = storage_config_;
+  sc.db_file = config_.auth_file.empty() ? AuthStore::kFileName : config_.auth_file;
+  auth_storage_ = storage::CreateStorage(sc);
+  const storage::Status os = auth_storage_->Open(sc);
+  if (!os.ok()) {
+    auth_storage_.reset();
+    return DbStatus::Error(DbCode::kStorageError, "身份库打开失败: " + os.ToString());
+  }
+  auth_.AttachStorage(auth_storage_.get());
+
+  std::lock_guard<std::recursive_mutex> guard(storage_mutex_);
+  bool created = false;
+  const DbStatus et = auth_.EnsureTables(&created);
+  if (!et.ok()) {
+    return et;
+  }
+  const DbStatus ls = auth_.LoadFromStorage();
+  if (!ls.ok()) {
+    return ls;
+  }
+  auth_opened_ = true;
+  DbLogInfo(logcat::kAuth, "身份库已打开: " + config_.data_dir + "/" + sc.db_file);
+
+  // 首次开启认证且库中没有任何用户 → 引导创建管理员 root（空口令），
+  // 并留下醒目提示，由 CLI / 服务端打印（避免「装了认证却进不去」）。
+  if (config_.enable_auth && auth_.user_count() == 0) {
+    std::string note;
+    const DbStatus cs = auth_.CreateUser(AuthStore::kDefaultAdmin, "", true, &note);
+    if (!cs.ok()) {
+      return cs;
+    }
+    auth_bootstrap_note_ =
+        "已创建默认管理员账号 root（口令为空）。请立即用 SET PASSWORD = '新口令'; 修改。";
+    DbLogWarn(logcat::kAuth, "引导创建管理员 root（空口令）");
+  }
+  return DbStatus::Ok();
+}
+
+DbStatus DbEngine::Authenticate(const std::string& user, const std::string& password,
+                                bool* out_is_admin) {
+  const DbStatus os = EnsureAuthOpen();
+  if (!os.ok()) {
+    return os;
+  }
+  bool is_admin = false;
+  if (!auth_.Authenticate(user, password, &is_admin)) {
+    DbLogWarn(logcat::kAuth, "认证失败: " + user);
+    // 不区分「无此用户」与「口令错误」，避免用户名枚举
+    return DbStatus::Error(DbCode::kAuthFailed, "认证失败：用户名或口令错误");
+  }
+  if (out_is_admin != nullptr) {
+    *out_is_admin = is_admin;
+  }
+  DbLogInfo(logcat::kAuth, "认证成功: " + user + (is_admin ? "（管理员）" : ""));
   return DbStatus::Ok();
 }
 
@@ -571,6 +649,14 @@ void DbEngine::Close() {
   default_session_.reset();
   executor_.reset();
 
+  // 身份库是独立的一份存储实例：单独刷盘并释放
+  if (auth_storage_) {
+    auth_storage_->Close();
+  }
+  auth_storage_.reset();
+  auth_opened_ = false;
+  auth_bootstrap_note_.clear();
+
   if (storage_) {
     storage_->Close();  // FlushAllPages：把脏页（含目录表与目录页）真正写盘
   }
@@ -753,6 +839,62 @@ DbStatus Session::CompileOnly(const std::string& sql, ScriptReport* report) {
   return overall;
 }
 
+// ── 用户管理语句的执行（会话层；调用前已完成登录检查）────────
+DbStatus Session::ApplyUserCommand(const UserCommand& cmd, std::string* note, QueryResult* result) {
+  using Kind = UserCommand::Kind;
+  const bool self_password = (cmd.kind == Kind::kSetPassword) && cmd.name.empty();
+  if (!is_admin() && !self_password) {
+    return DbStatus::Error(DbCode::kGrantDenied,
+                           "仅管理员可以管理用户（新建/删除用户、修改他人口令）");
+  }
+  if (in_transaction()) {
+    return DbStatus::Error(DbCode::kDatabaseTxnActive,
+                           "用户管理操作前须结束当前事务（COMMIT / ROLLBACK）");
+  }
+  const DbStatus os = engine_->EnsureAuthOpen();
+  if (!os.ok()) {
+    return os;
+  }
+  std::lock_guard<std::recursive_mutex> guard(engine_->storage_mutex_);
+  AuthStore& auth = engine_->auth();
+
+  switch (cmd.kind) {
+    case Kind::kCreateUser:
+      return auth.CreateUser(cmd.name, cmd.has_password ? cmd.password : std::string(), false, note);
+    case Kind::kDropUser:
+      if (AuthStore::CanonicalName(cmd.name) == AuthStore::CanonicalName(user_)) {
+        return DbStatus::Error(DbCode::kLastAdmin, "不能删除当前登录的用户自己: " + user_);
+      }
+      return auth.DropUser(cmd.name, note);
+    case Kind::kSetPassword: {
+      if (!cmd.has_password) {
+        return DbStatus::Error(DbCode::kSqlError, "SET PASSWORD 需要新口令");
+      }
+      const std::string target = cmd.name.empty() ? user_ : cmd.name;
+      return auth.SetPassword(target, cmd.password, note);
+    }
+    case Kind::kShowUsers: {
+      if (result != nullptr) {
+        result->Clear();
+        result->columns.push_back(ResultColumn{"user"});
+        result->columns.push_back(ResultColumn{"admin"});
+        result->columns.push_back(ResultColumn{"created_at"});
+        for (const AuthUser& u : auth.SnapshotUsers()) {
+          result->rows.push_back({storage::Value::Varchar(u.name),
+                                  storage::Value::Bool(u.is_admin),
+                                  storage::Value::BigInt(u.created_at)});
+        }
+        result->tag = "SHOW USERS " + std::to_string(result->rows.size());
+      }
+      if (note != nullptr) {
+        *note = "SHOW USERS（" + std::to_string(auth.user_count()) + " 个用户）";
+      }
+      return DbStatus::Ok();
+    }
+  }
+  return DbStatus::Error(DbCode::kInternal, "未知的用户管理语句");
+}
+
 DbStatus Session::ExecuteOne(const std::string& stmt_text, int line, int col, StatementOutcome* out) {
   if (out == nullptr) {
     return DbStatus::Error(DbCode::kInternal, "ExecuteOne: out 为空");
@@ -761,6 +903,14 @@ DbStatus Session::ExecuteOne(const std::string& stmt_text, int line, int col, St
   out->sql = stmt_text;
   out->line = line;
   out->col = col;
+
+  // ── ⓪ 登录检查：认证已启用时必须先登录 ──
+  if (need_login()) {
+    out->status = DbStatus::Error(DbCode::kNoCredentials,
+                                  "尚未登录：请提供用户名与口令后再执行语句");
+    out->elapsed_ms = MsSince(t0);
+    return out->status;
+  }
 
   // ── ① 事务控制语句（编译器不认识 BEGIN/COMMIT/ROLLBACK，在此拦截）──
   std::string keyword;
@@ -824,6 +974,34 @@ DbStatus Session::ExecuteOne(const std::string& stmt_text, int line, int col, St
     DbLogInfo(logcat::kSession, "[" + name_ + "] " + db_kind + " " +
                                     (st.ok() ? "OK: " + note : st.ToString()));
     return st;
+  }
+
+  // ── ①c 用户管理语句（编译器不认识，会话层直接执行）──
+  {
+    UserCommand cmd;
+    std::string perr;
+    const AuthParse pres = ParseUserCommand(stmt_text, &cmd, &perr);
+    if (pres == AuthParse::kSyntaxError) {
+      out->kind = "USER";
+      out->status = DbStatus::Error(DbCode::kSqlError, "语法错误: " + perr);
+      out->elapsed_ms = MsSince(t0);
+      return out->status;
+    }
+    if (pres == AuthParse::kOk) {
+      std::string note;
+      const DbStatus st = ApplyUserCommand(cmd, &note, &out->result);
+      out->kind = "USER";
+      out->executed = true;
+      out->status = st;
+      if (st.ok() && out->result.tag.empty()) {
+        out->result.tag = note;
+      }
+      out->elapsed_ms = MsSince(t0);
+      DbLogInfo(logcat::kSession,
+                "[" + name_ + "] USER " + (st.ok() ? "OK: " + note : st.ToString()));
+      return st;
+    }
+    // kNotAuth → 落到编译器（普通 SQL）
   }
 
   // ── ② 编译：词法 → 语法 → 语义 → 计划 ──

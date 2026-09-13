@@ -21,6 +21,7 @@ constexpr const char* kExec    = "exec";
 constexpr const char* kTxn     = "txn";
 constexpr const char* kLock    = "lock";
 constexpr const char* kSession = "session";
+constexpr const char* kAuth    = "auth";
 }  // namespace logcat
 
 // ── 日志门面：可多实例（各组件各持一份），另提供进程级 Global() ──

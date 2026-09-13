@@ -11,6 +11,7 @@
 #   2. compiler regression      (cella_sql/tests/run_tests.ps1)
 #   3. storage unit tests       (storage_tests.exe)
 #   4. integration tests        (cella_db_tests.exe)
+#   4.4 access control smoke    (cella_db.exe --auth)
 #   4.5 client layer tests      (cella_client_tests.exe)
 #   5. end-to-end demo scripts  (cella_db.exe sql/*.sql)
 #   6. example programs         (api_quickstart.exe, concurrency_demo.exe)
@@ -123,6 +124,21 @@ if ($sum -eq "pass= fail=") {
 }
 Add-Result "integration tests" $p.ExitCode $sum
 Write-Output "--- integration tests: exit $($p.ExitCode) $sum ---"
+
+# ------------------------------------------------- 4.4 access control smoke test
+# 认证启用后：建用户 / 列用户 / 改口令应全部成功（退出码 0 即全绿）。
+# 登录用 stdin 喂「用户名 + 口令」——root 初始口令为空，避免空命令行参数被吞。
+$authDir  = Join-Path $BuildDir "auth_smoke"
+if (Test-Path $authDir) { Remove-Item -Recurse -Force $authDir }
+$authOut  = Join-Path $BuildDir "auth_smoke_out.txt"
+$authFeed = "root`n`nCREATE USER smoke IDENTIFIED BY 'p1';`nSHOW USERS;`nSET PASSWORD = 'r2';`n\q`n"
+$authText = [string]($authFeed | & (Join-Path $dbDir "cella_db.exe") --data $authDir --auth --log off 2>&1 | Out-String)
+$authCode = $LASTEXITCODE
+[IO.File]::WriteAllText($authOut, $authText, [Text.Encoding]::UTF8)
+$authOk  = Match1 $authText "成功 (\d+) 条"
+$authBad = Match1 $authText "失败 (\d+) 条"
+Add-Result "access control smoke" $authCode "ok=$authOk fail=$authBad"
+Write-Output "--- access control smoke: exit $authCode ok=$authOk fail=$authBad ---"
 
 # ------------------------------------------------------- 4.5 client layer tests
 $clientDir = Join-Path $BuildDir "cella_client"

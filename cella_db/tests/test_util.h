@@ -39,17 +39,28 @@ struct Engine {
   EngineConfig cfg;
   bool opened = false;
 
-  explicit Engine(const std::string& dir_name, size_t pool = 32) {
+  explicit Engine(const std::string& dir_name, size_t pool = 32, bool auth = false) {
     cfg.data_dir = FreshDir(dir_name);
     cfg.pool_size = pool;
     cfg.enable_log = false;
     cfg.log_to_console = false;
+    cfg.enable_auth = auth;
     opened = engine.Open(cfg).ok();
   }
 
   ~Engine() { engine.Close(); }
 
   cella::db::Session& session() { return engine.default_session(); }
+
+  // 认证并设置会话身份（访问控制用例用）；成功返回 true
+  bool Login(const std::string& user, const std::string& password) {
+    bool is_admin = false;
+    if (!engine.Authenticate(user, password, &is_admin).ok()) {
+      return false;
+    }
+    session().SetIdentity(user, is_admin);
+    return true;
+  }
 
   ScriptReport Run(const std::string& sql) {
     ScriptReport r;
