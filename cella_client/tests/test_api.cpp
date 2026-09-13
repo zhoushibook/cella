@@ -25,7 +25,7 @@ struct Fixture {
   cella::db::DbEngine engine;
   cella::client::ApiService service;
 
-  explicit Fixture(const std::string& name)
+  explicit Fixture(const std::string& name, bool auth = false)
       : engine(), service(&engine) {
     const std::string dir = std::string(CELLA_CLIENT_TESTDATA_DIR) + "/" + name;
     std::error_code ec;
@@ -35,6 +35,7 @@ struct Fixture {
     cfg.data_dir = dir;
     cfg.enable_log = false;
     cfg.enable_journal = false;
+    cfg.enable_auth = auth;
     if (!engine.Open(cfg).ok()) {
       std::abort();
     }
@@ -84,6 +85,24 @@ struct Fixture {
     const auto resp = service.Handle(
         Make("POST", "/api/query", R"({"sql":")" + sql + R"("})"));
     return Data(resp);
+  }
+
+  // 带令牌的请求（Authorization: Bearer <token>）
+  static HttpRequest WithToken(HttpRequest req, const std::string& token) {
+    req.headers.push_back({"Authorization", "Bearer " + token});
+    return req;
+  }
+
+  // 登录并返回令牌；失败返回空串
+  std::string Login(const std::string& user, const std::string& password) {
+    const std::string body = "{\"user\":\"" + user + "\",\"password\":\"" + password + "\"}";
+    const HttpResponse resp = service.Handle(Make("POST", "/api/login", body));
+    if (resp.status != 200) {
+      return std::string();
+    }
+    const JsonValue v = Data(resp);
+    const JsonValue* tok = v.Find("token");
+    return (tok != nullptr && tok->IsString()) ? tok->AsString() : std::string();
   }
 
   // 失败响应的 error.code
@@ -284,4 +303,138 @@ MT_TEST(API_坐标换算黄金样本_多行) {
   MT_EQ(e->Find("line")->AsInt(), 3);
   MT_EQ(e->Find("absLine")->AsInt(), 6);
   MT_EQ(e->Find("col")->AsInt(), 6);
+}
+
+// ═════════════════════ 访问控制（服务端）════════════════════
+
+MT_TEST(API_未登录被拒401) {
+  Fixture f("api_auth_401", true);
+  const auto denied = f.service.Handle(
+      Fixture::Make("POST", "/api/query", R"({"sql":"get * in cella_catalog;"})"));
+  MT_EQ(denied.status, 401);
+  MT_EQ(Fixture::ErrorCode(denied), std::string("HTTP-401"));
+
+  // 公开端点仍可访问（前端靠 authEnabled 判断是否需要弹登录框）
+  const auto h = f.service.Handle(Fixture::Make("GET", "/api/health"));
+  MT_EQ(h.status, 200);
+  const auto hd = Fixture::Data(h);
+  MT_EQ(hd.Find("authEnabled")->AsBool(), true);
+  MT_EQ(hd.Find("user")->AsString(), std::string(""));
+
+  // 静态资源不受访问控制影响（未设置 web 目录时为 404，但绝不能是 401）
+  const auto page = f.service.Handle(Fixture::Make("GET", "/index.html"));
+  MT_CHECK(page.status != 401);
+}
+
+MT_TEST(API_登录与令牌) {
+  Fixture f("api_auth_login", true);
+  // 错口令 → 401 + DB-801
+  const auto bad = f.service.Handle(
+      Fixture::Make("POST", "/api/login", R"({"user":"root","password":"nope"})"));
+  MT_EQ(bad.status, 401);
+  MT_EQ(Fixture::ErrorCode(bad), std::string("DB-801"));
+
+  // root 初始空口令
+  const std::string token = f.Login("root", "");
+  MT_CHECK(!token.empty());
+
+  const auto ok = f.service.Handle(Fixture::WithToken(
+      Fixture::Make("POST", "/api/query", R"({"sql":"CREATE TABLE t(id INT);"})"), token));
+  MT_EQ(ok.status, 200);
+
+  const auto sess =
+      f.service.Handle(Fixture::WithToken(Fixture::Make("GET", "/api/session"), token));
+  const auto sd = Fixture::Data(sess);
+  MT_EQ(sd.Find("user")->AsString(), std::string("root"));
+  MT_EQ(sd.Find("admin")->AsBool(), true);
+
+  // 伪造令牌 → 401
+  const auto fake = f.service.Handle(Fixture::WithToken(
+      Fixture::Make("POST", "/api/query", R"({"sql":"get * in cella_catalog;"})"), "deadbeef"));
+  MT_EQ(fake.status, 401);
+
+  // 登出后令牌立即失效
+  const auto lo = f.service.Handle(Fixture::WithToken(Fixture::Make("POST", "/api/logout"), token));
+  MT_EQ(lo.status, 200);
+  const auto after = f.service.Handle(Fixture::WithToken(
+      Fixture::Make("POST", "/api/query", R"({"sql":"get * in cella_catalog;"})"), token));
+  MT_EQ(after.status, 401);
+}
+
+MT_TEST(API_认证未启用时登录被拒) {
+  Fixture f("api_auth_off");
+  const auto login = f.service.Handle(
+      Fixture::Make("POST", "/api/login", R"({"user":"root","password":""})"));
+  MT_EQ(login.status, 400);
+  // 未启用认证时一切照常免登录
+  const auto q = f.service.Handle(
+      Fixture::Make("POST", "/api/query", R"({"sql":"CREATE TABLE t(id INT);"})"));
+  MT_EQ(q.status, 200);
+  const auto h = f.service.Handle(Fixture::Make("GET", "/api/health"));
+  MT_EQ(Fixture::Data(h).Find("authEnabled")->AsBool(), false);
+}
+
+MT_TEST(API_权限不足) {
+  Fixture f("api_auth_perm", true);
+  const std::string root = f.Login("root", "");
+  MT_CHECK(!root.empty());
+  auto run_as_root = [&](const std::string& sql) {
+    return f.service.Handle(Fixture::WithToken(
+        Fixture::Make("POST", "/api/query", "{\"sql\":\"" + sql + "\"}"), root));
+  };
+  MT_EQ(run_as_root("CREATE TABLE t(id INT);CREATE TABLE u(id INT);").status, 200);
+  MT_EQ(run_as_root("CREATE USER alice IDENTIFIED BY 'p';").status, 200);
+  MT_EQ(run_as_root("GRANT get ON main.t TO alice;").status, 200);
+
+  const std::string alice = f.Login("alice", "p");
+  MT_CHECK(!alice.empty());
+
+  // 已授权的读放行
+  const auto read = f.service.Handle(Fixture::WithToken(
+      Fixture::Make("POST", "/api/query", R"({"sql":"get * in t;"})"), alice));
+  MT_EQ(read.status, 200);
+  const JsonValue read_data = Fixture::Data(read);
+  MT_EQ(read_data.Find("statements")->items()[0].Find("ok")->AsBool(), true);
+
+  // 未授权的写：语句级错误码 DB-802（与编译错误一致，前端按语句提示）
+  const auto write = f.service.Handle(Fixture::WithToken(
+      Fixture::Make("POST", "/api/query", R"({"sql":"INSERT INTO t VALUES (1);"})"), alice));
+  MT_EQ(write.status, 200);
+  const JsonValue write_data = Fixture::Data(write);
+  const JsonValue& write_st = write_data.Find("statements")->items()[0];
+  MT_EQ(write_st.Find("ok")->AsBool(), false);
+  MT_EQ(write_st.Find("error")->Find("code")->AsString(), std::string("DB-802"));
+
+  // 数据浏览端点走同一套判定：有读权限的表 200、无权限的表 403
+  const auto rows_t = f.service.Handle(Fixture::WithToken(
+      Fixture::Make("GET", "/api/tables/t/rows?page=1&pageSize=10"), alice));
+  MT_EQ(rows_t.status, 200);
+  const auto rows_u = f.service.Handle(Fixture::WithToken(
+      Fixture::Make("GET", "/api/tables/u/rows?page=1&pageSize=10"), alice));
+  MT_EQ(rows_u.status, 403);
+  MT_EQ(Fixture::ErrorCode(rows_u), std::string("DB-802"));
+
+  // 建库需要管理员（不能靠直连引擎端点绕过）
+  const auto madedb = f.service.Handle(Fixture::WithToken(
+      Fixture::Make("POST", "/api/databases/create", R"({"name":"school"})"), alice));
+  MT_EQ(madedb.status, 403);
+  MT_EQ(Fixture::ErrorCode(madedb), std::string("DB-802"));
+  const auto madedb_ok = f.service.Handle(Fixture::WithToken(
+      Fixture::Make("POST", "/api/databases/create", R"({"name":"school"})"), root));
+  MT_EQ(madedb_ok.status, 200);
+
+  // 服务端诊断只给管理员
+  const auto diag = f.service.Handle(
+      Fixture::WithToken(Fixture::Make("GET", "/api/diagnostics/stats"), alice));
+  MT_EQ(diag.status, 403);
+  MT_EQ(f.service.Handle(Fixture::WithToken(Fixture::Make("GET", "/api/diagnostics/stats"), root))
+            .status,
+        200);
+
+  // 库列表按权限过滤：alice 在 main 上有授权 → 看得到 main，看不到新建的 school
+  const auto dbs = f.service.Handle(Fixture::WithToken(Fixture::Make("GET", "/api/databases"), alice));
+  MT_EQ(dbs.status, 200);
+  const JsonValue dbs_data = Fixture::Data(dbs);
+  MT_EQ(static_cast<int>(dbs_data.Find("databases")->size()), 1);
+  MT_EQ(dbs_data.Find("databases")->items()[0].Find("name")->AsString(), std::string("main"));
 }

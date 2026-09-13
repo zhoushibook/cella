@@ -44,6 +44,8 @@ ServerConfig ParseServerArgs(int argc, char** argv) {
       c.pool_size = static_cast<size_t>(std::strtoul(v.c_str(), nullptr, 10));
     } else if (a == "--replacer") {
       if (!value(&c.replacer)) return c;
+    } else if (a == "--auth") {
+      c.enable_auth = true;
     } else {
       c.error = "未知选项: " + a;
       return c;

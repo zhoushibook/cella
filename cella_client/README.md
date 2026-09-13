@@ -14,6 +14,9 @@
 # 构建后启动（数据目录/端口按需调整）
 .\build\cella_client\cella_web.exe --data .\mydb --port 8080
 # 浏览器打开 http://127.0.0.1:8080
+
+# 启用访问控制（需在页面上登录；首次自动创建管理员 root，口令为空）
+.\build\cella_client\cella_web.exe --data .\mydb --auth
 ```
 
 只监听 `127.0.0.1`，不对局域网暴露。`--help` 查看全部参数。
@@ -25,6 +28,7 @@
 | `--port N` | `8080` | 监听端口 |
 | `--web-dir DIR` | 编译期注入 | 前端资源目录（开发前端时指向工作副本） |
 | `--page-size` / `--pool` / `--replacer` | 4096 / 64 / LRU | 存储层参数，与 CLI 一致 |
+| `--auth` | 关 | 启用访问控制：页面先登录，接口需带令牌（详见 §4.1） |
 
 > **同一数据目录只能有一个服务进程**。锁文件（`data_dir` 下 `cella-client.lock`）记录持有者
 > pid，启动时校验其是否存活：强杀/崩溃留下的**陈旧锁会被自动识别并清理**，无需手工删除。
@@ -70,7 +74,9 @@
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/api/health` | 引擎状态与配置 |
+| `POST` | `/api/login` | 登录换令牌（公开；`--auth` 未启用时返回 400） |
+| `POST` | `/api/logout` | 登出（令牌立即失效） |
+| `GET` | `/api/health` | 引擎状态与配置（公开；含 `authEnabled`，前端据此决定是否弹登录框） |
 | `GET/POST` | `/api/databases[...]` | 库列表 / use / create / drop |
 | `POST` | `/api/query` | 执行 SQL（多条语句逐条汇报，含结果集/计划/错误） |
 | `POST` | `/api/plan` | 只编译返回优化前后计划 |
@@ -86,6 +92,25 @@
 错误码沿用引擎分段（`LEX/SYN/SEM/PLN` 与 `DB-5xx/6xx/7xx`）；诊断行列是**语句内坐标**，
 `error.absLine` 已换算为脚本绝对行号，前端直接用于跳转。
 
+### 4.1 访问控制（`--auth`）
+
+服务端启用 `--auth` 后：
+
+1. 除 `/api/health`、`/api/login`、`/api/logout` 外，**所有接口都要带令牌**：
+   `Authorization: Bearer <token>`（也接受 `Cookie: cella_token=...`）；
+   缺失或过期 → `401`（`error.code = HTTP-401`）。
+2. `POST /api/login` 传 `{user, password}`，成功返回 `{token, user, admin, expiresIn}`
+   （令牌有效期 12 小时）。
+3. 身份按请求注入会话；权限判定与 SQL 路径**完全同一套**（不会因为走 REST 就绕开）：
+   越权语句 → 语句级 `DB-802`；库级/管理级动作（建库/删库/存盘点/服务端诊断）
+   与数据端点（无读权限的表）→ `HTTP 403` + `DB-802`。
+4. 库列表按权限过滤：普通用户只看到自己有授权的库。
+5. 前端：启动先查 `/api/health`，`authEnabled && !user` 时弹出登录层；
+   令牌存 `localStorage`，任何接口返回 401 会自动清令牌并重新弹登录框。
+
+令牌是**进程内内存表**（重启即失效）；同一令牌可多标签页共用，身份按请求生效
+（服务端仍是单会话 + `gate_` 串行，见 §6）。
+
 ---
 
 ## 5. 架构与测试
@@ -97,6 +122,7 @@ cella_web.exe
    ├─ net/     Socket(RAII) · HttpParser · HttpServer(每连接一线程+keep-alive) · StaticFiles
    ├─ api/     Json(自研) · Router · SqlBuilder(方言生成) · ErrorMap(坐标换算)
    └─ server/  ApiService（全部 REST；engine_gate_ 串行化，锁序 gate_ → storage_mutex_）
+              └─ 令牌表（内存）+ 登录端点；鉴权与身份注入在同一临界区内完成
    └─ 进程内直调 cella_db_core（DbEngine → Session → Executor → IStorage，零改动）
 ```
 
@@ -113,3 +139,6 @@ cella_web.exe
 - 服务端串行执行：长查询期间整个客户端等待（前端有加载态；不支持取消）。
 - 表设计器：受 `ALTER TABLE` 未实现所限，只能建新表，不能改已有表结构。
 - SQL 历史记录（localStorage）尚未实现。
+- 访问控制是**单会话 + 按请求注入身份**：同一时刻只有一个事务上下文，多个浏览器标签页
+  共享同一引擎会话（令牌各自独立）。真正的多会话/连接池留待后续。
+- 令牌是内存态：服务重启后需要重新登录。

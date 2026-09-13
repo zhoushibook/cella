@@ -1,4 +1,22 @@
-// api.js —— fetch 封装 + 统一错误（不依赖任何视图，见 PLAN §5.4.1）。
+// api.js —— fetch 封装 + 统一错误 + 访问控制令牌（不依赖任何视图，见 PLAN §5.4.1）。
+
+const TOKEN_KEY = 'cella.token';
+
+let token = '';
+try { token = localStorage.getItem(TOKEN_KEY) || ''; } catch (e) { token = ''; }
+
+export function setToken(t) {
+  token = t || '';
+  try {
+    if (token) localStorage.setItem(TOKEN_KEY, token);
+    else localStorage.removeItem(TOKEN_KEY);
+  } catch (e) { /* 无痕模式等：退化为仅内存保存 */ }
+}
+
+export function getToken() { return token; }
+
+// 401 回调（由 app.js 注入：弹出登录框）
+export const Auth = { onUnauthorized: null };
 
 export class ApiError extends Error {
   constructor(payload) {
@@ -13,6 +31,7 @@ export class ApiError extends Error {
 
 async function call(method, path, body) {
   const opt = { method, headers: {} };
+  if (token) opt.headers['Authorization'] = 'Bearer ' + token;
   if (body !== undefined) {
     opt.headers['Content-Type'] = 'application/json; charset=utf-8';
     opt.body = JSON.stringify(body);
@@ -22,6 +41,11 @@ async function call(method, path, body) {
     resp = await fetch(path, opt);
   } catch (e) {
     throw new ApiError({ code: 'NET', message: '无法连接服务（可能已停止运行）' });
+  }
+  if (resp.status === 401) {
+    setToken('');
+    if (Auth.onUnauthorized) Auth.onUnauthorized();
+    throw new ApiError({ code: 'HTTP-401', message: '未登录或登录已过期，请重新登录', status: 401 });
   }
   let json = null;
   try {
@@ -39,6 +63,8 @@ async function call(method, path, body) {
 
 export const Api = {
   health: () => call('GET', '/api/health'),
+  login: (user, password) => call('POST', '/api/login', { user, password }),
+  logout: () => call('POST', '/api/logout'),
   databases: () => call('GET', '/api/databases'),
   useDb: (name) => call('POST', '/api/databases/use', { name }),
   createDb: (name) => call('POST', '/api/databases/create', { name }),

@@ -10,6 +10,7 @@
 //   --page-size N     页大小（默认 4096）
 //   --pool N          缓冲池帧数（默认 64）
 //   --replacer NAME   替换策略 LRU|FIFO|CLOCK（默认 LRU）
+//   --auth            启用访问控制（页面需先登录；首次自动创建管理员 root，空口令）
 //   -h, --help        显示本帮助
 //
 // 安全：只监听 127.0.0.1；同一数据目录只允许一个服务进程（lock 文件，PLAN §6.5）。
@@ -45,6 +46,7 @@ const char* const kUsage =
     "  --page-size N     页大小（默认 4096）\n"
     "  --pool N          缓冲池帧数（默认 64）\n"
     "  --replacer NAME   替换策略 LRU|FIFO|CLOCK（默认 LRU）\n"
+    "  --auth            启用访问控制（页面需先登录；首次自动创建管理员 root，空口令）\n"
     "  -h, --help        显示本帮助\n";
 
 // 单实例锁：同一 data_dir 只允许一个服务进程（IStorage 无文件锁，PLAN §6.5）。
@@ -142,6 +144,7 @@ int main(int argc, char** argv) {
   ec.page_size = cfg.page_size;
   ec.pool_size = cfg.pool_size;
   ec.replacer = cfg.replacer;
+  ec.enable_auth = cfg.enable_auth;
 
   cella::db::DbEngine engine;
   const cella::db::DbStatus opened = engine.Open(ec);
@@ -174,8 +177,11 @@ int main(int argc, char** argv) {
             << "  数据目录 : " << cfg.data_dir << "\n"
             << "  当前库   : " << engine.current_db() << "\n"
             << "  前端目录 : " << web_dir << "\n"
-            << "按 Ctrl+C 停止。\n"
-            << std::flush;
+            << "  访问控制 : " << (cfg.enable_auth ? "已启用（需登录）" : "未启用") << "\n";
+  if (!engine.auth_bootstrap_note().empty()) {
+    std::cout << "\n*** 安全提示 *** " << engine.auth_bootstrap_note() << "\n\n";
+  }
+  std::cout << "按 Ctrl+C 停止。\n" << std::flush;
 
   // Ctrl+C：Windows 控制台默认直接终止进程（引擎在 Close 前已有存盘点语义），
   // 这里注册信号仅为了把提示打完整；优雅停机不在首版范围（PLAN §6.4）。

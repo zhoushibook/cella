@@ -3,6 +3,9 @@
 const state = {
   theme: localStorage.getItem('cella.theme') || 'light',
   health: null,
+  authEnabled: false,  // 服务端是否启用访问控制
+  user: '',            // 当前登录用户（空 = 未登录）
+  isAdmin: false,
   databases: [],
   currentDb: 'main',
   tables: [],          // [{name, columns, primaryKey, ...}]

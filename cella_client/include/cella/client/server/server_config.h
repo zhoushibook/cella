@@ -14,6 +14,7 @@ struct ServerConfig {
   std::uint32_t page_size = 4096;
   size_t pool_size = 64;
   std::string replacer = "LRU";
+  bool enable_auth = false;               // --auth：启用访问控制（需在页面登录）
   bool help = false;
   std::string error;                      // 解析失败原因
 };

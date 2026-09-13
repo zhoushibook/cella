@@ -1,7 +1,7 @@
 // app.js —— 装配：顶栏 / 标签 / 数据浏览 / 行编辑 / 事务 / 导出。
 // 约定（PLAN §5.4.1）：组件间不互相调用，一律通过 store 交互。
 
-import { Api, ApiError } from './api.js';
+import { Api, ApiError, setToken, Auth } from './api.js';
 import { state$, set, subscribe, tableByName, pkOf } from './store.js';
 import { createEditor, formatSql } from './editor.js';
 import { createGrid } from './grid.js';
@@ -672,6 +672,61 @@ const actions = {
   },
 };
 
+// ── 访问控制：登录 / 登出 / 用户标识 ───────────────────────
+function renderUserChip(s) {
+  const chip = $('userChip');
+  const btn = $('btnLogout');
+  if (!s.authEnabled) {
+    chip.style.display = 'none';
+    btn.style.display = 'none';
+    return;
+  }
+  chip.style.display = '';
+  chip.textContent = s.user ? (s.user + (s.isAdmin ? '（管理员）' : '')) : '未登录';
+  btn.style.display = s.user ? '' : 'none';
+}
+
+function showLogin(message) {
+  $('loginErr').textContent = message || '';
+  $('loginOverlay').classList.add('show');
+  if (!$('loginUser').value) $('loginUser').focus(); else $('loginPass').focus();
+}
+
+function hideLogin() {
+  $('loginOverlay').classList.remove('show');
+  $('loginErr').textContent = '';
+  $('loginPass').value = '';
+}
+
+async function doLogin() {
+  const user = $('loginUser').value.trim();
+  const password = $('loginPass').value;
+  if (!user) { $('loginErr').textContent = '请输入用户名'; return; }
+  $('btnLogin').disabled = true;
+  try {
+    const d = await Api.login(user, password);
+    setToken(d.token);
+    set({ user: d.user, isAdmin: !!d.admin });
+    hideLogin();
+    toast('已登录：' + d.user + (d.admin ? '（管理员）' : ''), 'ok');
+    await fullRefresh();
+  } catch (e) {
+    $('loginErr').textContent = e.message;
+  } finally {
+    $('btnLogin').disabled = false;
+  }
+}
+
+async function doLogout() {
+  try { await Api.logout(); } catch (e) { /* 令牌可能已过期，忽略 */ }
+  setToken('');
+  set({ user: '', isAdmin: false });
+  set({ tabs: [], activeTab: null });
+  renderTabs();
+  renderTabBody();
+  showLogin('已登出');
+}
+
 // ── 启动 ────────────────────────────────────────────────────
 function applyTheme(t) {
   document.documentElement.setAttribute('data-theme', t);
@@ -726,6 +781,15 @@ async function boot() {
   // 全局忙碌态：禁用执行按钮
   subscribe((s) => { $('btnRun').disabled = s.busy; });
 
+  // 访问控制：登录层与用户标识
+  subscribe(renderUserChip);
+  renderUserChip(state$());
+  $('btnLogin').addEventListener('click', doLogin);
+  $('btnLogout').addEventListener('click', doLogout);
+  $('loginUser').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
+  $('loginPass').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
+  Auth.onUnauthorized = () => showLogin('登录已过期，请重新登录');
+
   // 首标签
   addTab({ type: 'query', title: '查询 1',
     sql: '-- cella 方言：get=SELECT, in=FROM, limit=WHERE, ordered=ORDER BY, page 页码, 每页行数\n' +
@@ -733,11 +797,17 @@ async function boot() {
 
   try {
     const h = await Api.health();
-    set({ health: h, currentDb: h.currentDb });
+    set({ health: h, currentDb: h.currentDb, authEnabled: !!h.authEnabled,
+          user: h.user || '', isAdmin: !!h.admin });
     $('stLeft').textContent = `数据目录 ${h.dataDir} · 页大小 ${h.pageSize} · 缓冲池 ${h.poolSize} 帧 · ${h.replacer}`;
+    if (h.authEnabled && !h.user) {
+      showLogin('');          // 服务端启用了访问控制且当前未登录
+      return;
+    }
     await fullRefresh();
   } catch (e) {
-    toast(e.message, 'err', e.detail);
+    if (e.status === 401) showLogin(e.message);
+    else toast(e.message, 'err', e.detail);
   }
 }
 

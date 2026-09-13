@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <random>
 
 #include "cella/db/common/value_bridge.h"  // RenderValue / ValueEquals
 
@@ -27,6 +28,31 @@ using cella::db::StatementOutcome;
 using cella::storage::Value;
 
 namespace {
+
+// 令牌有效期：12 小时（本地开发工具，够用且不至于长期有效）
+constexpr int kTokenTtlSeconds = 12 * 60 * 60;
+
+// 错误码 → HTTP 状态：未登录 401、权限不足 403，其余仍是 400
+int HttpStatusFor(cella::db::DbCode c) {
+  switch (c) {
+    case cella::db::DbCode::kNoCredentials:    return 401;
+    case cella::db::DbCode::kPermissionDenied: return 403;
+    default:                                   return 400;
+  }
+}
+
+std::string RandomToken() {
+  static const char kHex[] = "0123456789abcdef";
+  std::random_device rd;
+  std::mt19937_64 gen(rd());
+  std::uniform_int_distribution<int> dist(0, 15);
+  std::string s;
+  s.reserve(32);
+  for (int i = 0; i < 32; ++i) {
+    s += kHex[dist(gen)];
+  }
+  return s;
+}
 
 constexpr size_t kDefaultMaxRows = 5000;
 constexpr size_t kHardMaxRows = 200000;
@@ -117,6 +143,28 @@ std::string KeyColumnDeclType(const CatalogTable& t, const std::string& col) {
   return std::string();
 }
 
+// 令牌来源：`Authorization: Bearer <token>`，或 `Cookie: cella_token=<token>`。
+// 前者给 fetch 用，后者预留（浏览器直接下载静态资源时也能带上）。
+std::string TokenFromRequest(const HttpRequest& req) {
+  const std::string auth = req.Header("Authorization");
+  const std::string bearer = "Bearer ";
+  if (auth.size() > bearer.size() && auth.compare(0, bearer.size(), bearer) == 0) {
+    return auth.substr(bearer.size());
+  }
+  const std::string cookie = req.Header("Cookie");
+  const std::string key = "cella_token=";
+  const size_t pos = cookie.find(key);
+  if (pos != std::string::npos) {
+    const size_t begin = pos + key.size();
+    size_t end = cookie.find(';', begin);
+    if (end == std::string::npos) {
+      end = cookie.size();
+    }
+    return cookie.substr(begin, end - begin);
+  }
+  return std::string();
+}
+
 }  // namespace
 
 ApiService::ApiService(cella::db::DbEngine* engine)
@@ -132,6 +180,8 @@ ApiService::ApiService(cella::db::DbEngine* engine)
     });
   };
   bind("GET", "/api/health", &ApiService::Health);
+  bind("POST", "/api/login", &ApiService::Login);
+  bind("POST", "/api/logout", &ApiService::Logout);
   bind("GET", "/api/databases", &ApiService::Databases);
   bind("POST", "/api/databases/use", &ApiService::UseDatabase);
   bind("POST", "/api/databases/create", &ApiService::CreateDatabase);
@@ -156,24 +206,116 @@ void ApiService::SetWebDir(const std::string& dir) {
 }
 
 HttpResponse ApiService::Handle(const HttpRequest& req) {
-  if (req.path.rfind("/api/", 0) == 0 || req.path == "/api") {
+  const bool is_api = (req.path.rfind("/api/", 0) == 0 || req.path == "/api");
+  if (!is_api) {
     HttpResponse resp;
-    if (!router_.Dispatch(req, &resp)) {
-      resp = HttpResponse::Error(404, "未知接口: " + req.path);
+    if (!static_->TryServe(req.path.empty() ? "/" : req.path, &resp)) {
+      resp = HttpResponse::Error(404, "资源不存在");
     }
     return resp;
   }
+
+  // 访问控制：/api/health 与 /api/login 公开（前者要让前端知道「是否需要登录」），
+  // 其余端点一律要求有效令牌。校验与**身份注入必须在同一个临界区内**完成 ——
+  // 身份存在共享会话上，若在锁外注入会被并发请求互相踩。
+  std::lock_guard<std::recursive_mutex> lk(gate_);
+  const bool public_route =
+      (req.path == "/api/health" || req.path == "/api/login" || req.path == "/api/logout");
+  if (engine_->auth_enabled()) {
+    const TokenInfo* tok = LookupToken(req);  // 公开端点也允许带令牌（用于显示身份）
+    if (tok != nullptr) {
+      engine_->default_session().SetIdentity(tok->user, tok->is_admin);
+    } else {
+      // 未登录：清空身份，避免上一个请求的残留身份泄漏到本次响应
+      engine_->default_session().SetIdentity(std::string(), false);
+      if (!public_route) {
+        return FailResponse(401, "HTTP-401", "未登录或登录已过期，请重新登录");
+      }
+    }
+  }
+
   HttpResponse resp;
-  if (!static_->TryServe(req.path.empty() ? "/" : req.path, &resp)) {
-    resp = HttpResponse::Error(404, "资源不存在");
+  if (!router_.Dispatch(req, &resp)) {
+    resp = HttpResponse::Error(404, "未知接口: " + req.path);
   }
   return resp;
+}
+
+// ── 令牌与登录 ──────────────────────────────────────────────
+
+std::string ApiService::IssueToken(std::string user, bool is_admin) {
+  const std::string token = RandomToken();
+  TokenInfo info;
+  info.user = std::move(user);
+  info.is_admin = is_admin;
+  info.expires = std::chrono::steady_clock::now() + std::chrono::seconds(kTokenTtlSeconds);
+  tokens_[token] = std::move(info);
+  return token;
+}
+
+const ApiService::TokenInfo* ApiService::LookupToken(const HttpRequest& req) const {
+  const std::string token = TokenFromRequest(req);
+  if (token.empty()) {
+    return nullptr;
+  }
+  const auto it = tokens_.find(token);
+  if (it == tokens_.end()) {
+    return nullptr;
+  }
+  if (it->second.expires <= std::chrono::steady_clock::now()) {
+    return nullptr;  // 过期即视为未登录
+  }
+  return &it->second;
+}
+
+void ApiService::RevokeToken(const HttpRequest& req) {
+  const std::string token = TokenFromRequest(req);
+  if (!token.empty()) {
+    tokens_.erase(token);
+  }
+}
+
+HttpResponse ApiService::Login(const HttpRequest& req, const std::vector<std::string>&) {
+  std::lock_guard<std::recursive_mutex> lk(gate_);
+  if (!engine_->auth_enabled()) {
+    return FailResponse(400, "HTTP-400", "服务端未启用访问控制（启动时加 --auth）");
+  }
+  JsonValue body;
+  HttpResponse err;
+  if (!ParseBody(req, &body, &err)) {
+    return err;
+  }
+  const std::string user = BodyString(body, "user", std::string());
+  const std::string password = BodyString(body, "password", std::string());
+  if (user.empty()) {
+    return BodyError("用户名不能为空");
+  }
+  bool is_admin = false;
+  const DbStatus st = engine_->Authenticate(user, password, &is_admin);
+  if (!st.ok()) {
+    return FailResponse(401, cella::db::ToString(st.code()), st.message());
+  }
+  const std::string token = IssueToken(user, is_admin);
+  JsonValue data = JsonValue::Obj();
+  data.Set("token", JsonValue::Str(token));
+  data.Set("user", JsonValue::Str(user));
+  data.Set("admin", JsonValue::Bool(is_admin));
+  data.Set("expiresIn", JsonValue::Int(kTokenTtlSeconds));
+  return OkResponse(std::move(data));
+}
+
+HttpResponse ApiService::Logout(const HttpRequest& req, const std::vector<std::string>&) {
+  std::lock_guard<std::recursive_mutex> lk(gate_);
+  RevokeToken(req);
+  JsonValue data = JsonValue::Obj();
+  data.Set("note", JsonValue::Str("已登出"));
+  return OkResponse(std::move(data));
 }
 
 // ── 元信息 ──────────────────────────────────────────────────
 
 HttpResponse ApiService::Health(const HttpRequest&, const std::vector<std::string>&) {
-  std::lock_guard<std::mutex> lk(gate_);
+  std::lock_guard<std::recursive_mutex> lk(gate_);
   const auto& cfg = engine_->config();
   JsonValue data = JsonValue::Obj();
   data.Set("version", JsonValue::Str("cella-web/0.1"));
@@ -186,16 +328,23 @@ HttpResponse ApiService::Health(const HttpRequest&, const std::vector<std::strin
   const auto secs =
       std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started_);
   data.Set("uptimeSeconds", JsonValue::Int(secs.count()));
+  // 访问控制：前端据此决定是否弹登录框；已登录时顺带给出身份
+  const Session& s = engine_->default_session();
+  data.Set("authEnabled", JsonValue::Bool(engine_->auth_enabled()));
+  data.Set("user", JsonValue::Str(s.user()));
+  data.Set("admin", JsonValue::Bool(!s.user().empty() && s.is_admin()));
   return OkResponse(std::move(data));
 }
 
 HttpResponse ApiService::Databases(const HttpRequest&, const std::vector<std::string>&) {
-  std::lock_guard<std::mutex> lk(gate_);
+  std::lock_guard<std::recursive_mutex> lk(gate_);
   QueryResult qr;
   const DbStatus st = engine_->ShowDatabases(&qr);
   if (!st.ok()) {
     return FailResponse(500, cella::db::ToString(st.code()), st.message());
   }
+  // 与 SQL 路径一致：普通用户只列有权限的库
+  engine_->default_session().FilterDatabasesByPrivilege(&qr);
   const std::string& current = engine_->current_db();
   const std::string& dir = engine_->config().data_dir;
   JsonValue arr = JsonValue::Arr();
@@ -228,11 +377,16 @@ HttpResponse ApiService::UseDatabase(const HttpRequest& req, const std::vector<s
   if (!ValidIdentifier(name)) {
     return BodyError("库名非法: " + name);
   }
-  std::lock_guard<std::mutex> lk(gate_);
-  std::string note;
-  const DbStatus st = engine_->UseDatabase(name, &note);
+  std::lock_guard<std::recursive_mutex> lk(gate_);
+  // 访问控制：库级动作必须走与 SQL 路径同一套判定（否则会绕过权限）
+  DbStatus st = engine_->default_session().CheckDatabaseAccess(name);
   if (!st.ok()) {
-    return FailResponse(400, cella::db::ToString(st.code()), st.message());
+    return FailResponse(HttpStatusFor(st.code()), cella::db::ToString(st.code()), st.message());
+  }
+  std::string note;
+  st = engine_->UseDatabase(name, &note);
+  if (!st.ok()) {
+    return FailResponse(HttpStatusFor(st.code()), cella::db::ToString(st.code()), st.message());
   }
   JsonValue data = JsonValue::Obj();
   data.Set("current", JsonValue::Str(engine_->current_db()));
@@ -250,11 +404,15 @@ HttpResponse ApiService::CreateDatabase(const HttpRequest& req, const std::vecto
   if (!ValidIdentifier(name)) {
     return BodyError("库名非法: " + name);
   }
-  std::lock_guard<std::mutex> lk(gate_);
-  std::string note;
-  const DbStatus st = engine_->CreateDatabase(name, &note);
+  std::lock_guard<std::recursive_mutex> lk(gate_);
+  DbStatus st = engine_->default_session().RequireAdmin("CREATE DATABASE");
   if (!st.ok()) {
-    return FailResponse(400, cella::db::ToString(st.code()), st.message());
+    return FailResponse(HttpStatusFor(st.code()), cella::db::ToString(st.code()), st.message());
+  }
+  std::string note;
+  st = engine_->CreateDatabase(name, &note);
+  if (!st.ok()) {
+    return FailResponse(HttpStatusFor(st.code()), cella::db::ToString(st.code()), st.message());
   }
   JsonValue data = JsonValue::Obj();
   data.Set("name", JsonValue::Str(name));
@@ -272,11 +430,15 @@ HttpResponse ApiService::DropDatabase(const HttpRequest& req, const std::vector<
   if (!ValidIdentifier(name)) {
     return BodyError("库名非法: " + name);
   }
-  std::lock_guard<std::mutex> lk(gate_);
-  std::string note;
-  const DbStatus st = engine_->DropDatabase(name, &note);
+  std::lock_guard<std::recursive_mutex> lk(gate_);
+  DbStatus st = engine_->default_session().RequireAdmin("DROP DATABASE");
   if (!st.ok()) {
-    return FailResponse(400, cella::db::ToString(st.code()), st.message());
+    return FailResponse(HttpStatusFor(st.code()), cella::db::ToString(st.code()), st.message());
+  }
+  std::string note;
+  st = engine_->DropDatabase(name, &note);
+  if (!st.ok()) {
+    return FailResponse(HttpStatusFor(st.code()), cella::db::ToString(st.code()), st.message());
   }
   JsonValue data = JsonValue::Obj();
   data.Set("name", JsonValue::Str(name));
@@ -303,7 +465,7 @@ HttpResponse ApiService::Query(const HttpRequest& req, const std::vector<std::st
   }
   max_rows = std::min(max_rows, kHardMaxRows);
 
-  std::lock_guard<std::mutex> lk(gate_);
+  std::lock_guard<std::recursive_mutex> lk(gate_);
   ScriptReport report;
   const DbStatus st = engine_->default_session().Execute(sql, &report);
 
@@ -376,7 +538,7 @@ HttpResponse ApiService::Plan(const HttpRequest& req, const std::vector<std::str
   if (sql.empty()) {
     return BodyError("sql 不能为空");
   }
-  std::lock_guard<std::mutex> lk(gate_);
+  std::lock_guard<std::recursive_mutex> lk(gate_);
   ScriptReport report;
   (void)engine_->default_session().CompileOnly(sql, &report);
   JsonValue stmts = JsonValue::Arr();
@@ -402,19 +564,22 @@ HttpResponse ApiService::Plan(const HttpRequest& req, const std::vector<std::str
 }
 
 HttpResponse ApiService::SessionInfo(const HttpRequest&, const std::vector<std::string>&) {
-  std::lock_guard<std::mutex> lk(gate_);
+  std::lock_guard<std::recursive_mutex> lk(gate_);
   Session& s = engine_->default_session();
   JsonValue data = JsonValue::Obj();
   data.Set("inTxn", JsonValue::Bool(s.in_transaction()));
   data.Set("txnId", JsonValue::Int(s.current_txn()));
   data.Set("currentDb", JsonValue::Str(engine_->current_db()));
   data.Set("statusLine", JsonValue::Str(s.StatusLine()));
+  data.Set("authEnabled", JsonValue::Bool(engine_->auth_enabled()));
+  data.Set("user", JsonValue::Str(s.user()));
+  data.Set("admin", JsonValue::Bool(!s.user().empty() && s.is_admin()));
   return OkResponse(std::move(data));
 }
 
 HttpResponse ApiService::Txn(const HttpRequest&, const std::vector<std::string>& params) {
   const std::string op = params.empty() ? std::string() : params[0];
-  std::lock_guard<std::mutex> lk(gate_);
+  std::lock_guard<std::recursive_mutex> lk(gate_);
   Session& s = engine_->default_session();
   std::string note;
   DbStatus st;
@@ -428,7 +593,7 @@ HttpResponse ApiService::Txn(const HttpRequest&, const std::vector<std::string>&
     return HttpResponse::Error(404, "未知事务操作: " + op);
   }
   if (!st.ok()) {
-    return FailResponse(400, cella::db::ToString(st.code()), st.message());
+    return FailResponse(HttpStatusFor(st.code()), cella::db::ToString(st.code()), st.message());
   }
   JsonValue data = JsonValue::Obj();
   data.Set("op", JsonValue::Str(op));
@@ -439,7 +604,12 @@ HttpResponse ApiService::Txn(const HttpRequest&, const std::vector<std::string>&
 }
 
 HttpResponse ApiService::Checkpoint(const HttpRequest&, const std::vector<std::string>&) {
-  std::lock_guard<std::mutex> lk(gate_);
+  std::lock_guard<std::recursive_mutex> lk(gate_);
+  const DbStatus perm = engine_->default_session().RequireAdmin("存盘点");
+  if (!perm.ok()) {
+    return FailResponse(HttpStatusFor(perm.code()), cella::db::ToString(perm.code()),
+                        perm.message());
+  }
   const DbStatus st = engine_->Checkpoint();
   if (!st.ok()) {
     return FailResponse(500, cella::db::ToString(st.code()), st.message());
@@ -451,7 +621,13 @@ HttpResponse ApiService::Checkpoint(const HttpRequest&, const std::vector<std::s
 
 HttpResponse ApiService::Diagnostics(const HttpRequest&, const std::vector<std::string>& params) {
   const std::string kind = params.empty() ? std::string() : params[0];
-  std::lock_guard<std::mutex> lk(gate_);
+  std::lock_guard<std::recursive_mutex> lk(gate_);
+  // 缓冲池/锁表/事务表这类服务端诊断只给管理员
+  const DbStatus perm = engine_->default_session().RequireAdmin("查看服务端诊断");
+  if (!perm.ok()) {
+    return FailResponse(HttpStatusFor(perm.code()), cella::db::ToString(perm.code()),
+                        perm.message());
+  }
   std::string text;
   if (kind == "stats") {
     text = engine_->StatsText();
@@ -509,7 +685,12 @@ JsonValue ApiService::TableJsonLocked(const cella::db::CatalogTable& t) {
 }
 
 HttpResponse ApiService::Catalog(const HttpRequest&, const std::vector<std::string>&) {
-  std::lock_guard<std::mutex> lk(gate_);
+  std::lock_guard<std::recursive_mutex> lk(gate_);
+  // 元信息同样受访问控制：能访问本库才看得到表清单
+  const DbStatus st = engine_->default_session().CheckDatabaseAccess(engine_->current_db());
+  if (!st.ok()) {
+    return FailResponse(HttpStatusFor(st.code()), cella::db::ToString(st.code()), st.message());
+  }
   JsonValue arr = JsonValue::Arr();
   for (const CatalogTable* t : engine_->catalog().ListTables()) {
     arr.Push(TableJsonLocked(*t));
@@ -522,7 +703,11 @@ HttpResponse ApiService::Catalog(const HttpRequest&, const std::vector<std::stri
 
 HttpResponse ApiService::CatalogOne(const HttpRequest&, const std::vector<std::string>& params) {
   const std::string name = params.empty() ? std::string() : params[0];
-  std::lock_guard<std::mutex> lk(gate_);
+  std::lock_guard<std::recursive_mutex> lk(gate_);
+  const DbStatus acc = engine_->default_session().CheckDatabaseAccess(engine_->current_db());
+  if (!acc.ok()) {
+    return FailResponse(HttpStatusFor(acc.code()), cella::db::ToString(acc.code()), acc.message());
+  }
   const CatalogTable* t = FindTableLocked(name);
   if (t == nullptr) {
     return FailResponse(404, "DB-502", "表不存在: " + name);
@@ -580,7 +765,7 @@ HttpResponse ApiService::Rows(const HttpRequest& req, const std::vector<std::str
     order = "asc";
   }
 
-  std::lock_guard<std::mutex> lk(gate_);
+  std::lock_guard<std::recursive_mutex> lk(gate_);
   const CatalogTable* t = FindTableLocked(name);
   if (t == nullptr) {
     return FailResponse(404, "DB-502", "表不存在: " + name);
@@ -609,7 +794,7 @@ HttpResponse ApiService::Rows(const HttpRequest& req, const std::vector<std::str
   const DbStatus st = engine_->default_session().ExecuteOne(
       SelectPageSql(t->name, cols, sort, order == "desc", page, page_size), 1, 1, &out);
   if (!st.ok() || !out.result.IsQuery()) {
-    return FailResponse(400, cella::db::ToString(st.code()), st.message());
+    return FailResponse(HttpStatusFor(st.code()), cella::db::ToString(st.code()), st.message());
   }
 
   // 全量拉取模式（§11.7）：返回行数小于页大小时，说明已到表尾，总数已知
@@ -637,7 +822,7 @@ HttpResponse ApiService::Rows(const HttpRequest& req, const std::vector<std::str
 
 HttpResponse ApiService::RowCount(const HttpRequest&, const std::vector<std::string>& params) {
   const std::string name = params.empty() ? std::string() : params[0];
-  std::lock_guard<std::mutex> lk(gate_);
+  std::lock_guard<std::recursive_mutex> lk(gate_);
   const CatalogTable* t = FindTableLocked(name);
   if (t == nullptr) {
     return FailResponse(404, "DB-502", "表不存在: " + name);
@@ -654,7 +839,7 @@ HttpResponse ApiService::RowCount(const HttpRequest&, const std::vector<std::str
   const DbStatus st =
       engine_->default_session().ExecuteOne(CountSql(t->name, t->columns.front().name), 1, 1, &out);
   if (!st.ok() || !out.result.IsQuery()) {
-    return FailResponse(400, cella::db::ToString(st.code()), st.message());
+    return FailResponse(HttpStatusFor(st.code()), cella::db::ToString(st.code()), st.message());
   }
   JsonValue data = JsonValue::Obj();
   data.Set("count", JsonValue::Int(static_cast<std::int64_t>(out.result.rows.size())));
@@ -725,7 +910,7 @@ HttpResponse ApiService::EditRow(const HttpRequest& req, const std::vector<std::
     return err;
   }
 
-  std::lock_guard<std::mutex> lk(gate_);
+  std::lock_guard<std::recursive_mutex> lk(gate_);
   const CatalogTable* t = FindTableLocked(name);
   if (t == nullptr) {
     return FailResponse(404, "DB-502", "表不存在: " + name);
@@ -886,7 +1071,7 @@ HttpResponse ApiService::InsertRow(const HttpRequest& req, const std::vector<std
   if (!ParseBody(req, &body, &err)) {
     return err;
   }
-  std::lock_guard<std::mutex> lk(gate_);
+  std::lock_guard<std::recursive_mutex> lk(gate_);
   const CatalogTable* t = FindTableLocked(name);
   if (t == nullptr) {
     return FailResponse(404, "DB-502", "表不存在: " + name);

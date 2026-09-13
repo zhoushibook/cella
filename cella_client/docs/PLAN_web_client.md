@@ -747,3 +747,18 @@ out->rows.push_back(in.rows[i]);     // ← 然后才切片
   「逻辑行 → 物理位置」的关系画出来 —— 这是把存储层讲清楚的最好教具
 
 客户端不只是「一个更好看的 CLI」，它是这套系统教学演示的入口。
+
+
+---
+
+## 附：访问控制接入（2026-09-13）
+
+`cella_web` 增加 `--auth`，页面登录后所有接口带 `Authorization: Bearer <token>`：
+- 公开端点只有 `/api/health`（含 `authEnabled`）与 `/api/login`、`/api/logout`；
+- 令牌 12 小时有效，内存表，`/api/logout` 立即失效；
+- 鉴权与身份注入在同一临界区内完成（`gate_` 已改为递归互斥量），避免并发请求互相踩身份；
+- 权限判定与 SQL 路径同一套：越权语句 → 语句级 `DB-802`；库级/管理级动作与
+  无权限数据端点 → `HTTP 403` + `DB-802`；库列表按权限过滤；
+- 前端：登录层 + 用户标识 + 401 自动回登录，令牌存 `localStorage`。
+
+详见 `cella_client/README.md` §4.1；服务端用例见 `cella_client/tests/test_api.cpp`（4 个访问控制用例）。

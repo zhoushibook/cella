@@ -256,3 +256,50 @@ html[data-theme="dark"] .tok-num { color: #fac775; }
   border-radius: 6px; padding: 5px 8px; background: var(--bg); color: var(--text);
 }
 .modal .btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+
+/* ── 访问控制：用户标识与登录遮罩 ───────────────────────────── */
+.userchip {
+  display: none;
+  font-family: var(--sans);
+  font-size: 12px;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 10px;
+  white-space: nowrap;
+}
+.loginoverlay {
+  position: fixed;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(15, 23, 42, 0.45);
+  z-index: 60;
+}
+.loginoverlay.show { display: flex; }
+.loginbox {
+  width: 300px;
+  padding: 20px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+  font-family: var(--sans);
+}
+.logintitle { font-size: 15px; font-weight: 600; color: var(--text); margin-bottom: 14px; }
+.loginrow { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 10px; }
+.loginrow input {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  padding: 6px 8px;
+  box-sizing: border-box;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg-sub);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.loginerr { min-height: 16px; font-size: 12px; color: var(--err); margin-bottom: 8px; }
+.loginbox .btn { width: 100%; }

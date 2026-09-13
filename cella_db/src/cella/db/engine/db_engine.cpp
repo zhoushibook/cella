@@ -984,6 +984,15 @@ DbStatus Session::ApplyGrantCommand(const GrantCommand& cmd, std::string* note, 
   return DbStatus::Ok();
 }
 
+DbStatus Session::RequireAdmin(const char* what) const {
+  if (!engine_->config().enable_auth || is_admin()) {
+    return DbStatus::Ok();
+  }
+  return DbStatus::Error(DbCode::kPermissionDenied,
+                         std::string("权限不足：") + what + " 需要管理员（当前用户 \"" + user_ +
+                             "\"）");
+}
+
 DbStatus Session::CheckDatabaseAccess(const std::string& db) const {
   if (!engine_->config().enable_auth || is_admin()) {
     return DbStatus::Ok();

@@ -10,6 +10,7 @@
 #pragma once
 
 #include <chrono>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -38,6 +39,9 @@ class ApiService {
  private:
   // ── 端点（均已持有 gate_ 或无需引擎访问）──────────────────
   HttpResponse Health(const HttpRequest& req, const std::vector<std::string>& p);
+  // 登录 / 登出（公开端点：登录前当然没有令牌）
+  HttpResponse Login(const HttpRequest& req, const std::vector<std::string>& p);
+  HttpResponse Logout(const HttpRequest& req, const std::vector<std::string>& p);
   HttpResponse Databases(const HttpRequest& req, const std::vector<std::string>& p);
   HttpResponse UseDatabase(const HttpRequest& req, const std::vector<std::string>& p);
   HttpResponse CreateDatabase(const HttpRequest& req, const std::vector<std::string>& p);
@@ -60,6 +64,18 @@ class ApiService {
   HttpResponse EditRow(const HttpRequest& req, const std::vector<std::string>& params,
                        bool is_delete);
 
+  // ── 访问控制（令牌表；均需已持有 gate_）──────────────────
+  // 一张令牌 = 一个已认证身份 + 过期时刻。过期/未知一律视为未登录。
+  struct TokenInfo {
+    std::string user;
+    bool is_admin = false;
+    std::chrono::steady_clock::time_point expires;
+  };
+  std::string IssueToken(std::string user, bool is_admin);
+  // 从 Authorization: Bearer <token>（或 ?token=）取出并校验；未命中返回 nullptr
+  const TokenInfo* LookupToken(const HttpRequest& req) const;
+  void RevokeToken(const HttpRequest& req);
+
   // ── 内部工具（需已持有 gate_）─────────────────────────────
   const cella::db::CatalogTable* FindTableLocked(const std::string& name);
   JsonValue TableJsonLocked(const cella::db::CatalogTable& t);
@@ -71,7 +87,10 @@ class ApiService {
                          std::string* err);
 
   cella::db::DbEngine* engine_;
-  std::mutex gate_;                 // engine_gate_：引擎调用串行化
+  // engine_gate_：引擎调用串行化。**递归**互斥量 —— Handle() 先在同一临界区内
+  // 完成「校验令牌 + 注入身份」，再调用处理器（处理器自己也会锁同一把锁）。
+  std::recursive_mutex gate_;
+  std::map<std::string, TokenInfo> tokens_;  // 令牌表（同样由 gate_ 保护）
   std::unique_ptr<StaticFiles> static_;
   Router router_;
   std::chrono::steady_clock::time_point started_;

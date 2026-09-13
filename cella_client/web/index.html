@@ -18,6 +18,8 @@
     <button id="btnFormat" class="btn" title="格式化 SQL">格式化</button>
     <button id="btnExport" class="btn" title="导出当前结果（右键=JSON）">导出</button>
     <span class="spacer"></span>
+    <span id="userChip" class="userchip" title="当前登录用户"></span>
+    <button id="btnLogout" class="btn" style="display:none" title="登出">登出</button>
     <span id="txnBadge" class="txnbadge" title="事务状态">事务空闲</span>
     <button id="btnBegin" class="btn">BEGIN</button>
     <button id="btnCommit" class="btn" disabled>COMMIT</button>
@@ -56,6 +58,16 @@
       <button id="bpClose" class="btn icon" title="关闭">✕</button>
     </div>
     <div id="bpBody" class="bottombody"></div>
+  </div>
+
+  <div id="loginOverlay" class="loginoverlay">
+    <div class="loginbox">
+      <div class="logintitle">cella 登录</div>
+      <label class="loginrow">用户名<input id="loginUser" type="text" autocomplete="username" spellcheck="false"></label>
+      <label class="loginrow">口令<input id="loginPass" type="password" autocomplete="current-password"></label>
+      <div id="loginErr" class="loginerr"></div>
+      <button id="btnLogin" class="btn primary">登录</button>
+    </div>
   </div>
 
   <div id="toasts" class="toasts"></div>

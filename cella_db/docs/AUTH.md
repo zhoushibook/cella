@@ -111,5 +111,7 @@ cella_privileges  (user VARCHAR(64), scope_db VARCHAR(64), scope_table VARCHAR(6
   生产应换 bcrypt / scrypt / argon2。
 * `root` 初始为**空口令**，仅用于首次进入；请立刻改口令。
 * 本方言**没有**角色（role）、列级权限、口令有效期、失败锁定与连接审计（见计划文档 §10）。
-* 客户端（`cella_web`）开启认证后需先 `POST /api/login` 换令牌；
-  服务端目前是**单会话 + 全局串行**，多会话/连接池留待后续。
+* 客户端（`cella_web --auth`）需先 `POST /api/login` 换令牌（12 小时有效），
+  之后所有接口带 `Authorization: Bearer <token>`；越权 → `DB-802`，未登录 → `401`。
+  服务端目前是**单会话 + 全局串行**（身份按请求注入），多会话/连接池留待后续；
+  详见 `cella_client/README.md` §4.1。

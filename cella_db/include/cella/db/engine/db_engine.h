@@ -216,6 +216,12 @@ class Session {
   bool need_login() const { return engine_->config().enable_auth && user_.empty(); }
   // 是否按管理员对待（访问控制关闭时一律视为管理员，等价于「无访问控制」）
   bool is_admin() const { return !engine_->config().enable_auth || is_admin_; }
+  // ── 访问控制的外部入口 ──
+  // 供**直接调用引擎**的层（如 cella_client 的部分端点）复用同一套判定，
+  // 否则那些端点会绕过 DDL/库级检查。
+  DbStatus RequireAdmin(const char* what) const;
+  DbStatus CheckDatabaseAccess(const std::string& db) const;
+  void FilterDatabasesByPrivilege(QueryResult* result) const;
 
   // 执行一段 SQL（可含多条语句）。逐条编译、逐条执行、逐条汇报。
   DbStatus Execute(const std::string& sql, ScriptReport* report);
@@ -242,12 +248,8 @@ class Session {
   DbStatus ApplyUserCommand(const UserCommand& cmd, std::string* note, QueryResult* result);
   // 执行一条授权语句（调用前已完成登录检查）；SHOW GRANTS 会把结果写进 result
   DbStatus ApplyGrantCommand(const GrantCommand& cmd, std::string* note, QueryResult* result);
-  // 访问控制：能否访问某个库（管理员，或在该库上有任何授权）
-  DbStatus CheckDatabaseAccess(const std::string& db) const;
   // 访问控制：库级权限（建表/删表）
   DbStatus CheckDbPrivilege(cella::db::Priv need, const char* what) const;
-  // SHOW DATABASES 的可读性过滤（认证关闭或管理员时不过滤）
-  void FilterDatabasesByPrivilege(QueryResult* result) const;
 
   DbEngine* engine_;
   std::string name_;

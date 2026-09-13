@@ -83,7 +83,7 @@ cella_client/                   【图形客户端】内嵌 HTTP 服务 + 浏览
     ├── include/cella/client/   net（socket/HTTP/静态资源）/ api（json/router/sql_builder）/ server
     ├── src/                    实现 + main.cpp（cella_web 服务入口）
     ├── web/                    前端资源（纯 HTML/CSS/原生 ES Module，无构建步骤）
-    ├── tests/                  25 用例（JSON/HTTP/SQL 生成/API 端到端）
+    ├── tests/                  29 用例（JSON/HTTP/SQL 生成/API 端到端/访问控制）
     └── docs/                   PLAN_web_client.md（设计与实现约定）
 ```
 
@@ -98,7 +98,7 @@ cella_client/                   【图形客户端】内嵌 HTTP 服务 + 浏览
 | `build/cella_db/api_quickstart.exe` | 30 秒 C++ API 速览 |
 | `build/cella_db/concurrency_demo.exe` | 并发锁 / 死锁检测现场演示 |
 | `build/cella_client/cella_web.exe` | **图形客户端服务**（浏览器打开 `http://127.0.0.1:8080`） |
-| `build/cella_client/cella_client_tests.exe` | 客户端层测试（25 用例：JSON/HTTP/SQL 生成/API 端到端） |
+| `build/cella_client/cella_client_tests.exe` | 客户端层测试（29 用例：JSON/HTTP/SQL 生成/API 端到端/访问控制） |
 | `build/cella_sql/cella_sql.exe` | 原编译器 CLI（保留，`-l/-a/-s/-p/-o/--all` 行为不变） |
 | `build/cella_storage/*.exe` | 存储层 demo / quickstart / crud_flow / 测试（保留） |
 
