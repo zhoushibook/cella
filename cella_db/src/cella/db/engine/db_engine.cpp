@@ -266,6 +266,9 @@ DbStatus DbEngine::Open(const EngineConfig& config) {
   storage_config_ = sc;
   stats_before_checkpoints_ = storage::BufferStats{};
   checkpoint_count_ = 0;
+  // 记录「打开前数据文件是否已存在」：首次创建的落盘时机见 ⑩
+  const std::string main_db_path = config_.data_dir + "/" + sc.db_file;
+  const bool db_file_existed = std::filesystem::exists(main_db_path);
   storage_ = storage::CreateStorage(sc);
   const storage::Status os = storage_->Open(sc);
   if (!os.ok()) {
@@ -347,6 +350,21 @@ DbStatus DbEngine::Open(const EngineConfig& config) {
     }
   }
 
+  // ⑩ 首次创建即完整落盘（与身份库同一手法，见 FlushAuth 的注释）：新建数据文件时
+  //    只有元数据页写盘，目录/系统表页都在缓冲池里；进程若在首次 Close 前被强杀
+  //    （web 服务被停、CLI 被 Ctrl+C），会留下「只有元数据页」的半成品 ——
+  //    之后每次打开都报 kPageNotFound，整个数据目录报废。这里刷全一次保证自洽。
+  if (!db_file_existed) {
+    std::lock_guard<std::recursive_mutex> guard(storage_mutex_);
+    storage_->Close();
+    const storage::Status rs = storage_->Open(storage_config_);
+    if (!rs.ok()) {
+      return DbStatus::Error(DbCode::kStorageError,
+                             "数据文件首次落盘后重开失败: " + rs.ToString());
+    }
+    catalog_.AttachStorage(storage_.get());  // 对象未换，重挂仅为对齐生命周期语义
+  }
+
   opened_ = true;
   DbLogInfo(logcat::kEngine, "引擎已打开: 数据目录=" + config_.data_dir + " 页大小=" +
                                  std::to_string(config_.page_size) + " 缓冲池=" +
@@ -369,6 +387,7 @@ DbStatus DbEngine::EnsureAuthOpen() {
   // 身份库与当前库共用一套存储参数，但文件独立；USE 切库不会触碰它。
   storage::StorageConfig sc = storage_config_;
   sc.db_file = config_.auth_file.empty() ? AuthStore::kFileName : config_.auth_file;
+  auth_sc_ = sc;  // FlushAuth 重开时复用同一份参数
   auth_storage_ = storage::CreateStorage(sc);
   const std::string auth_path = config_.data_dir + "/" + sc.db_file;
   const storage::Status os = auth_storage_->Open(sc);
@@ -383,6 +402,9 @@ DbStatus DbEngine::EnsureAuthOpen() {
                                "原有的用户与授权将丢失。");
   }
   auth_.AttachStorage(auth_storage_.get());
+  // 写后钩子：每次用户/授权改动都立刻把身份库刷全（见 FlushAuth），
+  // 否则改动滞留缓冲池，进程被强杀（Ctrl+C / 关窗口）就丢了 —— 真实踩过的坑。
+  auth_.SetFlushHook([this]() { (void)FlushAuth(); });
 
   std::lock_guard<std::recursive_mutex> guard(storage_mutex_);
   bool created = false;
@@ -420,6 +442,22 @@ DbStatus DbEngine::EnsureAuthOpen() {
     if (!rs.ok()) {
       return DbStatus::Error(DbCode::kStorageError, "身份库首次落盘后重开失败: " + rs.ToString());
     }
+  }
+  return DbStatus::Ok();
+}
+
+// 身份库即改即落盘：Close（= FlushAllPages）+ 重开。身份库改动极少（用户/授权管理），
+// 这个代价可以忽略；换来的不变量是「改完即持久」，强杀进程也不丢。
+DbStatus DbEngine::FlushAuth() {
+  if (auth_storage_ == nullptr) {
+    return DbStatus::Ok();
+  }
+  std::lock_guard<std::recursive_mutex> guard(storage_mutex_);
+  auth_storage_->Close();
+  const storage::Status rs = auth_storage_->Open(auth_sc_);
+  if (!rs.ok()) {
+    auth_opened_ = false;
+    return DbStatus::Error(DbCode::kStorageError, "身份库刷盘后重开失败: " + rs.ToString());
   }
   return DbStatus::Ok();
 }

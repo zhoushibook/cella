@@ -278,8 +278,39 @@ DbStatus AuthStore::DeleteUserRow(const std::string& name) {
 
 // ── 用户管理 ────────────────────────────────────────────────
 
+bool AuthStore::PasswordHasControlChar(const std::string& password) {
+  for (const char c : password) {
+    const auto u = static_cast<unsigned char>(c);
+    if (u < 0x20) {  // 含 \n \r \t 等
+      return true;
+    }
+  }
+  return false;
+}
+
+std::string AuthStore::StoredPasswordHash(const std::string& name) const {
+  std::lock_guard<std::recursive_mutex> guard(mutex_);
+  const auto it = users_.find(CanonicalName(name));
+  return it == users_.end() ? std::string() : it->second.pwd;
+}
+
+// 校验口令：不允许换行 / 制表等控制字符 —— REPL 跨行输入会把换行存进引号串里，
+// 口令便「看起来对、实际多个换行」（真实踩过的坑），在存储入口直接拒绝。
+DbStatus AuthStore::CheckPassword(const std::string& password) {
+  if (PasswordHasControlChar(password)) {
+    return DbStatus::Error(DbCode::kSqlError,
+                           "口令不能包含换行 / 制表等控制字符（请把语句写在一行内，"
+                           "例如 SET PASSWORD = '123456';）");
+  }
+  return DbStatus::Ok();
+}
+
 DbStatus AuthStore::CreateUser(const std::string& name, const std::string& password, bool is_admin,
                                std::string* note) {
+  const DbStatus pv = CheckPassword(password);
+  if (!pv.ok()) {
+    return pv;
+  }
   if (storage_ == nullptr) {
     return DbStatus::Error(DbCode::kCatalogError, "身份库未附加存储引擎");
   }
@@ -311,6 +342,7 @@ DbStatus AuthStore::CreateUser(const std::string& name, const std::string& passw
     *note = "用户 " + u.name + " 已创建" + (is_admin ? "（管理员）" : "");
   }
   DbLogInfo(logcat::kAuth, "创建用户 " + u.name + (is_admin ? "（管理员）" : ""));
+  NotifyFlush();
   return DbStatus::Ok();
 }
 
@@ -344,11 +376,16 @@ DbStatus AuthStore::DropUser(const std::string& name, std::string* note) {
     *note = "用户 " + name + " 已删除";
   }
   DbLogInfo(logcat::kAuth, "删除用户 " + name);
+  NotifyFlush();
   return DbStatus::Ok();
 }
 
 DbStatus AuthStore::SetPassword(const std::string& name, const std::string& password,
                                 std::string* note) {
+  const DbStatus pv = CheckPassword(password);
+  if (!pv.ok()) {
+    return pv;
+  }
   if (storage_ == nullptr) {
     return DbStatus::Error(DbCode::kCatalogError, "身份库未附加存储引擎");
   }
@@ -375,6 +412,7 @@ DbStatus AuthStore::SetPassword(const std::string& name, const std::string& pass
     *note = "用户 " + updated.name + " 的口令已更新";
   }
   DbLogInfo(logcat::kAuth, "更新口令: " + updated.name);
+  NotifyFlush();
   return DbStatus::Ok();
 }
 
@@ -492,6 +530,7 @@ DbStatus AuthStore::GrantPrivilege(const std::string& user, const std::string& s
   }
   DbLogInfo(logcat::kAuth, "GRANT " + std::string(PrivName(g.priv)) + " ON " + ScopeText(g) + " TO " +
                                g.user);
+  NotifyFlush();
   return DbStatus::Ok();
 }
 
@@ -534,6 +573,7 @@ DbStatus AuthStore::RevokePrivilege(const std::string& user, const std::string& 
   }
   DbLogInfo(logcat::kAuth, "REVOKE " + std::string(PrivName(g.priv)) + " ON " + ScopeText(g) +
                                " FROM " + g.user);
+  NotifyFlush();
   return DbStatus::Ok();
 }
 
@@ -573,6 +613,7 @@ DbStatus AuthStore::SetAdmin(const std::string& user, bool is_admin, std::string
     *note = "用户 " + updated.name + (is_admin ? " 已提升为管理员" : " 已撤销管理员");
   }
   DbLogInfo(logcat::kAuth, "SET ADMIN " + std::to_string(is_admin ? 1 : 0) + ": " + updated.name);
+  NotifyFlush();
   return DbStatus::Ok();
 }
 

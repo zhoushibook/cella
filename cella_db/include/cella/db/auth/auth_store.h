@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -60,6 +61,9 @@ class AuthStore {
 
   void AttachStorage(storage::IStorage* storage) { storage_ = storage; }
   bool attached() const { return storage_ != nullptr; }
+  // 写后刷盘钩子：由 DbEngine 注入（Close + Open 身份库），保证每次改动即落盘 ——
+  // 否则改动只留在缓冲池里，进程被强杀（Ctrl+C / 关窗口）就丢了。
+  void SetFlushHook(std::function<void()> hook) { flush_hook_ = std::move(hook); }
 
   // ── 生命周期（须持 storage_mutex_）─────────────────────────
   // 建两张系统表（缺哪张建哪张）；created 返回本次是否新建过
@@ -108,6 +112,12 @@ class AuthStore {
   // ── 工具 ──────────────────────────────────────────────────
   // 用户名合法性：[A-Za-z_][A-Za-z0-9_]*，长度 1..64
   static bool ValidUserName(const std::string& name);
+  // 口令里不允许换行 / 制表等控制字符（REPL 跨行输入会把换行存进串里，几乎必是失误）
+  static bool PasswordHasControlChar(const std::string& password);
+  // 口令校验入口（建用户 / 改口令共用）；违规 → DB-501 带提示
+  static DbStatus CheckPassword(const std::string& password);
+  // 某用户当前存储的口令串（sha256$iter$salt$hash）——测试用；不存在返回空
+  std::string StoredPasswordHash(const std::string& name) const;
   // 查找用的规范键（大写）
   static std::string CanonicalName(const std::string& name);
 
@@ -124,11 +134,18 @@ class AuthStore {
   DbStatus DeleteGrantRow(const storage::Rid& rid);
   // 把用户拼写解析成已登记的写法；用户不存在 → DB-803
   DbStatus ResolveUserName(const std::string& user, std::string* out) const;
+  // 成功的写操作末尾调用（若已注入钩子）
+  void NotifyFlush() {
+    if (flush_hook_) {
+      flush_hook_();
+    }
+  }
 
   mutable std::recursive_mutex mutex_;  // 叶子锁：只保护内存缓存
   storage::IStorage* storage_ = nullptr;
   std::map<std::string, AuthUser> users_;  // 键 = 大写用户名
   std::vector<AuthGrant> grants_;          // 全量授权（无重复键）
+  std::function<void()> flush_hook_;       // 写后刷盘（DbEngine 注入）
 };
 
 }  // namespace cella::db

@@ -228,3 +228,11 @@ MT_TEST(多库_旧布局迁移) {
   MT_EQ(e.engine.current_db(), std::string("main"));
   MT_EQ(RowsText(e.Run("get id in t;").statements[0].result), std::string("5"));
 }
+
+// ── 首次创建即完整落盘（回归「web 被强杀后数据目录报废」）────────────────
+MT_TEST(多库_数据文件首次创建即完整落盘) {
+  Engine e("db_flush_first");
+  // 引擎还开着：main.db 就已经是完整多页（元数据 + 目录/系统表），而非只有 4096 字节
+  const auto sz = std::filesystem::file_size(e.cfg.data_dir + "/" + e.cfg.db_file);
+  MT_CHECK(sz > 4096);
+}

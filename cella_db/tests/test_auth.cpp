@@ -4,6 +4,7 @@
 //       用户管理（建 / 删 / 改口令）、非管理员受限、最后一个管理员、持久化、
 //       以及「开关关闭时行为与引入本特性前一致」。
 #include <filesystem>
+#include <fstream>
 #include <string>
 
 #include "cella/db/auth/password.h"
@@ -408,4 +409,26 @@ MT_TEST(认证_首次创建即完整落盘) {
   MT_CHECK(e.Login("alice", "p"));
   MT_CHECK(e.Login("root", ""));
   MT_CHECK(e.Run("SHOW USERS;").all_ok());
+}
+
+// ── 改动即落盘：进程被强杀也不丢（回归「改口令后强杀 → 改动丢失」）────────
+MT_TEST(认证_口令改动即落盘) {
+  Engine e("auth_durable", 32, true);
+  MT_CHECK(e.Login("root", ""));
+  MT_CHECK(e.Run("SET PASSWORD = '123456';").all_ok());
+  // 引擎还开着：新口令哈希必须已经在盘上（写后钩子立即把身份库刷全）
+  std::ifstream f(e.cfg.data_dir + "/cella_auth.db", std::ios::binary);
+  MT_CHECK(f.good());
+  const std::string bytes((std::istreambuf_iterator<char>(f)),
+                          std::istreambuf_iterator<char>());
+  const std::string want = e.engine.auth().StoredPasswordHash("root");
+  MT_CHECK(!want.empty());
+  MT_CHECK(bytes.find(want) != std::string::npos);
+  // 关掉重开：新口令生效（旧口令失效）
+  e.Close();
+  MT_CHECK(e.Reopen());
+  MT_CHECK(e.Login("root", "123456"));
+  // 控制字符口令在存储入口被拒（REPL 跨行输入的历史坑：换行被原样存进口令串）
+  MT_CHECK(!e.Run("SET PASSWORD = 'a\nb';").all_ok());
+  MT_CHECK(!e.Run("CREATE USER bad IDENTIFIED BY 'x\ny';").all_ok());
 }

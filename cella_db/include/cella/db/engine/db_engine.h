@@ -138,6 +138,9 @@ class DbEngine {
   DbStatus EnsureAuthOpen();
   // 认证：成功返回 Ok 并给出管理员标志；失败 → DB-801（不区分用户名/口令错）。
   DbStatus Authenticate(const std::string& user, const std::string& password, bool* out_is_admin);
+  // 身份库即改即落盘：Close + Open 强制刷全（Close = FlushAllPages）。
+  // 由 AuthStore 的写后钩子调用；不这样做的后果是「改口令后进程被强杀 → 改动丢失」。
+  DbStatus FlushAuth();
   // 首次开启认证时自动建 root 的说明（空 = 无话说），供 CLI 打印醒目警告
   const std::string& auth_bootstrap_note() const { return auth_bootstrap_note_; }
 
@@ -182,6 +185,7 @@ class DbEngine {
   // 身份库：独立于当前库的一份存储实例（USE 切库不影响它）
   std::unique_ptr<storage::IStorage> auth_storage_;
   AuthStore auth_;
+  storage::StorageConfig auth_sc_;  // 身份库打开参数（FlushAuth 重开用）
   bool auth_opened_ = false;
   std::string auth_bootstrap_note_;
   std::recursive_mutex storage_mutex_;  // 存储层访问串行化（存储层非线程安全）
