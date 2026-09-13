@@ -182,3 +182,206 @@ MT_TEST(认证_持久化) {
   MT_CHECK(!e.Login("root", ""));  // 旧（空）口令失效
   MT_CHECK(e.engine.auth_bootstrap_note().empty());  // 已有用户 → 不再引导
 }
+
+// ═════════════════════════ 授权（M2）═════════════════════════
+
+MT_TEST(授权_表级读写) {
+  Engine e("auth_g_table", 32, true);
+  MT_CHECK(e.Login("root", ""));
+  MT_CHECK(e.Run("CREATE TABLE t(id INT, v VARCHAR(8));INSERT INTO t VALUES (1,'a');").all_ok());
+  MT_CHECK(e.Run("CREATE USER alice IDENTIFIED BY 'p';").all_ok());
+
+  // 未授权：读被拒
+  MT_CHECK(e.Login("alice", "p"));
+  MT_CHECK(e.Run("get * in t;").statements[0].status.code() == DbCode::kPermissionDenied);
+  // 授权读 → 读通过，写仍被拒
+  MT_CHECK(e.Login("root", ""));
+  MT_CHECK(e.Run("GRANT get ON main.t TO alice;").all_ok());
+  MT_CHECK(e.Login("alice", "p"));
+  MT_CHECK(e.Run("get * in t;").all_ok());
+  MT_CHECK(e.Run("INSERT INTO t VALUES (2,'b');").statements[0].status.code() ==
+           DbCode::kPermissionDenied);
+  MT_CHECK(e.Run("UPDATE t SET v = 'x';").statements[0].status.code() == DbCode::kPermissionDenied);
+  MT_CHECK(e.Run("DELETE in t;").statements[0].status.code() == DbCode::kPermissionDenied);
+  // 授权写（三种各自独立）
+  MT_CHECK(e.Login("root", ""));
+  MT_CHECK(e.Run("GRANT insert, update, delete ON main.t TO alice;").all_ok());
+  MT_CHECK(e.Login("alice", "p"));
+  MT_CHECK(e.Run("INSERT INTO t VALUES (2,'b');").all_ok());
+  MT_CHECK(e.Run("UPDATE t SET v = 'c' limit id = 2;").all_ok());
+  MT_CHECK(e.Run("DELETE in t limit id = 2;").all_ok());
+  MT_EQ(testutil::RowsText(e.Run("get * in t;").statements[0].result), std::string("1|a"));
+}
+
+MT_TEST(授权_作用域与撤销) {
+  Engine e("auth_g_scope", 32, true);
+  MT_CHECK(e.Login("root", ""));
+  MT_CHECK(e.Run("CREATE TABLE t(id INT);CREATE TABLE u(id INT);").all_ok());
+  MT_CHECK(e.Run("CREATE USER bob IDENTIFIED BY 'p';").all_ok());
+  // 整库只读：库里所有表都可读
+  MT_CHECK(e.Run("GRANT get ON main.* TO bob;").all_ok());
+  MT_CHECK(e.Login("bob", "p"));
+  MT_CHECK(e.Run("get * in t;").all_ok());
+  MT_CHECK(e.Run("get * in u;").all_ok());
+  // 全局只读（`*.*`）：仍然只读，写被拒
+  MT_CHECK(e.Login("root", ""));
+  MT_CHECK(e.Run("GRANT get ON *.* TO bob;").all_ok());
+  MT_CHECK(e.Login("bob", "p"));
+  MT_CHECK(e.Run("get * in t;").all_ok());
+  MT_CHECK(e.Run("INSERT INTO t VALUES (9);").statements[0].status.code() ==
+           DbCode::kPermissionDenied);
+  // 撤销即时生效（整库 + 全局都撤掉）
+  MT_CHECK(e.Login("root", ""));
+  MT_CHECK(e.Run("REVOKE get ON main.* FROM bob;").all_ok());
+  MT_CHECK(e.Run("REVOKE get ON *.* FROM bob;").all_ok());
+  MT_CHECK(e.Login("bob", "p"));
+  MT_CHECK(e.Run("get * in t;").statements[0].status.code() == DbCode::kPermissionDenied);
+  // 撤销不存在的授权：幂等成功
+  MT_CHECK(e.Login("root", ""));
+  MT_CHECK(e.Run("REVOKE get ON main.t FROM bob;").all_ok());
+}
+
+MT_TEST(授权_建表删表需库级权限) {
+  Engine e("auth_g_ddl", 32, true);
+  MT_CHECK(e.Login("root", ""));
+  MT_CHECK(e.Run("CREATE TABLE t(id INT);").all_ok());
+  MT_CHECK(e.Run("CREATE USER carol IDENTIFIED BY 'p';").all_ok());
+  // 只有表级 DML 权限 → 建表/删表被拒（库级需求）
+  MT_CHECK(e.Run("GRANT all ON main.t TO carol;").all_ok());
+  MT_CHECK(e.Login("carol", "p"));
+  MT_CHECK(e.Run("CREATE TABLE t2(id INT);").statements[0].status.code() ==
+           DbCode::kPermissionDenied);
+  MT_CHECK(e.Run("DROP TABLE t;").statements[0].status.code() == DbCode::kPermissionDenied);
+  // 库级 all → 建表 / 删表放行
+  MT_CHECK(e.Login("root", ""));
+  MT_CHECK(e.Run("GRANT all ON main.* TO carol;").all_ok());
+  MT_CHECK(e.Login("carol", "p"));
+  MT_CHECK(e.Run("CREATE TABLE t2(id INT);").all_ok());
+  MT_CHECK(e.Run("DROP TABLE t2;").all_ok());
+}
+
+MT_TEST(授权_跨库) {
+  Engine e("auth_g_cross", 32, true);
+  MT_CHECK(e.Login("root", ""));
+  MT_CHECK(e.Run("CREATE TABLE t(id INT);INSERT INTO t VALUES (1);CREATE TABLE u(id INT);"
+                 "CREATE DATABASE b;USE b;CREATE TABLE bt(id INT);INSERT INTO bt VALUES (7);"
+                 "USE main;")
+               .all_ok());
+  MT_CHECK(e.Run("CREATE USER dave IDENTIFIED BY 'p';").all_ok());
+  MT_CHECK(e.Run("GRANT get ON b.* TO dave;").all_ok());
+  MT_CHECK(e.Run("GRANT get ON main.t TO dave;").all_ok());
+
+  MT_CHECK(e.Login("dave", "p"));
+  // b 库：整库可读
+  MT_CHECK(e.Run("USE b;").all_ok());
+  MT_CHECK(e.Run("get * in bt;").all_ok());
+  // main 库：只有 t 可读（有 main.t 授权 → 也就能切过去）
+  MT_CHECK(e.Run("USE main;").all_ok());
+  MT_CHECK(e.Run("get * in t;").all_ok());
+  MT_CHECK(e.Run("get * in u;").statements[0].status.code() == DbCode::kPermissionDenied);
+  // SHOW DATABASES：只列出有权限的库（b 与 main），不含身份库
+  MT_EQ(testutil::RowsText(e.Run("SHOW DATABASES;").statements[0].result), std::string("b\nmain"));
+  // 建库需要管理员；切到无授权的库被拒
+  MT_CHECK(e.Run("CREATE DATABASE c;").statements[0].status.code() == DbCode::kPermissionDenied);
+  MT_CHECK(e.Run("USE c;").statements[0].status.code() == DbCode::kPermissionDenied);
+}
+
+MT_TEST(授权_库管理需管理员) {
+  Engine e("auth_g_db", 32, true);
+  MT_CHECK(e.Login("root", ""));
+  MT_CHECK(e.Run("CREATE USER eve IDENTIFIED BY 'p';CREATE DATABASE d1;").all_ok());
+  MT_CHECK(e.Run("GRANT get ON d1.* TO eve;").all_ok());
+  MT_CHECK(e.Login("eve", "p"));
+  MT_CHECK(e.Run("CREATE DATABASE d2;").statements[0].status.code() == DbCode::kPermissionDenied);
+  MT_CHECK(e.Run("DROP DATABASE d1;").statements[0].status.code() == DbCode::kPermissionDenied);
+  // 保留名：任何人都不能建
+  MT_CHECK(e.Login("root", ""));
+  MT_CHECK(e.Run("CREATE DATABASE cella_auth;").statements[0].status.code() ==
+           DbCode::kDatabaseError);
+  // SHOW DATABASES 里没有身份库
+  const ScriptReport sd = e.Run("SHOW DATABASES;");
+  MT_CHECK(sd.all_ok());
+  MT_CHECK(testutil::RowsText(sd.statements[0].result).find("cella_auth") == std::string::npos);
+}
+
+MT_TEST(授权_授予需管理员) {
+  Engine e("auth_g_who", 32, true);
+  MT_CHECK(e.Login("root", ""));
+  MT_CHECK(e.Run("CREATE USER frank IDENTIFIED BY 'p';CREATE TABLE t(id INT);").all_ok());
+  MT_CHECK(e.Login("frank", "p"));
+  MT_CHECK(e.Run("GRANT get ON main.t TO frank;").statements[0].status.code() ==
+           DbCode::kGrantDenied);
+  MT_CHECK(e.Run("REVOKE get ON main.t FROM frank;").statements[0].status.code() ==
+           DbCode::kGrantDenied);
+  // 查看自己的授权是允许的（此时为空）
+  const ScriptReport sg = e.Run("SHOW GRANTS;");
+  MT_CHECK(sg.all_ok());
+  MT_EQ(testutil::ColsText(sg.statements[0].result), std::string("scope|priv"));
+  MT_EQ(testutil::RowCount(sg.statements[0].result), 0u);
+  // 不能查看他人授权
+  MT_CHECK(e.Run("SHOW GRANTS FOR root;").statements[0].status.code() == DbCode::kGrantDenied);
+}
+
+MT_TEST(授权_管理员权限与最后一个管理员) {
+  Engine e("auth_g_admin", 32, true);
+  MT_CHECK(e.Login("root", ""));
+  MT_CHECK(e.Run("CREATE USER gina IDENTIFIED BY 'p';").all_ok());
+  MT_CHECK(e.Run("GRANT admin TO gina;").all_ok());
+  MT_CHECK(e.engine.auth().IsAdmin("gina"));
+  // 提升后 gina 可以管用户（无需任何表级授权）
+  MT_CHECK(e.Login("gina", "p"));
+  MT_CHECK(e.Run("CREATE TABLE t(id INT);").all_ok());
+  MT_CHECK(e.Run("CREATE USER hank IDENTIFIED BY 'p';").all_ok());
+  // 不能撤销自己的管理员
+  MT_CHECK(e.Run("REVOKE admin FROM gina;").statements[0].status.code() == DbCode::kLastAdmin);
+  MT_CHECK(e.engine.auth().IsAdmin("gina"));
+  // root 降级会被拒（撤销后仍有 gina 是管理员，故此时允许——验证「非最后一个」放行）
+  MT_CHECK(e.Login("root", ""));
+  MT_CHECK(e.Run("REVOKE admin FROM gina;").all_ok());
+  MT_CHECK(!e.engine.auth().IsAdmin("gina"));
+  // 只剩 root 一个管理员：撤销自己 → DB-804
+  MT_CHECK(e.Run("REVOKE admin FROM root;").statements[0].status.code() == DbCode::kLastAdmin);
+}
+
+MT_TEST(授权_SHOW_GRANTS与语法) {
+  Engine e("auth_g_show", 32, true);
+  MT_CHECK(e.Login("root", ""));
+  MT_CHECK(e.Run("CREATE TABLE t(id INT);CREATE USER ivy IDENTIFIED BY 'p';").all_ok());
+  MT_CHECK(e.Run("GRANT get, insert ON main.t TO ivy;").all_ok());
+  MT_CHECK(e.Run("GRANT get ON main.* TO ivy;").all_ok());
+  const ScriptReport sg = e.Run("SHOW GRANTS FOR ivy;");
+  MT_CHECK(sg.all_ok());
+  MT_EQ(testutil::ColsText(sg.statements[0].result), std::string("scope|priv"));
+  MT_CHECK(testutil::RowCount(sg.statements[0].result) == 3u);  // main.t get/main.t insert/main.* get
+  // 管理员查看自己：含 ADMIN 行
+  const ScriptReport sr = e.Run("SHOW GRANTS;");
+  MT_CHECK(sr.all_ok());
+  MT_EQ(testutil::RowsText(sr.statements[0].result), std::string("*.*|ADMIN"));
+  // 语法错误 → DB-501（明确的语法错误而非丢给编译器）
+  MT_CHECK(e.Run("GRANT get TO ivy;").statements[0].status.code() == DbCode::kSqlError);
+  MT_CHECK(e.Run("GRANT bogus ON main.t TO ivy;").statements[0].status.code() == DbCode::kSqlError);
+  MT_CHECK(e.Run("GRANT get ON t TO;").statements[0].status.code() == DbCode::kSqlError);
+  // 用户不存在 → DB-803
+  MT_CHECK(e.Run("GRANT get ON main.t TO nobody;").statements[0].status.code() ==
+           DbCode::kUserError);
+}
+
+MT_TEST(授权_持久化与系统表放行) {
+  Engine e("auth_g_persist", 32, true);
+  MT_CHECK(e.Login("root", ""));
+  MT_CHECK(e.Run("CREATE TABLE t(id INT);").all_ok());
+  MT_CHECK(e.Run("CREATE USER jack IDENTIFIED BY 'p';").all_ok());
+  MT_CHECK(e.Run("GRANT get ON main.t TO jack;").all_ok());
+  e.Close();
+  MT_CHECK(e.Reopen());
+
+  MT_CHECK(e.Login("jack", "p"));
+  MT_CHECK(e.Run("get * in t;").all_ok());                      // 授权跨重启仍生效
+  MT_CHECK(e.Run("get * in cella_catalog;").all_ok());          // 系统表读放行
+  MT_CHECK(e.Run("CREATE TABLE x(id INT);").statements[0].status.code() ==
+           DbCode::kPermissionDenied);
+  MT_CHECK(e.Login("root", ""));
+  MT_CHECK(e.Run("REVOKE get ON main.t FROM jack;").all_ok());  // 撤销也持久化
+  MT_CHECK(e.Login("jack", "p"));
+  MT_CHECK(e.Run("get * in t;").statements[0].status.code() == DbCode::kPermissionDenied);
+}

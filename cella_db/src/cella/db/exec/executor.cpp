@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "cella/db/auth/auth_store.h"
 #include "cella/db/common/db_logger.h"
 #include "cella/db/common/value_bridge.h"
 #include "cella/db/exec/expr_eval.h"
@@ -325,11 +326,45 @@ namespace cella::db
     return ExecGet(plan, ctx, out);
   }
 
-  DbStatus Executor::LockTable(const std::string &table, LockMode mode, const ExecContext &ctx)
+  // 表级权限判定。短路顺序：访问控制关 → 管理员 → 无需检查（DDL）→ 未绑定身份库 →
+  // 系统表（只读放行，写已被 DB-512 拦）。命中即为「所有表访问的必经点」。
+  DbStatus Executor::CheckTablePrivilege(const std::string &table, const ExecContext &ctx,
+                                         TablePriv need)
+  {
+    if (!ctx.auth_enabled || ctx.is_admin || need == TablePriv::kNone || auth_ == nullptr)
+    {
+      return DbStatus::Ok();
+    }
+    if (CatalogManager::IsSystemTable(table))
+    {
+      return DbStatus::Ok();
+    }
+    Priv required = Priv::kGet;
+    if (!TablePrivToPriv(need, &required))
+    {
+      return DbStatus::Ok();
+    }
+    if (auth_->HasPrivilege(ctx.user, ctx.lock_scope, table, required))
+    {
+      return DbStatus::Ok();
+    }
+    return DbStatus::Error(DbCode::kPermissionDenied,
+                           "权限不足：用户 \"" + ctx.user + "\" 在 " + ctx.lock_scope + "." + table +
+                               " 上没有 " + PrivName(required) + " 权限");
+  }
+
+  DbStatus Executor::LockTable(const std::string &table, LockMode mode, const ExecContext &ctx,
+                               TablePriv need)
   {
     if (ctx.txn_id == kInvalidTxnId)
     {
       return DbStatus::Error(DbCode::kNoActiveTxn, "缺少事务上下文，无法加锁");
+    }
+    // 访问控制：表级读写在这个「所有表访问的必经点」上判定，新增算子也不会漏
+    const DbStatus ps = CheckTablePrivilege(table, ctx, need);
+    if (!ps.ok())
+    {
+      return ps;
     }
     // 锁资源带库前缀：同一路径里不会跨库（USE 在事务中被禁），
     // 前缀是防「引擎切换库后，别的会话残留的旧库锁」与新城同名表误撞。
@@ -356,7 +391,7 @@ namespace cella::db
     {
       return DbStatus::Error(DbCode::kTableExists, "表已存在: " + st->tableName);
     }
-    const DbStatus ls = LockTable(st->tableName, LockMode::kExclusive, ctx);
+    const DbStatus ls = LockTable(st->tableName, LockMode::kExclusive, ctx, TablePriv::kNone);
     if (!ls.ok())
     {
       return ls;
@@ -442,7 +477,7 @@ namespace cella::db
     {
       return DbStatus::Error(DbCode::kSystemTableProtected, "系统表禁止删除: " + name);
     }
-    const DbStatus ls = LockTable(name, LockMode::kExclusive, ctx);
+    const DbStatus ls = LockTable(name, LockMode::kExclusive, ctx, TablePriv::kNone);
     if (!ls.ok())
     {
       return ls;
@@ -493,7 +528,7 @@ namespace cella::db
     {
       return DbStatus::Error(DbCode::kSystemTableProtected, "系统表禁止修改: " + name);
     }
-    const DbStatus ls = LockTable(name, LockMode::kExclusive, ctx);
+    const DbStatus ls = LockTable(name, LockMode::kExclusive, ctx, TablePriv::kInsert);
     if (!ls.ok())
     {
       return ls;
@@ -740,7 +775,7 @@ namespace cella::db
     {
       return DbStatus::Error(DbCode::kSystemTableProtected, "系统表禁止修改: " + name);
     }
-    const DbStatus ls = LockTable(name, LockMode::kExclusive, ctx);
+    const DbStatus ls = LockTable(name, LockMode::kExclusive, ctx, TablePriv::kDelete);
     if (!ls.ok())
     {
       return ls;
@@ -801,7 +836,7 @@ namespace cella::db
     {
       return DbStatus::Error(DbCode::kSystemTableProtected, "系统表禁止修改: " + name);
     }
-    const DbStatus ls = LockTable(name, LockMode::kExclusive, ctx);
+    const DbStatus ls = LockTable(name, LockMode::kExclusive, ctx, TablePriv::kUpdate);
     if (!ls.ok())
     {
       return ls;
@@ -1056,7 +1091,7 @@ namespace cella::db
       return DbStatus::Error(DbCode::kTableNotFound, "表不存在: " + name);
     }
     const std::string real = meta->name;
-    const DbStatus ls = LockTable(real, LockMode::kShared, ctx); // 读锁
+    const DbStatus ls = LockTable(real, LockMode::kShared, ctx, TablePriv::kRead); // 读锁
     if (!ls.ok())
     {
       return ls;

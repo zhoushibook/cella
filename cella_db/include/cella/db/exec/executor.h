@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "cella/cella_planner.h"
+#include "cella/db/auth/privilege.h"
 #include "cella/db/catalog/catalog_manager.h"
 #include "cella/db/exec/query_result.h"
 #include "cella/db/exec/row_set.h"
@@ -36,6 +37,8 @@
 #include "cella/storage/common/types.h"
 
 namespace cella::db {
+
+class AuthStore;
 
 // 语句执行的上下文：事务 + 触碰表记录
 struct ExecContext {
@@ -48,6 +51,10 @@ struct ExecContext {
   // 从而保证 `get *` 的输出与不引用 rowid 的语句完全不受影响。
   // 放在上下文里（而不是 Executor 成员）是因为引擎可能被多会话并发使用。
   bool with_rowid = false;
+  // ── 访问控制（表级读写的判定就在 LockTable 这个必经点上）──
+  bool auth_enabled = false;    // 关掉时一律跳过检查
+  bool is_admin = false;        // 管理员全放行
+  std::string user;             // 当前登录用户（auth_enabled 时有效）
 
   bool recording() const { return txn != nullptr; }
 };
@@ -63,6 +70,9 @@ class Executor {
 
   // 执行一条语句的计划；out 必须非空。
   DbStatus Execute(const cella::CELLA_PlanNode& plan, const ExecContext& ctx, QueryResult* out);
+
+  // 绑定身份库（访问控制判定用；不接管所有权）。引擎在打开后调用一次即可。
+  void AttachAuth(const AuthStore* auth) { auth_ = auth; }
 
   // 只跑查询算子子树（GET 的各类算子也可单独驱动，便于测试）
   DbStatus Run(const cella::CELLA_PlanNode& node, const ExecContext& ctx, RowSet* out);
@@ -97,7 +107,13 @@ class Executor {
   DbStatus RunSingleChild(const cella::CELLA_PlanNode& node, const ExecContext& ctx, RowSet* out);
 
   // ── 工具 ──
-  DbStatus LockTable(const std::string& table, LockMode mode, const ExecContext& ctx);
+  // 加表锁。need = 本次锁对应的数据权限（访问控制关闭/管理员/系统表会短路放行）：
+  // DML 各自传 kInsert/kUpdate/kDelete，读传 kRead，DDL 传 kNone（已由会话层判定）。
+  // 参数**必填**，这样将来新增算子时编译器会逼着调用点明确表态，不会静默放行。
+  DbStatus LockTable(const std::string& table, LockMode mode, const ExecContext& ctx,
+                     TablePriv need);
+  // 表级权限判定（LockTable 内部调用）
+  DbStatus CheckTablePrivilege(const std::string& table, const ExecContext& ctx, TablePriv need);
   // 扫描一张表并按谓词过滤，收集 (Rid, 记录)（DELETE/UPDATE 两阶段修改用）
   DbStatus ScanMatching(const CatalogTable& table, const cella::CELLA_Expr* pred, bool with_rowid,
                         std::vector<std::pair<storage::Rid, storage::Record>>* out);
@@ -116,6 +132,7 @@ class Executor {
   TxnManager* txn_manager_;
   LockManager* locks_;
   std::recursive_mutex* storage_mutex_;
+  const AuthStore* auth_ = nullptr;  // 访问控制判定（可为空 = 不做检查）
   size_t operator_calls_ = 0;
 
   // ── ORDER BY 引用未投影列时的「隐藏排序键」通道 ──

@@ -333,6 +333,7 @@ DbStatus DbEngine::Open(const EngineConfig& config) {
   // ⑦ 执行器
   executor_ = std::make_unique<Executor>(storage_.get(), &catalog_, txn_manager_.get(), locks_.get(),
                                          &storage_mutex_);
+  executor_->AttachAuth(&auth_);  // 表级权限判定要用（身份库按需打开，指针本身恒定）
 
   // ⑧ 默认会话
   default_session_ = std::make_unique<Session>(this, "main");
@@ -466,6 +467,10 @@ DbStatus DbEngine::CreateDatabase(const std::string& name, std::string* note) {
     return DbStatus::Error(DbCode::kDatabaseError,
                            "数据库名非法: \"" + name + "\"（标识符规则，且不与保留字冲突）");
   }
+  if (AuthStore::CanonicalName(name) == AuthStore::CanonicalName(AuthStore::kReservedDbName)) {
+    return DbStatus::Error(DbCode::kDatabaseError,
+                           "数据库名 " + name + " 是保留名（身份库专用，不属于用户库）");
+  }
   const std::string file = config_.data_dir + "/" + DbFileOf(name);
   std::error_code ec;
   if (std::filesystem::exists(file, ec)) {
@@ -589,7 +594,11 @@ DbStatus DbEngine::ShowDatabases(QueryResult* out) {
         fname.compare(fname.size() - suffix.size(), suffix.size(), suffix) != 0) {
       continue;  // 只认 *.db（.db.dropped-* 的软删除留档不会匹配）
     }
-    names.insert(fname.substr(0, fname.size() - suffix.size()));
+    const std::string stem = fname.substr(0, fname.size() - suffix.size());
+    if (stem == AuthStore::kReservedDbName) {
+      continue;  // 身份库不是用户库，不出现在列表里
+    }
+    names.insert(stem);
   }
   for (const std::string& n : names) {
     std::vector<storage::Value> row;
@@ -895,6 +904,127 @@ DbStatus Session::ApplyUserCommand(const UserCommand& cmd, std::string* note, Qu
   return DbStatus::Error(DbCode::kInternal, "未知的用户管理语句");
 }
 
+// ── 授权语句的执行（会话层；调用前已完成登录检查）────────────
+DbStatus Session::ApplyGrantCommand(const GrantCommand& cmd, std::string* note, QueryResult* result) {
+  using Kind = GrantCommand::Kind;
+  const bool show = (cmd.kind == Kind::kShowGrants);
+  if (!is_admin() && !show) {
+    return DbStatus::Error(DbCode::kGrantDenied, "只有管理员可以授予或撤销权限");
+  }
+  if (!show && in_transaction()) {
+    return DbStatus::Error(DbCode::kDatabaseTxnActive,
+                           "授权操作前须结束当前事务（COMMIT / ROLLBACK）");
+  }
+  const DbStatus os = engine_->EnsureAuthOpen();
+  if (!os.ok()) {
+    return os;
+  }
+  AuthStore& auth = engine_->auth();
+
+  if (show) {
+    const std::string target = cmd.name.empty() ? user_ : cmd.name;
+    if (!is_admin() && AuthStore::CanonicalName(target) != AuthStore::CanonicalName(user_)) {
+      return DbStatus::Error(DbCode::kGrantDenied, "只能查看自己的授权（管理员可查看他人）");
+    }
+    if (!auth.HasUser(target)) {
+      return DbStatus::Error(DbCode::kUserError, "用户不存在: " + target);
+    }
+    if (result != nullptr) {
+      result->Clear();
+      result->columns.push_back(ResultColumn{"scope"});
+      result->columns.push_back(ResultColumn{"priv"});
+      for (const AuthGrant& g : auth.GrantsOf(target)) {
+        result->rows.push_back({storage::Value::Varchar(FormatScope(g.scope_db, g.scope_table)),
+                                storage::Value::Varchar(PrivName(g.priv))});
+      }
+      if (auth.IsAdmin(target)) {  // 管理员是用户属性，不在权限行里，这里补一行说明
+        result->rows.push_back(
+            {storage::Value::Varchar("*.*"), storage::Value::Varchar(PrivName(Priv::kAdmin))});
+      }
+      result->tag = "SHOW GRANTS " + std::to_string(result->rows.size());
+    }
+    if (note != nullptr) {
+      *note = "SHOW GRANTS FOR " + target;
+    }
+    return DbStatus::Ok();
+  }
+
+  // 作用域：未写库名 → 当前库；写了 `*` → 全局
+  const std::string db = cmd.scope_db.empty() ? engine_->current_db() : cmd.scope_db;
+  const std::string tbl = cmd.scope_table.empty() ? "*" : cmd.scope_table;
+  std::lock_guard<std::recursive_mutex> guard(engine_->storage_mutex_);
+  for (const std::string& raw : cmd.privs) {
+    Priv priv;
+    if (!ParsePriv(raw, &priv)) {
+      return DbStatus::Error(DbCode::kSqlError,
+                             "未知权限名: " + raw +
+                                 "（可用 get / insert / update / delete / create / drop / all / admin）");
+    }
+    for (const std::string& u : cmd.users) {
+      DbStatus st;
+      if (priv == Priv::kAdmin) {
+        if (cmd.kind == Kind::kGrant) {
+          st = auth.SetAdmin(u, true, note);
+        } else {
+          if (AuthStore::CanonicalName(u) == AuthStore::CanonicalName(user_)) {
+            return DbStatus::Error(DbCode::kLastAdmin, "不能撤销自己的管理员权限: " + u);
+          }
+          st = auth.SetAdmin(u, false, note);
+        }
+      } else if (cmd.kind == Kind::kGrant) {
+        st = auth.GrantPrivilege(u, db, tbl, priv, false, note);
+      } else {
+        st = auth.RevokePrivilege(u, db, tbl, priv, note);
+      }
+      if (!st.ok()) {
+        return st;
+      }
+    }
+  }
+  return DbStatus::Ok();
+}
+
+DbStatus Session::CheckDatabaseAccess(const std::string& db) const {
+  if (!engine_->config().enable_auth || is_admin()) {
+    return DbStatus::Ok();
+  }
+  if (!engine_->auth().HasAnyPrivilegeOnDb(user_, db)) {
+    return DbStatus::Error(DbCode::kPermissionDenied,
+                           "权限不足：用户 \"" + user_ + "\" 不能访问数据库 " + db);
+  }
+  return DbStatus::Ok();
+}
+
+DbStatus Session::CheckDbPrivilege(cella::db::Priv need, const char* what) const {
+  if (!engine_->config().enable_auth || is_admin()) {
+    return DbStatus::Ok();
+  }
+  const std::string& db = engine_->current_db();
+  if (engine_->auth().HasPrivilege(user_, db, "*", need)) {
+    return DbStatus::Ok();
+  }
+  return DbStatus::Error(DbCode::kPermissionDenied,
+                         "权限不足：用户 \"" + user_ + "\" 在库 " + db + " 上没有 " +
+                             PrivName(need) + " 权限（" + what + "）");
+}
+
+void Session::FilterDatabasesByPrivilege(QueryResult* result) const {
+  if (result == nullptr || !engine_->config().enable_auth || is_admin()) {
+    return;
+  }
+  std::vector<std::vector<storage::Value>> kept;
+  for (const auto& row : result->rows) {
+    if (row.empty()) {
+      continue;
+    }
+    if (engine_->auth().HasAnyPrivilegeOnDb(user_, row[0].str_val)) {
+      kept.push_back(row);
+    }
+  }
+  result->rows = std::move(kept);
+  result->tag = "SHOW DATABASES " + std::to_string(result->rows.size());
+}
+
 DbStatus Session::ExecuteOne(const std::string& stmt_text, int line, int col, StatementOutcome* out) {
   if (out == nullptr) {
     return DbStatus::Error(DbCode::kInternal, "ExecuteOne: out 为空");
@@ -950,6 +1080,9 @@ DbStatus Session::ExecuteOne(const std::string& stmt_text, int line, int col, St
     if (db_kind != "SHOW DATABASES" && in_transaction()) {
       st = DbStatus::Error(DbCode::kDatabaseTxnActive,
                            db_kind + " 前须结束当前事务（COMMIT / ROLLBACK）");
+    } else if ((db_kind == "CREATE DATABASE" || db_kind == "DROP DATABASE") && !is_admin()) {
+      // 建库/删库是全局操作，只有管理员可以做
+      st = DbStatus::Error(DbCode::kPermissionDenied, db_kind + " 需要管理员权限");
     } else if (db_kind == "CREATE DATABASE") {
       st = engine_->CreateDatabase(db_arg, &note);
     } else if (db_kind == "DROP DATABASE") {
@@ -958,10 +1091,15 @@ DbStatus Session::ExecuteOne(const std::string& stmt_text, int line, int col, St
       if (db_arg.empty()) {
         st = DbStatus::Error(DbCode::kDatabaseError, "USE 缺少数据库名");
       } else {
-        st = engine_->UseDatabase(db_arg, &note);
+        // 访问控制：在该库上没有任何授权就不能切过去
+        st = CheckDatabaseAccess(db_arg);
+        if (st.ok()) {
+          st = engine_->UseDatabase(db_arg, &note);
+        }
       }
     } else {  // SHOW DATABASES
       st = engine_->ShowDatabases(&out->result);
+      FilterDatabasesByPrivilege(&out->result);  // 普通用户只看得到有权限的库
       note = out->result.tag;
     }
     out->executed = true;
@@ -1002,6 +1140,35 @@ DbStatus Session::ExecuteOne(const std::string& stmt_text, int line, int col, St
       return st;
     }
     // kNotAuth → 落到编译器（普通 SQL）
+  }
+
+  // ── ①d 授权语句（GRANT / REVOKE / SHOW GRANTS，同样是会话层拦截）──
+  {
+    GrantCommand cmd;
+    std::string perr;
+    const AuthParse pres = ParseGrantCommand(stmt_text, &cmd, &perr);
+    if (pres == AuthParse::kSyntaxError) {
+      out->kind = "GRANT";
+      out->status = DbStatus::Error(DbCode::kSqlError, "语法错误: " + perr);
+      out->elapsed_ms = MsSince(t0);
+      return out->status;
+    }
+    if (pres == AuthParse::kOk) {
+      std::string note;
+      const DbStatus st = ApplyGrantCommand(cmd, &note, &out->result);
+      out->kind = (cmd.kind == GrantCommand::Kind::kShowGrants)
+                      ? "SHOW GRANTS"
+                      : ((cmd.kind == GrantCommand::Kind::kGrant) ? "GRANT" : "REVOKE");
+      out->executed = true;
+      out->status = st;
+      if (st.ok() && out->result.tag.empty()) {
+        out->result.tag = note;
+      }
+      out->elapsed_ms = MsSince(t0);
+      DbLogInfo(logcat::kSession,
+                "[" + name_ + "] " + out->kind + " " + (st.ok() ? "OK: " + note : st.ToString()));
+      return st;
+    }
   }
 
   // ── ② 编译：词法 → 语法 → 语义 → 计划 ──
@@ -1047,6 +1214,26 @@ DbStatus Session::ExecuteOne(const std::string& stmt_text, int line, int col, St
   out->original_plan_text = PlanText(plans);
   out->compiled = true;
 
+  // ── 访问控制：DDL 的库级权限（建表 / 删表）──
+  // 表级 DML 由执行器在 LockTable 这一必经点判定；这里管需要「库级」权限的两条。
+  {
+    const cella::CELLA_Stmt::Kind sk = program->statements[0]->kind;
+    DbStatus ps;
+    if (sk == cella::CELLA_Stmt::Kind::CREATE_TABLE) {
+      ps = CheckDbPrivilege(Priv::kCreate, "CREATE TABLE");
+    } else if (sk == cella::CELLA_Stmt::Kind::DROP_TABLE) {
+      ps = CheckDbPrivilege(Priv::kDrop, "DROP TABLE");
+    }
+    if (!ps.ok()) {
+      // 语义阶段可能已把这张（不存在的）表登记进编译器目录副本 → 必须复位，
+      // 否则下一次同名建表会误报「表已存在」（本块是提前返回，不会走到后面的复位）。
+      EnsureCatalogInSync();
+      out->status = ps;
+      out->elapsed_ms = MsSince(t0);
+      return ps;
+    }
+  }
+
   // ── ③ 计划优化：常量折叠 / 布尔化简 / 恒真 Filter 消除 ──
   // 执行用的是优化后的计划 → 「编译器产出的可执行 IR 直接驱动存储访问」
   const auto opt = cella::cella_optimizePlans(plans);
@@ -1087,6 +1274,10 @@ DbStatus Session::ExecuteOne(const std::string& stmt_text, int line, int col, St
   ctx.txn_id = txn_;
   ctx.txn = txn_handle_.get();
   ctx.lock_scope = engine_->current_db();
+  // 访问控制：把身份带进执行上下文 —— 表级读写由 LockTable 判定
+  ctx.auth_enabled = engine_->config().enable_auth;
+  ctx.is_admin = is_admin();
+  ctx.user = user_;
   // rowid 伪列：只在该语句确实引用它时才让扫描在结果末尾附加（否则 `get *` 会多出一列）
   ctx.with_rowid =
       program->statements.empty() ? false : StmtRefersRowid(program->statements[0].get());

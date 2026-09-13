@@ -376,11 +376,24 @@ AuthParse ParseGrantCommand(const std::string& stmt_text, GrantCommand* out, std
   for (std::string& p : c.privs) {
     p = Upper(p);
   }
-  if (!ctx.cur.TakeKeyword("ON")) {
-    return ctx.Fail("期望关键字 ON");
-  }
-  if (!ParseScope(&ctx.cur, &c.scope_db, &c.scope_table)) {
-    return ctx.Fail("ON 之后期望作用域（*.* / 库名.* / 库名.表名 / 表名）");
+  if (ctx.cur.TakeKeyword("ON")) {
+    if (!ParseScope(&ctx.cur, &c.scope_db, &c.scope_table)) {
+      return ctx.Fail("ON 之后期望作用域（*.* / 库名.* / 库名.表名 / 表名）");
+    }
+  } else {
+    // 管理员不挂在某个作用域上：允许 `GRANT ADMIN TO u` / `REVOKE ADMIN FROM u`。
+    // 其它权限仍必须写 ON。
+    bool only_admin = !c.privs.empty();
+    for (const std::string& pr : c.privs) {
+      if (pr != "ADMIN") {
+        only_admin = false;
+      }
+    }
+    if (!only_admin) {
+      return ctx.Fail("期望关键字 ON");
+    }
+    c.scope_db = "*";
+    c.scope_table = "*";
   }
   const char* link = (c.kind == GrantCommand::Kind::kGrant) ? "TO" : "FROM";
   if (!ctx.cur.TakeKeyword(link)) {

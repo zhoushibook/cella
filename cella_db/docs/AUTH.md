@@ -54,8 +54,10 @@ SET PASSWORD FOR alice = 'newpwd';       -- 管理员代改他人
 | 权限 `priv` | `GET`（读；`SELECT` 是等价写法）/ `INSERT` / `UPDATE` / `DELETE` / `CREATE` / `DROP` / `ALL` / `ADMIN` |
 | 作用域 `scope` | `*.*` 全局 / `lib.*` 整库 / `lib.tbl` 单表 / `tbl` 当前库的单表 |
 
-判定规则：**取最具体的一条**（表级 > 库级 > 全局）；管理员（`ADMIN`）全放行；
-系统表 `cella_catalog` 读放行（写仍被 `DB-512` 拦）。
+判定规则：**任何一条覆盖该需求的授权即通过**（多来源授权取并集，与 MySQL 一致；没有「拒绝」概念，
+所以撤权要撤掉所有覆盖它的授权）。管理员（`ADMIN`）全放行；系统表 `cella_catalog` 读放行（写仍被 `DB-512` 拦）。
+
+库级需求（`CREATE TABLE` / `DROP TABLE`）只能用**库级或全局**授权满足 —— 单表授权不够。
 
 `GET` 对应读（`get` 语句，含 join 的每一张表）；`INSERT`/`UPDATE`/`DELETE` 分别对应三种写；
 `CREATE`/`DROP` 是**建表/删表**（库级）。
@@ -66,14 +68,15 @@ SET PASSWORD FOR alice = 'newpwd';       -- 管理员代改他人
 GRANT  get, insert ON main.student TO alice;      -- 单表读 + 写
 GRANT  all          ON main.*        TO alice, bob;
 GRANT  get          ON *.*           TO reporter; -- 全局只读
-GRANT  admin                         TO dba;      -- 提升为管理员
+GRANT  admin                        TO dba;      -- 提升为管理员（不需写 ON）
 REVOKE insert       ON main.student  FROM alice;
 SHOW GRANTS;                                      -- 自己的
 SHOW GRANTS FOR alice;
 ```
 
 * `GRANT ... ON 表名`（不带库）按**执行时的当前库**记名，便于脚本 `USE` 之后直接授权。
-* `GRANT ADMIN` 把用户提升为管理员；`REVOKE ADMIN` 降级，但不允许把管理员降为零个（`DB-804`）。
+* `GRANT ADMIN TO 用户` / `REVOKE ADMIN FROM 用户`（**不写 `ON`**）改的是管理员标志。
+  不允许把管理员降为零个，也不允许撤销自己的管理员（`DB-804`）。
 * 授权/撤销需要管理员（`DB-805`），且事务中不允许（`DB-513`）。
 
 ## 6. 存储

@@ -240,6 +240,14 @@ class Session {
   txn_id_t BeginInternal();
   // 执行一条用户管理语句（调用前已完成登录检查）；SHOW USERS 会把结果写进 result
   DbStatus ApplyUserCommand(const UserCommand& cmd, std::string* note, QueryResult* result);
+  // 执行一条授权语句（调用前已完成登录检查）；SHOW GRANTS 会把结果写进 result
+  DbStatus ApplyGrantCommand(const GrantCommand& cmd, std::string* note, QueryResult* result);
+  // 访问控制：能否访问某个库（管理员，或在该库上有任何授权）
+  DbStatus CheckDatabaseAccess(const std::string& db) const;
+  // 访问控制：库级权限（建表/删表）
+  DbStatus CheckDbPrivilege(cella::db::Priv need, const char* what) const;
+  // SHOW DATABASES 的可读性过滤（认证关闭或管理员时不过滤）
+  void FilterDatabasesByPrivilege(QueryResult* result) const;
 
   DbEngine* engine_;
   std::string name_;

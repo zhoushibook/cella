@@ -76,7 +76,7 @@ cella> \d
     ├── src/                    实现
     ├── sql/                    3 个可执行演示脚本
     ├── examples/               API 速览 + 并发现场演示
-    ├── tests/                  96 用例 / 848 断言
+    ├── tests/                  105 用例 / 970 断言
     └── docs/                   INTEGRATION.md / ARCHITECTURE.md / TEST_REPORT.md
 
 cella_client/                   【图形客户端】内嵌 HTTP 服务 + 浏览器 SPA
@@ -94,7 +94,7 @@ cella_client/                   【图形客户端】内嵌 HTTP 服务 + 浏览
 | 产物 | 说明 |
 | --- | --- |
 | `build/cella_db/cella_db.exe` | **完整系统 CLI**（交互 REPL / 脚本 / 元命令 / 表格化输出） |
-| `build/cella_db/cella_db_tests.exe` | 整合层测试（96 用例 / 848 断言） |
+| `build/cella_db/cella_db_tests.exe` | 整合层测试（105 用例 / 970 断言） |
 | `build/cella_db/api_quickstart.exe` | 30 秒 C++ API 速览 |
 | `build/cella_db/concurrency_demo.exe` | 并发锁 / 死锁检测现场演示 |
 | `build/cella_client/cella_web.exe` | **图形客户端服务**（浏览器打开 `http://127.0.0.1:8080`） |
@@ -110,7 +110,7 @@ cella_client/                   【图形客户端】内嵌 HTTP 服务 + 浏览
 | --- | --- | --- | --- |
 | 编译器回归 | 33 | 33 项 golden 比对 | 0 |
 | 存储层单元测试（原有） | 30 | 4620 | 0 |
-| 整合层测试（新增） | 96 | 848 | 0 |
+| 整合层测试（新增） | 105 | 970 | 0 |
 | 端到端 SQL 脚本 | 70 条语句 | — | 4（脚本刻意演示的错误路径） |
 
 构建零 error / 零 warning（MSVC `/W4 /WX`）。详见 [cella_db/docs/TEST_REPORT.md](cella_db/docs/TEST_REPORT.md)。
