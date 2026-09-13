@@ -370,10 +370,17 @@ DbStatus DbEngine::EnsureAuthOpen() {
   storage::StorageConfig sc = storage_config_;
   sc.db_file = config_.auth_file.empty() ? AuthStore::kFileName : config_.auth_file;
   auth_storage_ = storage::CreateStorage(sc);
+  const std::string auth_path = config_.data_dir + "/" + sc.db_file;
   const storage::Status os = auth_storage_->Open(sc);
   if (!os.ok()) {
     auth_storage_.reset();
-    return DbStatus::Error(DbCode::kStorageError, "身份库打开失败: " + os.ToString());
+    // 身份库是「用户 + 授权」的唯一副本。若它在建库过程中被打断（只写了元数据页、
+    // 表页没落盘），之后每次打开都会失败；这里把文件路径与恢复办法一并给出。
+    return DbStatus::Error(DbCode::kStorageError,
+                           "身份库打开失败: " + os.ToString() + "（文件: " + auth_path +
+                               "）。若该文件已损坏，可把它改名或删除后重新启动 —— "
+                               "会重建身份库并恢复默认管理员 root（口令为空），"
+                               "原有的用户与授权将丢失。");
   }
   auth_.AttachStorage(auth_storage_.get());
 
@@ -388,7 +395,7 @@ DbStatus DbEngine::EnsureAuthOpen() {
     return ls;
   }
   auth_opened_ = true;
-  DbLogInfo(logcat::kAuth, "身份库已打开: " + config_.data_dir + "/" + sc.db_file);
+  DbLogInfo(logcat::kAuth, "身份库已打开: " + auth_path);
 
   // 首次开启认证且库中没有任何用户 → 引导创建管理员 root（空口令），
   // 并留下醒目提示，由 CLI / 服务端打印（避免「装了认证却进不去」）。
@@ -401,6 +408,18 @@ DbStatus DbEngine::EnsureAuthOpen() {
     auth_bootstrap_note_ =
         "已创建默认管理员账号 root（口令为空）。请立即用 SET PASSWORD = '新口令'; 修改。";
     DbLogWarn(logcat::kAuth, "引导创建管理员 root（空口令）");
+  }
+
+  // 首次创建后**立即完整落盘**（放在 bootstrap 之后，让第一次刷出的状态就含 root）。
+  // 新建文件时元数据页先写盘、表页只随 Close 刷出；进程若在这中间被强杀，会留下
+  // 「只有元数据页」的半成品，之后永远打不开。一次 Close + Open 强制刷全（与存盘点同法），
+  // 把窗口压到接近零；此后文件始终至少是自洽的（最坏只丢最后一次改动）。
+  if (created) {
+    auth_storage_->Close();
+    const storage::Status rs = auth_storage_->Open(sc);
+    if (!rs.ok()) {
+      return DbStatus::Error(DbCode::kStorageError, "身份库首次落盘后重开失败: " + rs.ToString());
+    }
   }
   return DbStatus::Ok();
 }

@@ -3,6 +3,7 @@
 // 覆盖：口令哈希自检（含 SHA-256 已知向量）、管理员引导、登录 / 未登录拦截、
 //       用户管理（建 / 删 / 改口令）、非管理员受限、最后一个管理员、持久化、
 //       以及「开关关闭时行为与引入本特性前一致」。
+#include <filesystem>
 #include <string>
 
 #include "cella/db/auth/password.h"
@@ -384,4 +385,27 @@ MT_TEST(授权_持久化与系统表放行) {
   MT_CHECK(e.Run("REVOKE get ON main.t FROM jack;").all_ok());  // 撤销也持久化
   MT_CHECK(e.Login("jack", "p"));
   MT_CHECK(e.Run("get * in t;").statements[0].status.code() == DbCode::kPermissionDenied);
+}
+
+// ── 建库健壮性：首次创建就必须完整落盘（回归「半成品身份库」）──────
+MT_TEST(认证_首次创建即完整落盘) {
+  Engine e("auth_flush", 32, true);
+  const std::string path = e.cfg.data_dir + "/cella_auth.db";
+  MT_CHECK(std::filesystem::exists(path));
+  // 新建文件时元数据页先写盘、表页只随 Close 刷出 —— 若不在创建后立即刷全，
+  // 进程被打断就会留下「只有元数据页」的半成品（此后每次打开都报读页失败）。
+  // 因此这里断言：**引擎还开着**的时候，文件就已经是完整的多页状态。
+  const auto size = static_cast<long long>(std::filesystem::file_size(path));
+  MT_CHECK(size > 4096);  // 至少两页：元数据页 + 表页
+  // 且 flush 之后仍能正常工作（root 已随第一次落盘写入）
+  MT_CHECK(e.engine.auth().HasUser("root"));
+  MT_CHECK(e.Login("root", ""));
+  MT_CHECK(e.Run("CREATE USER alice IDENTIFIED BY 'p';").all_ok());
+
+  // 关掉重开：文件自洽，数据仍在
+  e.Close();
+  MT_CHECK(e.Reopen());
+  MT_CHECK(e.Login("alice", "p"));
+  MT_CHECK(e.Login("root", ""));
+  MT_CHECK(e.Run("SHOW USERS;").all_ok());
 }
