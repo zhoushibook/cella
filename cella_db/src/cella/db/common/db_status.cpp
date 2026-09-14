@@ -25,6 +25,7 @@ const char* ToString(DbCode c) {
     case DbCode::kIndexNotFound:       return "DB-518";
     case DbCode::kUniqueViolation:     return "DB-519";
     case DbCode::kStorageError:       return "DB-520";
+    case DbCode::kWalError:           return "DB-521";
     case DbCode::kNoActiveTxn:        return "DB-601";
     case DbCode::kTxnAlreadyActive:   return "DB-602";
     case DbCode::kTxnAborted:         return "DB-603";

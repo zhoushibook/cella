@@ -1037,8 +1037,11 @@ namespace cella::db
         u.kind = UndoRecord::Kind::kInsert;
         u.table = name;
         u.rid = rid;
+        u.after = rec; // P2：撤销这条插入时要写一条 kDelete，得知道被插入的内容
         ctx.txn->AddUndo(std::move(u));
       }
+      // ── P2.1：行变更入 WAL（前后像都在，重做/撤销都够用）──
+      AppendWalRow(ctx.txn_id, wal::RecordType::kInsert, name, rid, {}, rec.values());
       {
         const DbStatus is = IndexRowInsert(&indexes, *meta, rec.values(), rid);
         if (!is.ok())
@@ -2394,6 +2397,7 @@ namespace cella::db
         u.before = h.second; // 回滚时按内容重插
         ctx.txn->AddUndo(std::move(u));
       }
+      AppendWalRow(ctx.txn_id, wal::RecordType::kDelete, name, h.first, h.second.values(), {});
       ++removed;
     }
     out->affected = removed;
@@ -2585,6 +2589,7 @@ namespace cella::db
         u.table = name;
         u.rid = storage::Rid{}; // 新版本尚未插入，失败时只需重插旧内容
         u.before = h.second;
+        u.after = fresh;        // P2：撤销时要写一条反向 kUpdate
         update_undo = &ctx.txn->AddUndo(std::move(u));
       }
 
@@ -2600,6 +2605,8 @@ namespace cella::db
       {
         update_undo->rid = new_rid;
       }
+      AppendWalRow(ctx.txn_id, wal::RecordType::kUpdate, name, new_rid, h.second.values(),
+                   fresh.values());
       // ── P1.5：索引同步。行定位变了（删旧+插新），所以即便列值没变，
       //           叶子键也必须换成新 Rid；唯一性已在上面预检过。
       {
@@ -3756,6 +3763,284 @@ namespace cella::db
       out->rows.push_back(std::move(aligned));
     }
     return DbStatus::Ok();
+  }
+
+  // ═════════════════════════════════════════════════════════════
+  // WAL：行变更记录的写入（P2.1 / P2.2）
+  // ═════════════════════════════════════════════════════════════
+
+  void Executor::AppendWalRow(txn_id_t txn, wal::RecordType type, const std::string &table,
+                              const storage::Rid &rid,
+                              const std::vector<storage::Value> &before,
+                              const std::vector<storage::Value> &after)
+  {
+    if (wal_ == nullptr || txn == kInvalidTxnId)
+    {
+      return;
+    }
+    wal::WalRecord r;
+    r.type = type;
+    r.txn_id = txn;
+    r.table = table;
+    r.page_id = rid.page_id;
+    r.before = before;
+    r.after = after;
+    (void)wal_->Append(r);
+  }
+
+  // ── 恢复期索引处理：清空 / 重建（P2）────────────────────────
+
+  DbStatus Executor::ClearIndexes(const std::set<std::string> &tables)
+  {
+    StorageGuard guard(storage_mutex_);
+    for (const auto &t : tables)
+    {
+      const CatalogTable *meta = catalog_->FindTable(t);
+      if (meta == nullptr || CatalogManager::IsProtectedSystemTable(meta->name))
+      {
+        continue;
+      }
+      std::vector<IndexHandle> indexes;
+      const DbStatus os = OpenTableIndexes(*meta, &indexes);
+      if (!os.ok())
+      {
+        continue; // 索引打不开就算了，重建阶段会再试一次并真正报错
+      }
+      for (auto &ix : indexes)
+      {
+        if (ix.tree == nullptr)
+        {
+          continue;
+        }
+        std::vector<std::string> keys;
+        const storage::Status ss = ix.tree->ScanAll(&keys);
+        if (!ss.ok())
+        {
+          continue;
+        }
+        for (const auto &k : keys)
+        {
+          bool removed = false;
+          (void)ix.tree->Remove(k, &removed);
+        }
+      }
+    }
+    return DbStatus::Ok();
+  }
+
+  DbStatus Executor::RebuildIndexes(const std::set<std::string> &tables)
+  {
+    const DbStatus cs = ClearIndexes(tables); // 先清干净，再按表数据逐行重建
+    if (!cs.ok())
+    {
+      return cs;
+    }
+    StorageGuard guard(storage_mutex_);
+    for (const auto &t : tables)
+    {
+      const CatalogTable *meta = catalog_->FindTable(t);
+      if (meta == nullptr || CatalogManager::IsProtectedSystemTable(meta->name))
+      {
+        continue;
+      }
+      std::vector<IndexHandle> indexes;
+      const DbStatus os = OpenTableIndexes(*meta, &indexes);
+      if (!os.ok())
+      {
+        return os;
+      }
+      if (indexes.empty())
+      {
+        continue;
+      }
+      std::shared_ptr<storage::TableHeap> heap;
+      const storage::Status oh = storage_->open_table(meta->name, &heap);
+      if (!oh.ok())
+      {
+        return FromStorage(oh, "恢复后重建索引 " + meta->name);
+      }
+      for (auto it = heap->begin(); it != heap->end(); ++it)
+      {
+        const DbStatus is = IndexRowInsert(&indexes, *meta, it->values(), it.rid());
+        if (!is.ok())
+        {
+          return is;
+        }
+      }
+    }
+    return DbStatus::Ok();
+  }
+
+  // ═════════════════════════════════════════════════════════════
+  // 恢复期重放（P2.4 redo）
+  // ═════════════════════════════════════════════════════════════
+
+  bool Executor::LocateRowForRecovery(const CatalogTable &table,
+                                      const std::vector<storage::Value> &values,
+                                      storage::Rid *rid, storage::Record *row)
+  {
+    std::shared_ptr<storage::TableHeap> heap;
+    const storage::Status os = storage_->open_table(table.name, &heap);
+    if (!os.ok())
+    {
+      return false;
+    }
+    const int pk_idx = table.PrimaryKeyColumnIndex();
+    const bool by_pk = pk_idx >= 0 && static_cast<size_t>(pk_idx) < values.size();
+    for (auto it = heap->begin(); it != heap->end(); ++it)
+    {
+      const std::vector<storage::Value> &vals = it->values();
+      bool hit = false;
+      if (by_pk && static_cast<size_t>(pk_idx) < vals.size())
+      {
+        // 有主键：按主键定位 —— 主键在 UPDATE 前后通常不变，这是唯一可靠的逻辑身份
+        hit = wal::ValueEqual(vals[static_cast<size_t>(pk_idx)],
+                              values[static_cast<size_t>(pk_idx)]);
+      }
+      else
+      {
+        hit = wal::ValuesEqual(vals, values);
+      }
+      if (hit)
+      {
+        if (rid != nullptr)
+        {
+          *rid = it.rid();
+        }
+        if (row != nullptr)
+        {
+          *row = *it;
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  DbStatus Executor::RecoveryInsertRow(const std::string &table,
+                                       const std::vector<storage::Value> &values)
+  {
+    StorageGuard guard(storage_mutex_);
+    const CatalogTable *meta = catalog_->FindTable(table);
+    if (meta == nullptr)
+    {
+      return DbStatus::Error(DbCode::kTableNotFound, "恢复重做：表不存在 " + table);
+    }
+    if (CatalogManager::IsProtectedSystemTable(meta->name))
+    {
+      // 系统表（目录/索引元数据）不进 WAL —— DDL 后必定紧跟一次存盘点，它已经落盘了
+      return DbStatus::Ok();
+    }
+    storage::Rid dummy;
+    if (LocateRowForRecovery(*meta, values, &dummy, nullptr))
+    {
+      return DbStatus::Ok(); // 已经生效过，重放什么也不做
+    }
+    std::vector<IndexHandle> indexes;
+    const DbStatus os = OpenTableIndexes(*meta, &indexes);
+    if (!os.ok())
+    {
+      return os;
+    }
+    storage::Record rec;
+    for (const auto &v : values)
+    {
+      rec.AddValue(v);
+    }
+    storage::Rid new_rid;
+    const storage::Status s = storage_->insert_record(meta->name, rec, &new_rid);
+    if (!s.ok())
+    {
+      return FromStorage(s, "恢复重做插入 " + meta->name);
+    }
+    return IndexRowInsert(&indexes, *meta, rec.values(), new_rid);
+  }
+
+  DbStatus Executor::RecoveryDeleteRow(const std::string &table,
+                                       const std::vector<storage::Value> &before)
+  {
+    StorageGuard guard(storage_mutex_);
+    const CatalogTable *meta = catalog_->FindTable(table);
+    if (meta == nullptr)
+    {
+      return DbStatus::Error(DbCode::kTableNotFound, "恢复重做：表不存在 " + table);
+    }
+    if (CatalogManager::IsProtectedSystemTable(meta->name))
+    {
+      return DbStatus::Ok();
+    }
+    storage::Rid rid;
+    storage::Record row;
+    if (!LocateRowForRecovery(*meta, before, &rid, &row))
+    {
+      return DbStatus::Ok(); // 已经被删掉了（或后续还有记录会删它）→ 无需动作
+    }
+    std::vector<IndexHandle> indexes;
+    const DbStatus os = OpenTableIndexes(*meta, &indexes);
+    if (!os.ok())
+    {
+      return os;
+    }
+    const storage::Status s = storage_->delete_record(meta->name, rid);
+    if (!s.ok())
+    {
+      return FromStorage(s, "恢复重做删除 " + meta->name);
+    }
+    return IndexRowDelete(&indexes, *meta, row.values(), rid);
+  }
+
+  DbStatus Executor::RecoveryReplaceRow(const std::string &table,
+                                        const std::vector<storage::Value> &before,
+                                        const std::vector<storage::Value> &after)
+  {
+    StorageGuard guard(storage_mutex_);
+    const CatalogTable *meta = catalog_->FindTable(table);
+    if (meta == nullptr)
+    {
+      return DbStatus::Error(DbCode::kTableNotFound, "恢复重做：表不存在 " + table);
+    }
+    if (CatalogManager::IsProtectedSystemTable(meta->name))
+    {
+      return DbStatus::Ok();
+    }
+    // ① 已经是新版本 → 本次更新早就生效了
+    storage::Rid after_rid;
+    storage::Record after_row;
+    if (LocateRowForRecovery(*meta, after, &after_rid, &after_row) &&
+        wal::ValuesEqual(after_row.values(), after))
+    {
+      return DbStatus::Ok();
+    }
+    // ② 还是旧版本 → 删旧插新（与运行时 UPDATE 同一套动作 + 同一套索引维护）
+    storage::Rid old_rid;
+    if (!LocateRowForRecovery(*meta, before, &old_rid, nullptr))
+    {
+      // 两个版本都不在：这行后来被别的记录删掉了，跳过即可
+      return DbStatus::Ok();
+    }
+    std::vector<IndexHandle> indexes;
+    const DbStatus os = OpenTableIndexes(*meta, &indexes);
+    if (!os.ok())
+    {
+      return os;
+    }
+    const storage::Status ds = storage_->delete_record(meta->name, old_rid);
+    if (!ds.ok())
+    {
+      return FromStorage(ds, "恢复重做更新(删旧) " + meta->name);
+    }
+    storage::Record rec;
+    for (const auto &v : after)
+    {
+      rec.AddValue(v);
+    }
+    storage::Rid new_rid;
+    const storage::Status is = storage_->insert_record(meta->name, rec, &new_rid);
+    if (!is.ok())
+    {
+      return FromStorage(is, "恢复重做更新(插新) " + meta->name);
+    }
+    return IndexRowUpdate(&indexes, *meta, before, rec.values(), old_rid, new_rid);
   }
 
 } // namespace cella::db

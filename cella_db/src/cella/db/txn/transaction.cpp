@@ -50,51 +50,61 @@ namespace cella::db
                          std::recursive_mutex *storage_mutex)
       : storage_(storage), locks_(locks), storage_mutex_(storage_mutex) {}
 
-  TxnManager::~TxnManager()
-  {
-    if (journal_.is_open())
-    {
-      journal_.flush();
-      journal_.close();
-    }
-  }
+  TxnManager::~TxnManager() = default;
 
-  void TxnManager::SetJournalPath(const std::string &path)
+  // 把一次「逻辑补偿」写进 WAL。
+  //
+  // 为什么必须写：语句级回滚之后事务还会继续跑、最后可能提交。若补偿不入日志，
+  // 崩溃重放时会先把那次 INSERT 重做出来，却不知道它后来被撤掉了 —— 凭空多一行。
+  // 补偿记录就是教科书里 CLR 的等价物，只是它以普通数据记录的形态入日志
+  // （撤销一次插入 = 一条 kDelete，其 before 是被撤销行的 after）。
+  void TxnManager::LogCompensationLocked(txn_id_t id, const UndoRecord &u)
   {
-    std::unique_lock<std::mutex> lk(mutex_);
-    journal_path_ = path;
-    if (journal_.is_open())
-    {
-      journal_.close();
-    }
-    if (!path.empty())
-    {
-      journal_.open(path, std::ios::binary | std::ios::app);
-      if (!journal_)
-      {
-        DbLogWarn(logcat::kTxn, "无法打开审计日志: " + path);
-      }
-    }
-  }
-
-  void TxnManager::WriteJournal(const std::string &line)
-  {
-    if (!journal_.is_open())
+    if (wal_ == nullptr)
     {
       return;
     }
-    journal_ << NowIso() << " " << line << "\n";
-    journal_.flush();
+    wal::WalRecord r;
+    r.txn_id = id;
+    r.table = u.table;
+    r.page_id = u.rid.page_id;
+    switch (u.kind)
+    {
+    case UndoRecord::Kind::kInsert:
+      r.type = wal::RecordType::kDelete;
+      r.before = u.after.values();
+      break;
+    case UndoRecord::Kind::kDelete:
+      r.type = wal::RecordType::kInsert;
+      r.after = u.before.values();
+      break;
+    case UndoRecord::Kind::kUpdate:
+      r.type = wal::RecordType::kUpdate;
+      r.before = u.after.values();
+      r.after = u.before.values();
+      break;
+    }
+    (void)wal_->Append(r);
   }
 
   txn_id_t TxnManager::Begin()
   {
-    std::unique_lock<std::mutex> lk(mutex_);
-    const txn_id_t id = ++next_id_;
-    auto txn = std::make_shared<Transaction>(id);
-    txns_[id] = txn;
-    DbLogInfo(logcat::kTxn, "BEGIN txn=" + std::to_string(id));
-    return id;
+    std::shared_ptr<Transaction> txn;
+    {
+      std::unique_lock<std::mutex> lk(mutex_);
+      const txn_id_t id = ++next_id_;
+      txn = std::make_shared<Transaction>(id);
+      txns_[id] = txn;
+    }
+    if (wal_ != nullptr)
+    {
+      wal::WalRecord r;
+      r.type = wal::RecordType::kBegin;
+      r.txn_id = txn->id();
+      txn->SetFirstLsn(wal_->Append(r));
+    }
+    DbLogInfo(logcat::kTxn, "BEGIN txn=" + std::to_string(txn->id()));
+    return txn->id();
   }
 
   std::shared_ptr<Transaction> TxnManager::Find(txn_id_t id) const
@@ -201,6 +211,17 @@ namespace cella::db
     txn->SetEndTime(NowEpochSeconds());
     locks_->ReleaseAll(id);
 
+    // ── WAL 规则：提交记录必须先落盘，才能向调用方报告成功 ──
+    // 否则「COMMIT 返回 OK 后进程被杀」会丢掉这个事务 —— 那 WAL 就白写了。
+    if (wal_ != nullptr)
+    {
+      wal::WalRecord r;
+      r.type = wal::RecordType::kCommit;
+      r.txn_id = id;
+      (void)wal_->Append(r);
+      wal_->Flush();
+    }
+
     std::ostringstream os;
     os << "COMMIT txn=" << id << " 语句=" << txn->statement_count()
        << " undo=" << txn->undo_count() << " 表=[";
@@ -214,7 +235,6 @@ namespace cella::db
     {
       std::unique_lock<std::mutex> lk(mutex_);
       ++committed_total_;
-      WriteJournal(os.str());
     }
     DbLogInfo(logcat::kTxn, os.str());
     return DbStatus::Ok();
@@ -236,10 +256,14 @@ namespace cella::db
       {
       case UndoRecord::Kind::kInsert:
         st = storage_->delete_record(u.table, u.rid);
-        if (st.ok() && undo_hooks_ != nullptr)
+        if (st.ok())
         {
-          // 新插入的行被撤销 → 它的索引项也必须撤掉，否则索引里留下指向空洞的键
-          undo_hooks_->OnUndoInsertDeleted(u.table, u.rid);
+          if (undo_hooks_ != nullptr)
+          {
+            // 新插入的行被撤销 → 它的索引项也必须撤掉，否则索引里留下指向空洞的键
+            undo_hooks_->OnUndoInsertDeleted(u.table, u.rid);
+          }
+          LogCompensationLocked(t->id(), u);
         }
         break;
       case UndoRecord::Kind::kDelete:
@@ -255,10 +279,14 @@ namespace cella::db
         }
         storage::Rid ignored;
         st = storage_->insert_record(u.table, u.before, &ignored);
-        if (st.ok() && undo_hooks_ != nullptr)
+        if (st.ok())
         {
-          // 旧内容按**新**物理位置复插：索引项必须按新 Rid 重建（旧键已随新版本删除）
-          undo_hooks_->OnUndoRowRestored(u.table, ignored, u.before);
+          if (undo_hooks_ != nullptr)
+          {
+            // 旧内容按**新**物理位置复插：索引项必须按新 Rid 重建（旧键已随新版本删除）
+            undo_hooks_->OnUndoRowRestored(u.table, ignored, u.before);
+          }
+          LogCompensationLocked(t->id(), u);
         }
         break;
       }
@@ -316,10 +344,105 @@ namespace cella::db
       {
         ++aborted_total_;
       }
-      WriteJournal(os.str());
+    }
+    // 回滚成功也要记 ABORT：恢复时据此知道「这个事务已经了结」，不必再撤销一次。
+    if (wal_ != nullptr)
+    {
+      wal::WalRecord r;
+      r.type = wal::RecordType::kAbort;
+      r.txn_id = id;
+      (void)wal_->Append(r);
+      wal_->Flush();
     }
     DbLogWarn(logcat::kTxn, os.str());
     return rb;
+  }
+
+  std::vector<std::pair<txn_id_t, wal::lsn_t>> TxnManager::ActiveTxnsWithFirstLsn() const
+  {
+    std::unique_lock<std::mutex> lk(mutex_);
+    std::vector<std::pair<txn_id_t, wal::lsn_t>> out;
+    for (const auto &kv : txns_)
+    {
+      if (kv.second->active())
+      {
+        out.emplace_back(kv.first, kv.second->first_lsn());
+      }
+    }
+    return out;
+  }
+
+  void TxnManager::ObserveTxnId(txn_id_t id)
+  {
+    std::unique_lock<std::mutex> lk(mutex_);
+    if (id > next_id_)
+    {
+      next_id_ = id;
+    }
+  }
+
+  // 恢复期回滚（P2.5）。
+  //
+  // 为什么不用运行时的 ApplyUndoLocked：那条路径靠 UndoRecord 里的 **Rid** 定位行，
+  // 而 WAL 记录里只有页号（槽号在崩溃重启后既不稳定也可能已被复用）。
+  // 因此这里改为「反向重放」：撤销一条 kInsert 就是按内容删掉那一行，
+  // 撤销一条 kDelete 就是按内容插回去 —— 与运行时补偿是同一套语义，只是定位方式
+  // 换成主键/整行内容。applier（执行器）顺带把索引也维护了。
+  DbStatus TxnManager::UndoWalRecords(txn_id_t id, const std::vector<wal::WalRecord> &records,
+                                      wal::IUndoApplier *applier, const std::string &reason)
+  {
+    ObserveTxnId(id);
+    size_t failures = 0;
+    for (size_t i = records.size(); i-- > 0;)
+    {
+      const wal::WalRecord &r = records[i];
+      DbStatus s;
+      switch (r.type)
+      {
+      case wal::RecordType::kInsert:
+        s = applier->UndoInsert(r.table, r.after);
+        break;
+      case wal::RecordType::kDelete:
+        s = applier->UndoDelete(r.table, r.before);
+        break;
+      case wal::RecordType::kUpdate:
+        s = applier->UndoUpdate(r.table, r.after, r.before);
+        break;
+      default:
+        continue;
+      }
+      if (!s.ok())
+      {
+        ++failures;
+        DbLogWarn(logcat::kTxn, "恢复期撤销失败 txn=" + std::to_string(id) + " " + s.ToString());
+      }
+    }
+    locks_->ReleaseAll(id); // 恢复期锁表是空的，调用只为保持状态自洽
+    {
+      std::unique_lock<std::mutex> lk(mutex_);
+      if (failures == 0)
+      {
+        ++aborted_total_;
+      }
+    }
+    if (wal_ != nullptr)
+    {
+      wal::WalRecord end;
+      end.type = wal::RecordType::kAbort;
+      end.txn_id = id;
+      (void)wal_->Append(end);
+      wal_->Flush();
+    }
+    DbLogWarn(logcat::kTxn, "恢复期回滚 txn=" + std::to_string(id) + " 撤销=" +
+                                std::to_string(records.size()) + " 失败=" +
+                                std::to_string(failures) + " 原因=" + reason);
+    if (failures != 0)
+    {
+      return DbStatus::Error(DbCode::kWalError,
+                             "恢复期回滚 txn=" + std::to_string(id) + " 有 " +
+                                 std::to_string(failures) + " 条撤销失败");
+    }
+    return DbStatus::Ok();
   }
 
   std::string TxnManager::Dump() const
