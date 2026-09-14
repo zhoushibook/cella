@@ -5,7 +5,8 @@
 // 这样 cella_db 一行不用改（客户端模块的零改动约定，PLAN §9）。
 
 import { Api } from './api.js';
-import { state$, tableByName, pkOf } from './store.js';
+import { state$, subscribe, tableByName, pkOf } from './store.js';
+import { renderTiming, fmtMs } from './timing.js';
 
 const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
@@ -227,13 +228,17 @@ export function initBottomPanel() {
   const title = document.getElementById('bpTitle');
   const body = document.getElementById('bpBody');
   let lastPlan = null;   // 最近一次计划：点状态栏「计划」时不必重跑查询
+  let timingUnsub = null;   // 耗时面板开着时的订阅（切到别的面板要退订）
   document.getElementById('bpClose').addEventListener('click', () => panel.classList.add('hidden'));
   const wire = (id, name) => {
-    document.getElementById(id).addEventListener('click', () => showPanel(name));
+    const el = document.getElementById(id);
+    // 容错：自测页只造了它需要的那几个入口，缺一个不该让整块面板初始化失败
+    if (el) el.addEventListener('click', () => showPanel(name));
   };
   wire('stMsgs', 'messages');
   wire('stPlan', 'plan');
   wire('stDiag', 'diag');
+  wire('stTiming', 'timing');
   return {
     show: showPanel,
     isOpen: () => !panel.classList.contains('hidden'),
@@ -262,6 +267,7 @@ export function initBottomPanel() {
   }
 
   function showPanel(name, arg) {
+    if (timingUnsub) { timingUnsub(); timingUnsub = null; }
     panel.classList.remove('hidden');
     body.innerHTML = '';
     if (name === 'messages') {
@@ -277,10 +283,25 @@ export function initBottomPanel() {
         d.innerHTML = `<span class="code">${m.ok ? '✓' : '✗'} ${esc(m.code || '')}</span>` +
           `<span>${esc(m.message)}</span>` +
           (m.loc ? `<span class="loc">${esc(m.loc)}</span>` : '') +
+          // 逐条语句耗时：多语句脚本一次执行完，哪条慢只有分开看才知道
+          (m.ms != null ? `<span class="ms">${fmtMs(m.ms)}</span>` : '') +
           (m.detail ? `<div class="detail">${esc(m.detail)}</div>` : '');
         if (m.onJump) d.addEventListener('click', m.onJump);
         body.appendChild(d);
       }
+    } else if (name === 'timing') {
+      title.textContent = '耗时';
+      const host = document.createElement('div');
+      body.appendChild(host);
+      let lastList = state$().timings;
+      renderTiming(host);
+      // 面板开着时每次执行完自动刷新；只在记录真的换了才重画，
+      // 否则 busy 的一来一回也会重绘、把用户滚到一半的位置顶回去。
+      timingUnsub = subscribe((s) => {
+        if (s.timings === lastList) return;
+        lastList = s.timings;
+        renderTiming(host);
+      });
     } else if (name === 'plan') {
       title.textContent = '执行计划';
       if (arg) lastPlan = arg;
@@ -300,7 +321,12 @@ export function initBottomPanel() {
       const head = document.createElement('div');
       head.className = 'planhead';
       head.innerHTML = '<span>计划文本已按缩进解析成算子树</span>' +
-        (p.elapsedMs != null ? `<span class="chip">编译耗时 ${Number(p.elapsedMs).toFixed(2)} ms</span>` : '');
+        // 这个数来自语句级 elapsedMs（编译 + 执行）；点状态栏「计划」时是 /api/plan 的
+        // 纯编译耗时 —— 两种来源都叫「编译耗时」会误导，统一按「该语句耗时」讲。
+        (p.elapsedMs != null
+          ? `<span class="chip" title="该语句的引擎耗时（编译 + 执行；经 /api/plan 查看时为纯编译耗时）">` +
+            `该语句耗时 ${fmtMs(p.elapsedMs)}</span>`
+          : '');
       body.append(head, wrap);
     } else if (name === 'diag') {
       title.textContent = '诊断';

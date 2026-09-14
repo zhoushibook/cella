@@ -7,6 +7,8 @@
 <pre id="out">RUNNING</pre>
 <script type="module">
 import { parseStats, parseLocks, parseWaitFor, parseTxns, parsePlanTree, initBottomPanel } from '/assets/js/panels.js';
+import { recordRun, renderTiming, fmtMs, chipHtml, normalizeSql, clearRuns, speedClass } from '/assets/js/timing.js';
+import { state$ } from '/assets/js/store.js';
 const L = [];
 const ok = (n, c) => L.push((c ? 'PASS ' : 'FAIL ') + n);
 
@@ -61,15 +63,40 @@ ok('plan 空文本', parsePlanTree('').length === 0);
 
 // ⑥ 渲染层：诊断面板能真的画出来（DOM 断言）
 document.body.insertAdjacentHTML('beforeend',
-  '<footer id="statusbar"><span id="stMsgs"></span><span id="stPlan"></span><span id="stDiag"></span></footer>' +
+  '<footer id="statusbar"><span id="stMsgs"></span><span id="stPlan"></span><span id="stDiag"></span>' +
+  '<span id="stTiming"></span></footer>' +
   '<div id="bottomPanel" class="bottompanel hidden"><div class="bottomhead"><span id="bpTitle"></span>' +
   '<button id="bpClose"></button></div><div id="bpBody"></div></div>');
 const panel = initBottomPanel();
 panel.show('plan', { before: 'Sort (a ASC)\n  SeqScan [t]\n', after: 'Sort (a ASC)\n  SeqScan [t]\n', elapsedMs: 1.5 });
 const host = document.getElementById('bpBody');
-ok('计划视图渲染算子树 + 耗时', host.querySelectorAll('.planrow').length === 4 && host.textContent.includes('编译耗时'));
+ok('计划视图渲染算子树 + 耗时', host.querySelectorAll('.planrow').length === 4 && host.textContent.includes('该语句耗时'));
 panel.show('messages', [{ ok: false, code: 'SEM-201', message: '表不存在', loc: '行 2:8' }]);
 ok('消息区渲染', host.querySelectorAll('.msgitem').length === 1);
+panel.show('messages', [{ ok: true, code: 'SELECT', message: 'OK', ms: 3.5 }]);
+ok('消息条目显示语句耗时', host.querySelector('.msgitem .ms').textContent === '3.50 ms');
+
+// ⑦ 耗时：格式化 / 记录 / 面板渲染
+ok('fmtMs 毫秒口径 ' + [fmtMs(0.4), fmtMs(12.345), fmtMs(1234.5)].join(' | '),
+  fmtMs(0.4) === '0.40 ms' && fmtMs(12.345) === '12.35 ms' && fmtMs(1234.5) === '1235 ms');
+ok('fmtMs 非法输入给占位符', fmtMs(NaN) === '—' && fmtMs(-1) === '—');
+ok('normalizeSql 折叠空白（同语句要能对上历史）',
+  normalizeSql('get id,\n   name\n  in t;') === 'get id, name in t;');
+ok('速度分档 ' + [speedClass(1), speedClass(50), speedClass(500)].join('/'),
+  speedClass(1) === 'fast' && speedClass(50) === 'mid' && speedClass(500) === 'slow');
+
+clearRuns();
+const r1 = recordRun({ sql: 'get a in t;', kind: 'SELECT', rows: 3, engineMs: 1.0, serverMs: 2.0, wallMs: 5.0 });
+const r2 = recordRun({ sql: 'get a in t;', kind: 'SELECT', rows: 3, engineMs: 3.0, serverMs: 4.0, wallMs: 7.0 });
+ok('记录按时间倒序且带序号', r1.seq === 1 && r2.seq === 2 && state$().timings[0].seq === 2);
+ok('耗时徽标含毫秒与三口径说明',
+  /⏱ 3\.00 ms/.test(chipHtml(r2)) && /引擎/.test(chipHtml(r2)) && /端到端/.test(chipHtml(r2)));
+panel.show('timing');
+ok('耗时面板渲染历史对比表（2 行 + 条形 + 变化率）',
+  host.querySelectorAll('.timing tbody tr').length === 2 && !!host.querySelector('.timing .msbar i') &&
+  host.textContent.includes('最近') && host.textContent.includes('+200%'));
+ok('耗时面板的「首次」与「变化率」分列',
+  host.querySelector('.delta.first').textContent === '首次' && host.querySelector('.delta.up').textContent === '+200%');
 
 document.getElementById('out').textContent = L.join('\n');
 </script>

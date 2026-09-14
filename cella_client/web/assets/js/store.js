@@ -17,6 +17,7 @@ const state = {
   busy: false,
   statusText: '',
   lastResult: null,    // 最近一次查询（导出用）
+  timings: [],         // 最近若干次执行的耗时记录（见 timing.js），最新的在数组头部
 };
 
 const subs = new Set();

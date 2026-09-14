@@ -173,6 +173,36 @@ MT_TEST(API_建表插入查询闭环)
   MT_EQ(st.Find("columns")->items()[3].Find("type")->AsString(), std::string("DOUBLE"));
 }
 
+MT_TEST(API_耗时与行数字段)
+{
+  Fixture f("api_timing");
+  (void)f.Run("CREATE TABLE t(id INT PRIMARY KEY, v VARCHAR(8));"
+              "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c');");
+
+  const auto q = f.Run("get id, v in t ordered id asc;");
+  const auto &st = q.Find("statements")->items()[0];
+  // rowCount 是引擎真正产出的行数（与 rows 是否被 maxRows 截断无关）
+  MT_EQ(static_cast<int>(st.Find("rowCount")->AsInt()), 3);
+  MT_CHECK(st.Find("elapsedMs")->IsNumber());
+  MT_CHECK(st.Find("elapsedMs")->AsDouble() >= 0.0);
+  // 服务端总耗时（含排队）也必须给出，前端据此区分「查询慢」与「排队/传输慢」
+  MT_CHECK(q.Find("serverMs")->IsNumber());
+  MT_CHECK(q.Find("serverMs")->AsDouble() >= 0.0);
+
+  // 截断时：rows 只剩 1 行，rowCount 仍报 3 —— 否则耗时对比会把行数算少
+  const auto tr = Fixture::Data(f.service.Handle(Fixture::Make(
+      "POST", "/api/query", R"({"sql":"get id in t ordered id asc;","maxRows":1})")));
+  const auto &st2 = tr.Find("statements")->items()[0];
+  MT_EQ(static_cast<int>(st2.Find("rows")->size()), 1);
+  MT_EQ(static_cast<int>(st2.Find("rowCount")->AsInt()), 3);
+
+  // 数据浏览端点同样报耗时（分页慢通常就是排序列没索引）
+  const auto rv = Fixture::Data(
+      f.service.Handle(Fixture::Make("GET", "/api/tables/t/rows?page=1&pageSize=2")));
+  MT_CHECK(rv.Find("elapsedMs")->IsNumber());
+  MT_CHECK(rv.Find("elapsedMs")->AsDouble() >= 0.0);
+}
+
 MT_TEST(API_目录带主键数组)
 {
   Fixture f("api_catalog");

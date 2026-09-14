@@ -7,6 +7,7 @@ import { createEditor, formatSql } from './editor.js';
 import { createGrid } from './grid.js';
 import { createTree } from './tree.js';
 import { initBottomPanel, renderStruct } from './panels.js';
+import { recordRun, chipHtml, liveChipHtml, fmtMs, speedClass } from './timing.js';
 import { loadNum, saveNum, makeSplitter, setVar } from './ui.js';
 
 const $ = (id) => document.getElementById(id);
@@ -227,15 +228,46 @@ function mountQueryTab(pane, tab) {
   const grid = createGrid(gridwrap);   // 查询结果在本地排序（引擎顺序为基准，点列头三态切换）
   tab.ui = { editor, grid, bar };
 
-  bar.innerHTML = '<span>Ctrl+Enter 执行（选中片段只跑选区）· 点列头排序 · 点单元格拖选区 · Ctrl+C 复制</span>';
+  // 结果栏：左侧文案可省略号收尾，右侧固定放耗时徽标（flex:none + spacer），
+  // 所以文案长短不会挤压或顶动徽标，耗时显示不影响原有布局。
+  bar.innerHTML = '<span class="rbleft">Ctrl+Enter 执行（选中片段只跑选区）· ' +
+    '点列头排序 · 点单元格拖选区 · Ctrl+C 复制</span>' +
+    '<span class="spacer"></span><span class="rbtime"></span>';
+}
+
+// 结果栏左右两段（左：结果摘要；右：耗时徽标）
+function rbLeft(tab) { return tab.ui.bar.querySelector('.rbleft'); }
+function rbTime(tab) { return tab.ui.bar.querySelector('.rbtime'); }
+
+// 把耗时徽标画进结果栏；点徽标打开「耗时」面板看历史对比
+function setTimeChip(tab, rec) {
+  const host = rbTime(tab);
+  if (!host) return;
+  host.innerHTML = chipHtml(rec);
+  const chip = host.querySelector('.mschip');
+  if (chip) chip.addEventListener('click', () => showPanel('timing'));
+}
+
+// 执行期间的实时计时：长查询也能看到已经跑了多久（结束后由最终耗时徽标覆盖）
+function startLiveTimer(tab) {
+  const host = rbTime(tab);
+  if (!host) return { stop() {} };
+  const t0 = performance.now();
+  const tick = () => { host.innerHTML = liveChipHtml(performance.now() - t0); };
+  tick();
+  const id = setInterval(tick, 100);
+  return { stop() { clearInterval(id); } };
 }
 
 async function runSql(tab, sql) {
   if (!sql || !sql.trim()) return;
   pushHistory(sql);
   set({ busy: true });
+  const t0 = performance.now();          // 端到端：浏览器发请求 → 收到响应
+  const live = startLiveTimer(tab);
   try {
     const d = await Api.query(sql);
+    const wallMs = performance.now() - t0;
     set({ inTxn: d.session.inTxn, txnId: d.session.txnId });
     refreshTxnButtons();
 
@@ -245,12 +277,13 @@ async function runSql(tab, sql) {
       const err = st.error;
       if (st.ok) {
         msgs.push({ ok: true, code: st.kind, message: st.tag || 'OK',
-          loc: st.notice ? st.notice : '' });
+          loc: st.notice ? st.notice : '', ms: st.elapsedMs });
       } else {
         msgs.push({
           ok: false, code: (err && err.code) || 'ERR', message: (err && err.message) || '失败',
           loc: err && err.absLine ? `行 ${err.absLine}:${err.col || 1}` : '',
           detail: (err && err.detail) || '',
+          ms: st.elapsedMs,
           onJump: err && err.absLine ? () => tab.ui && tab.ui.editor.gotoLine(err.absLine, err.col || 1) : null,
         });
       }
@@ -260,29 +293,41 @@ async function runSql(tab, sql) {
       }
     }
 
+    // 耗时记录：引擎耗时按语句累加（多语句脚本给的是合计），行数用未截断的 rowCount
+    const engineMs = d.statements.reduce((a, b) => a + (b.elapsedMs || 0), 0);
+    const rec = recordRun({
+      sql,
+      kind: (shown && shown.kind) || (d.statements[0] && d.statements[0].kind) || '',
+      ok: !d.statements.some((x) => !x.ok),
+      rows: shown && shown.rowCount != null ? shown.rowCount : null,
+      engineMs,
+      serverMs: d.serverMs,
+      wallMs,
+    });
+
     if (shown) {
       tab.ui.grid.setData(shown.columns, shown.rows);
       const rowCount = shown.rows.length;
-      const ms = d.statements.reduce((a, b) => a + (b.elapsedMs || 0), 0);
       set({ lastResult: { columns: shown.columns, rows: shown.rows },
-        statusText: `${rowCount} 行 · ${ms.toFixed(2)} ms` });
-      bar2(tab).innerHTML = `<span>结果</span><span>·</span><span>${rowCount} 行` +
-        (shown.truncated ? '（已截断）' : '') + `</span><span>·</span><span>${ms.toFixed(2)} ms</span>`;
+        statusText: `${rowCount} 行 · ${fmtMs(engineMs)}` });
+      rbLeft(tab).innerHTML = `<span>结果</span><span>·</span><span>${rowCount} 行` +
+        (shown.truncated ? '（已截断）' : '') + '</span>';
     } else {
       tab.ui.grid.clear();
       const okCount = d.statements.filter((x) => x.ok).length;
-      set({ lastResult: null, statusText: `${okCount}/${d.statements.length} 条成功` });
-      bar2(tab).innerHTML = `<span>${d.statements.length} 条语句，${okCount} 条成功</span>`;
+      set({ lastResult: null, statusText: `${okCount}/${d.statements.length} 条成功 · ${fmtMs(engineMs)}` });
+      rbLeft(tab).innerHTML = `<span>${d.statements.length} 条语句，${okCount} 条成功</span>`;
     }
+    setTimeChip(tab, rec);
     showPanel('messages', msgs);
     refreshCatalog(); // 建表/删表/插删改都可能影响树
   } catch (e) {
     toast(e.message, 'err', e.detail);
   } finally {
+    live.stop();
     set({ busy: false });
   }
 }
-function bar2(tab) { return tab.ui.bar; }
 
 // ── 结构标签 ────────────────────────────────────────────────
 function mountStructTab(pane, tab) {
@@ -329,7 +374,8 @@ function mountDataTab(pane, tab) {
         <option value="1000">1000</option>
       </select>
       <span data-act="total">共 … 行</span>
-    </span>`;
+    </span>
+    <span class="mschip plain" data-act="ms"></span>`;
   bar.querySelector('[data-act="reload"]').addEventListener('click', () => loadRows(tab));
 
   editbar.innerHTML = `
@@ -737,6 +783,7 @@ async function goPage(tab, p) {
 
 async function loadRows(tab) {
   set({ busy: true });
+  const t0 = performance.now();
   try {
     const useFull = !tab.serverMode;
     const q = {
@@ -746,6 +793,7 @@ async function loadRows(tab) {
       order: tab.order || 'asc',
     };
     const d = await Api.rows(tab.table, q);
+    showDataMs(tab, performance.now() - t0, d.elapsedMs);
     tab.columns = d.columns;
     tab.hasPk = d.hasPrimaryKey;
     if (useFull && d.totalKnown) {
@@ -772,6 +820,18 @@ async function loadRows(tab) {
   } finally {
     set({ busy: false });
   }
+}
+
+// 数据浏览工具条上的耗时徽标。只报数、不进「耗时」历史：
+// 翻页是浏览行为，混进查询对比列表里只会淹掉真正想比的那几条。
+function showDataMs(tab, wallMs, serverMs) {
+  const el = tab.ui && tab.ui.bar ? tab.ui.bar.querySelector('[data-act="ms"]') : null;
+  if (!el) return;
+  el.textContent = '⏱ ' + fmtMs(wallMs);
+  el.className = 'mschip plain ' + speedClass(wallMs);
+  el.title = `本次取数：端到端 ${fmtMs(wallMs)}` +
+    (serverMs != null ? ` · 服务端 ${fmtMs(serverMs)}（含排队与编码）` : '') +
+    '\n（数据浏览耗时不计入「耗时」历史）';
 }
 
 function localSortedRows(tab) {
