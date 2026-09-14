@@ -6,6 +6,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "mini_test.h"
 #include "test_util.h"
@@ -14,42 +15,62 @@ using namespace cella::db;
 using testutil::Engine;
 using testutil::RowsText;
 
-namespace {
+namespace
+{
 
-// 在「已存在的数据目录」上开一个引擎（不清理，用于模拟二次打开）
-std::unique_ptr<DbEngine> OpenOn(const std::string& dir, bool checkpoint_on_commit = false) {
-  auto e = std::make_unique<DbEngine>();
-  EngineConfig c;
-  c.data_dir = dir;
-  c.enable_log = false;
-  c.enable_journal = true;
-  c.checkpoint_on_commit = checkpoint_on_commit;
-  if (!e->Open(c).ok()) {
-    return nullptr;
+  // 在「已存在的数据目录」上开一个引擎（不清理，用于模拟二次打开）
+  std::unique_ptr<DbEngine> OpenOn(const std::string &dir, bool checkpoint_on_commit = false,
+                                   uint32_t page_size = 4096)
+  {
+    auto e = std::make_unique<DbEngine>();
+    EngineConfig c;
+    c.data_dir = dir;
+    c.enable_log = false;
+    c.enable_journal = true;
+    c.checkpoint_on_commit = checkpoint_on_commit;
+    c.page_size = page_size;
+    if (!e->Open(c).ok())
+    {
+      return nullptr;
+    }
+    return e;
   }
-  return e;
-}
 
-void SeedAccounts(Engine* e) {
-  const ScriptReport r =
-      e->Run("CREATE TABLE account(id INT NOT NULL, balance INT NOT NULL);"
-             "INSERT INTO account VALUES (1,100),(2,50),(3,200);");
-  MT_CHECK(r.all_ok());
-}
-
-std::string ReadFile(const std::string& path) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) {
-    return std::string();
+  void SeedAccounts(Engine *e)
+  {
+    const ScriptReport r =
+        e->Run("CREATE TABLE account(id INT NOT NULL, balance INT NOT NULL);"
+               "INSERT INTO account VALUES (1,100),(2,50),(3,200);");
+    MT_CHECK(r.all_ok());
   }
-  std::ostringstream ss;
-  ss << in.rdbuf();
-  return ss.str();
-}
 
-}  // namespace
+  std::string ReadFile(const std::string &path)
+  {
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+    {
+      return std::string();
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+  }
 
-MT_TEST(事务_提交后生效) {
+  void PutUint32At(std::fstream *file, std::streamoff offset, uint32_t value)
+  {
+    char bytes[4] = {static_cast<char>(value & 0xFFu),
+                     static_cast<char>((value >> 8) & 0xFFu),
+                     static_cast<char>((value >> 16) & 0xFFu),
+                     static_cast<char>((value >> 24) & 0xFFu)};
+    file->seekp(offset, std::ios::beg);
+    file->write(bytes, sizeof(bytes));
+    file->flush();
+  }
+
+} // namespace
+
+MT_TEST(事务_提交后生效)
+{
   Engine e("txn_commit");
   SeedAccounts(&e);
   const ScriptReport r = e.Run(
@@ -70,7 +91,8 @@ MT_TEST(事务_提交后生效) {
         std::string("1|150\n2|50\n3|200\n4|300"));
 }
 
-MT_TEST(事务_回滚插入) {
+MT_TEST(事务_回滚插入)
+{
   Engine e("txn_rb_insert");
   SeedAccounts(&e);
   const ScriptReport r = e.Run("BEGIN;INSERT INTO account VALUES (9,999);ROLLBACK;");
@@ -79,7 +101,8 @@ MT_TEST(事务_回滚插入) {
         std::string("1\n2\n3"));
 }
 
-MT_TEST(事务_回滚更新恢复旧值) {
+MT_TEST(事务_回滚更新恢复旧值)
+{
   Engine e("txn_rb_update");
   SeedAccounts(&e);
   MT_CHECK(e.Run("BEGIN;UPDATE account SET balance = 0 limit id = 2;").all_ok());
@@ -92,7 +115,8 @@ MT_TEST(事务_回滚更新恢复旧值) {
         std::string("50"));
 }
 
-MT_TEST(事务_回滚删除恢复行) {
+MT_TEST(事务_回滚删除恢复行)
+{
   Engine e("txn_rb_delete");
   SeedAccounts(&e);
   MT_CHECK(e.Run("BEGIN;DELETE in account limit id = 3;").all_ok());
@@ -103,7 +127,8 @@ MT_TEST(事务_回滚删除恢复行) {
         std::string("1|100\n2|50\n3|200"));
 }
 
-MT_TEST(事务_语句级原子性) {
+MT_TEST(事务_语句级原子性)
+{
   Engine e("txn_stmt_atomic");
   SeedAccounts(&e);
   // 多行插入的第二行运行期失败：第一行必须一并撤销，事务继续有效
@@ -122,7 +147,8 @@ MT_TEST(事务_语句级原子性) {
         std::string("1\n2\n3\n5"));
 }
 
-MT_TEST(事务_编译失败不影响事务) {
+MT_TEST(事务_编译失败不影响事务)
+{
   Engine e("txn_compile_fail");
   SeedAccounts(&e);
   MT_CHECK(e.Run("BEGIN;").all_ok());
@@ -134,7 +160,8 @@ MT_TEST(事务_编译失败不影响事务) {
         std::string("1\n2\n3\n7"));
 }
 
-MT_TEST(事务_提交后仍可继续) {
+MT_TEST(事务_提交后仍可继续)
+{
   Engine e("txn_after_commit");
   SeedAccounts(&e);
   MT_CHECK(e.Run("BEGIN;INSERT INTO account VALUES (4,400);COMMIT;").all_ok());
@@ -145,7 +172,8 @@ MT_TEST(事务_提交后仍可继续) {
   MT_CHECK(!e.session().in_transaction());
 }
 
-MT_TEST(事务_状态机错误) {
+MT_TEST(事务_状态机错误)
+{
   Engine e("txn_state");
   SeedAccounts(&e);
   // 没有活动事务时 COMMIT / ROLLBACK
@@ -158,7 +186,8 @@ MT_TEST(事务_状态机错误) {
   MT_CHECK(e.Run("ROLLBACK;").all_ok());
 }
 
-MT_TEST(事务_DDL隐式提交) {
+MT_TEST(事务_DDL隐式提交)
+{
   Engine e("txn_ddl");
   SeedAccounts(&e);
   const ScriptReport r = e.Run(
@@ -177,7 +206,8 @@ MT_TEST(事务_DDL隐式提交) {
   MT_CHECK(e.engine.catalog().FindTable("audit") != nullptr);
 }
 
-MT_TEST(事务_重启后持久化) {
+MT_TEST(事务_重启后持久化)
+{
   Engine e("txn_persist");
   SeedAccounts(&e);
   MT_CHECK(e.Run("BEGIN;INSERT INTO account VALUES (4,400);COMMIT;").all_ok());
@@ -201,7 +231,8 @@ MT_TEST(事务_重启后持久化) {
         std::string("1\n2\n3\n4\n6"));
 }
 
-MT_TEST(事务_重启保留删除效果) {
+MT_TEST(事务_重启保留删除效果)
+{
   Engine e("txn_persist_delete");
   SeedAccounts(&e);
   MT_CHECK(e.Run("DELETE in account limit id = 2;").all_ok());
@@ -211,7 +242,8 @@ MT_TEST(事务_重启保留删除效果) {
         std::string("1\n3"));
 }
 
-MT_TEST(事务_统计与审计日志) {
+MT_TEST(事务_统计与审计日志)
+{
   Engine e("txn_journal");
   SeedAccounts(&e);
   MT_CHECK(e.Run("BEGIN;INSERT INTO account VALUES (4,400);COMMIT;").all_ok());
@@ -226,19 +258,21 @@ MT_TEST(事务_统计与审计日志) {
   MT_CHECK(journal.find("用户 ROLLBACK") != std::string::npos);
 }
 
-MT_TEST(事务_关闭时回滚未提交事务) {
+MT_TEST(事务_关闭时回滚未提交事务)
+{
   Engine e("txn_close_rollback");
   SeedAccounts(&e);
   MT_CHECK(e.Run("BEGIN;INSERT INTO account VALUES (9,900);").all_ok());
   MT_CHECK(e.session().in_transaction());
-  e.Close();  // 会话结束时未提交事务必须回滚
+  e.Close(); // 会话结束时未提交事务必须回滚
 
   MT_CHECK(e.Reopen());
   MT_EQ(RowsText(e.Run("get id in account ordered id asc;").statements[0].result),
         std::string("1\n2\n3"));
 }
 
-MT_TEST(事务_会话状态行) {
+MT_TEST(事务_会话状态行)
+{
   Engine e("txn_session_line");
   SeedAccounts(&e);
   MT_CHECK(e.session().StatusLine().find("自动提交") != std::string::npos);
@@ -250,11 +284,12 @@ MT_TEST(事务_会话状态行) {
   MT_CHECK(e.session().StatusLine().find("自动提交") != std::string::npos);
 }
 
-MT_TEST(事务_目录与数据同在单文件_删文件即空库) {
+MT_TEST(事务_目录与数据同在单文件_删文件即空库)
+{
   Engine e("txn_noselfheal");
   SeedAccounts(&e);
   MT_CHECK(e.Run("BEGIN;INSERT INTO account VALUES (9,900);COMMIT;").all_ok());
-  e.Close();  // 干净关闭
+  e.Close(); // 干净关闭
 
   // 目录与数据现在同在 cella.db 一个文件里，不再有 catalog.meta。
   // 删掉数据文件 → 重开得到一个全新的空库（系统表自动重建），
@@ -273,7 +308,65 @@ MT_TEST(事务_目录与数据同在单文件_删文件即空库) {
   MT_EQ(RowsText(e.Run("get id in account;").statements[0].result), std::string("1"));
 }
 
-MT_TEST(事务_DDL立即持久化) {
+MT_TEST(事务_损坏目录拒绝启动)
+{
+  Engine e("txn_corrupt_catalog");
+  SeedAccounts(&e);
+  e.Close();
+
+  // MetaPage offset 24 stores catalog_root_page; its page stores blob_len at offset 0.
+  const std::string db_path = e.cfg.data_dir + "/" + e.cfg.db_file;
+  std::fstream file(db_path, std::ios::in | std::ios::out | std::ios::binary);
+  MT_CHECK(file.is_open());
+  const std::streamsize page_size = static_cast<std::streamsize>(e.cfg.page_size);
+  std::vector<char> meta(static_cast<size_t>(page_size), 0);
+  file.read(meta.data(), page_size);
+  MT_CHECK(file.gcount() == page_size);
+  const uint32_t catalog_page = static_cast<uint32_t>(static_cast<unsigned char>(meta[24])) |
+                                (static_cast<uint32_t>(static_cast<unsigned char>(meta[25])) << 8) |
+                                (static_cast<uint32_t>(static_cast<unsigned char>(meta[26])) << 16) |
+                                (static_cast<uint32_t>(static_cast<unsigned char>(meta[27])) << 24);
+  MT_CHECK(catalog_page != 0xFFFFFFFFu);
+  PutUint32At(&file, static_cast<std::streamoff>(catalog_page) * page_size, 0xFFFFFFFFu);
+  file.close();
+
+  DbEngine broken;
+  EngineConfig config = e.cfg;
+  const DbStatus status = broken.Open(config);
+  MT_CHECK(!status.ok());
+  MT_CHECK(status.code() == DbCode::kStorageError);
+  MT_CHECK(status.message().find("kCorruptPage") != std::string::npos);
+  broken.Close();
+}
+
+MT_TEST(事务_UPDATE插入失败恢复旧行)
+{
+  const std::string dir = testutil::FreshDir("txn_update_insert_failure");
+  auto e = OpenOn(dir, false, 1024);
+  MT_CHECK(e != nullptr);
+  ScriptReport setup;
+  (void)e->default_session().Execute(
+      "CREATE TABLE t(id INT NOT NULL, value VARCHAR(1000));"
+      "INSERT INTO t VALUES (1,'old');",
+      &setup);
+  MT_CHECK(setup.all_ok());
+
+  const std::string oversized(1000, 'x');
+  ScriptReport failed;
+  (void)e->default_session().Execute("UPDATE t SET value = '" + oversized + "' limit id = 1;",
+                                     &failed);
+  MT_CHECK(!failed.all_ok());
+  MT_CHECK(failed.statements.back().status.code() == DbCode::kRecordTooLarge);
+
+  ScriptReport check;
+  (void)e->default_session().Execute("get value in t limit id = 1;", &check);
+  MT_CHECK(check.all_ok());
+  MT_EQ(RowsText(check.statements[0].result), std::string("old"));
+  e->Close();
+}
+
+MT_TEST(事务_DDL立即持久化)
+{
   Engine e("txn_ddl_durable");
   // DDL 在自动提交后立刻存盘；随后的 DML 默认不存盘（checkpoint_on_commit=false）
   MT_CHECK(e.Run("CREATE TABLE t(id INT NOT NULL, v VARCHAR(16));"
@@ -299,7 +392,8 @@ MT_TEST(事务_DDL立即持久化) {
   e2->Close();
 }
 
-MT_TEST(事务_checkpoint_on_commit_立即持久化数据) {
+MT_TEST(事务_checkpoint_on_commit_立即持久化数据)
+{
   const std::string dir = testutil::FreshDir("txn_cp_on");
   {
     auto e = OpenOn(dir, /*checkpoint_on_commit=*/true);
@@ -307,7 +401,7 @@ MT_TEST(事务_checkpoint_on_commit_立即持久化数据) {
     ScriptReport r;
     (void)e->default_session().Execute("CREATE TABLE t(id INT NOT NULL);INSERT INTO t VALUES (7);", &r);
     MT_CHECK(r.all_ok());
-  }  // 引擎析构前先正常 Close（见下方说明）
+  } // 引擎析构前先正常 Close（见下方说明）
 
   // 上面的引擎析构时 Close 会再次落盘；这里重开同一目录验证「提交即持久化」的可见性
   auto e2 = OpenOn(dir);
@@ -319,7 +413,8 @@ MT_TEST(事务_checkpoint_on_commit_立即持久化数据) {
   e2->Close();
 }
 
-MT_TEST(事务_Checkpoint_手动存盘) {
+MT_TEST(事务_Checkpoint_手动存盘)
+{
   Engine e("txn_checkpoint_api");
   SeedAccounts(&e);
   MT_CHECK(e.Run("INSERT INTO account VALUES (42,42);").all_ok());

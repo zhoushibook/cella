@@ -79,7 +79,6 @@ namespace cella::db
     constexpr uint64_t kRowidSlotMask = 0xFFFFull;
     constexpr const char *kRowidName = "rowid";
 
-
     int64_t RowidOf(const storage::Rid &rid)
     {
       return (static_cast<int64_t>(rid.page_id) << kRowidSlotBits) |
@@ -161,7 +160,7 @@ namespace cella::db
 
     // 供谓词求值的行值：物理列值（+ 引用 rowid 时末尾补 rowid），与 MakeFields 布局一致
     std::vector<storage::Value> ValuesWithRowid(const std::vector<storage::Value> &values,
-                                               const storage::Rid &rid, bool with_rowid)
+                                                const storage::Rid &rid, bool with_rowid)
     {
       std::vector<storage::Value> out = values;
       if (with_rowid)
@@ -964,20 +963,27 @@ namespace cella::db
       {
         return FromStorage(ds, "更新(删旧) " + name);
       }
+
+      UndoRecord *update_undo = nullptr;
+      if (ctx.recording())
+      {
+        UndoRecord u;
+        u.kind = UndoRecord::Kind::kUpdate;
+        u.table = name;
+        u.rid = storage::Rid{}; // 新版本尚未插入，失败时只需重插旧内容
+        u.before = h.second;
+        update_undo = &ctx.txn->AddUndo(std::move(u));
+      }
+
       storage::Rid new_rid;
       const storage::Status is = storage_->insert_record(name, fresh, &new_rid);
       if (!is.ok())
       {
         return FromStorage(is, "更新(插新) " + name);
       }
-      if (ctx.recording())
+      if (update_undo != nullptr)
       {
-        UndoRecord u;
-        u.kind = UndoRecord::Kind::kUpdate;
-        u.table = name;
-        u.rid = new_rid;     // 回滚时先删这一行
-        u.before = h.second; // 再重插旧内容
-        ctx.txn->AddUndo(std::move(u));
+        update_undo->rid = new_rid; // 回滚时先删新版本，再重插旧内容
       }
       ++updated;
     }
