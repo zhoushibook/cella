@@ -66,20 +66,29 @@ struct CatalogTable {
   int PrimaryKeyColumnIndex() const;
 };
 
-// ── 一个二级索引的元数据（P1.2）─────────────────────────────
+// ── 一个二级索引的元数据（P1.2；复合索引见 columns）─────────
 // 存放在独立的系统表 cella_index 中（不塞进 cella_catalog，避免改动既有行格式
 // 与 golden 输出）。一行一个索引。
+// 行格式（6 列，**不动**）：name | table | column | unique | root_page_id | created_at
+// 复合索引的列清单存进 column 列：逗号拼接 "a,b"（标识符不含逗号，解析安全）。
 struct CatalogIndex {
   std::string name;                  // 索引名（原始拼写）
   std::string table;                 // 所属表名（原始拼写）
-  std::string column;                // 索引列（单列，原始拼写）
+  std::string column;                // 列清单的逗号拼接形式（行格式兼容字段）
+  std::vector<std::string> columns;  // 索引列清单（按声明序；权威字段）
   bool unique = false;               // 唯一索引
   uint32_t root_page_id = 0;         // B+ 树根页号
   int64_t created_at = 0;            // Unix 秒
 
-  // 归属表存在且列存在时有效
-  bool valid() const { return !name.empty() && !table.empty() && !column.empty(); }
+  // 归属表存在且列清单有效时有效
+  bool valid() const { return !name.empty() && !table.empty() && !columns.empty(); }
+  // 列清单文本（写库/展示统一走这里，保证与 column 字段一致）
+  std::string JoinedColumns() const;
 };
+
+// 索引列清单 ⇄ 逗号拼接文本（cella_index 行格式；标识符不含逗号）
+std::string JoinIndexColumns(const std::vector<std::string>& cols);
+std::vector<std::string> SplitIndexColumns(const std::string& joined);
 
 // ── 目录管理器 ──────────────────────────────────────────────
 class CatalogManager {

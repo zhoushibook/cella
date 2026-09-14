@@ -132,8 +132,9 @@ int CatalogTable::PrimaryKeyColumnIndex() const {
 }
 
 std::vector<int> CatalogTable::PrimaryKeyColumns() const {
-  // 复合主键的列序 = 列声明序（本方言没有索引键序问题：唯一性是集合性质；
-  // 主键暂不建索引，见 PLAN_primary_key_rowid 的「约束不是加速器」取舍）
+  // 复合主键的列序 = 列声明序。一旦为复合主键建 B+ 树索引，键序就有了语义
+  //（最左前缀匹配、唯一性判定的元组顺序都依赖它）——本系统约定：
+  // **主键序 = 声明序**（5 段旗标编码不保留书写序，故按列下标自然序返回）。
   std::vector<int> out;
   for (size_t i = 0; i < columns.size(); ++i) {
     if (columns[i].primary_key) {
@@ -357,6 +358,46 @@ bool CatalogManager::DecodeRow(const storage::Record& row, CatalogTable* out) co
   return DecodeColumns(cols.str_val, &out->columns);
 }
 
+// ── 索引列清单 ⇄ 逗号拼接文本 ──────────────────────────────
+// 标识符不含逗号，因此 "a,b" 拼接是无歧义的（cella_index 行格式不变）。
+std::string JoinIndexColumns(const std::vector<std::string>& cols) {
+  std::string joined;
+  for (size_t i = 0; i < cols.size(); ++i) {
+    if (i > 0) {
+      joined += ",";
+    }
+    joined += cols[i];
+  }
+  return joined;
+}
+
+std::vector<std::string> SplitIndexColumns(const std::string& joined) {
+  std::vector<std::string> cols;
+  std::string cur;
+  for (char c : joined) {
+    if (c == ',') {
+      if (!cur.empty()) {
+        cols.push_back(cur);
+      }
+      cur.clear();
+    } else {
+      cur.push_back(c);
+    }
+  }
+  if (!cur.empty()) {
+    cols.push_back(cur);
+  }
+  return cols;
+}
+
+std::string CatalogIndex::JoinedColumns() const {
+  // columns 是权威字段；column 是它的持久化形态，两者保持一致
+  if (!columns.empty()) {
+    return JoinIndexColumns(columns);
+  }
+  return column;
+}
+
 bool CatalogManager::DecodeIndexRow(const storage::Record& row, CatalogIndex* out) const {
   if (row.value_count() < 6) {
     return false;
@@ -378,6 +419,8 @@ bool CatalogManager::DecodeIndexRow(const storage::Record& row, CatalogIndex* ou
   out->name = name.str_val;
   out->table = tbl.str_val;
   out->column = col.str_val;
+  // 复合适配：column 列是逗号拼接的列清单（单列 = 单个名字）
+  out->columns = SplitIndexColumns(col.str_val);
   out->unique = uniq.int32_val != 0;
   out->root_page_id = static_cast<uint32_t>(root.int32_val);
   out->created_at = static_cast<int64_t>(cat.int32_val);
@@ -444,7 +487,8 @@ DbStatus CatalogManager::WriteIndexRow(const CatalogIndex& index) {
   storage::Record rec;
   rec.AddValue(storage::Value::Varchar(index.name));
   rec.AddValue(storage::Value::Varchar(index.table));
-  rec.AddValue(storage::Value::Varchar(index.column));
+  // 列清单统一逗号拼接落库（单列 = 原名，与历史行逐字节一致）
+  rec.AddValue(storage::Value::Varchar(index.JoinedColumns()));
   rec.AddValue(storage::Value::Int(index.unique ? 1 : 0));
   rec.AddValue(storage::Value::Int(static_cast<int32_t>(index.root_page_id)));
   rec.AddValue(storage::Value::Int(static_cast<int32_t>(index.created_at)));

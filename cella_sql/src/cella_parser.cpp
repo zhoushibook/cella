@@ -775,7 +775,9 @@ namespace cella
                 return st;
             }
 
-            // CREATE [UNIQUE] INDEX idx ON table '(' column ')' ';'
+            // CREATE [UNIQUE] INDEX idx ON table '(' column [',' column]* ')' ';'
+            // 复合索引 = 括号内逗号分隔的列清单；indexColumns 按声明序保存，
+            // indexColumn 同步为逗号拼接（兼容既有打印与 golden 输出）。
             std::unique_ptr<CELLA_Stmt> parseCreateIndex()
             {
                 const CELLA_Token &t = advance(); // CREATE
@@ -792,12 +794,28 @@ namespace cella
                     return nullptr;
                 if (!expectDelim("("))
                     return nullptr;
-                if (!expectIdent(st->indexColumn))
+                std::string first;
+                if (!expectIdent(first))
                     return nullptr;
+                st->indexColumns.push_back(first);
+                while (matchDelim(","))
+                {
+                    std::string more;
+                    if (!expectIdent(more))
+                        return nullptr;
+                    st->indexColumns.push_back(more);
+                }
                 if (!expectDelim(")"))
                     return nullptr;
                 if (!expectSemicolon())
                     return nullptr;
+                // 拼接回 indexColumn（单列 = 原名，逐字节不变）
+                for (size_t i = 0; i < st->indexColumns.size(); ++i)
+                {
+                    if (i > 0)
+                        st->indexColumn += ",";
+                    st->indexColumn += st->indexColumns[i];
+                }
                 return st;
             }
 

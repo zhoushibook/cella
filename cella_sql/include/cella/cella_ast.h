@@ -219,7 +219,9 @@ namespace cella
         // CREATE INDEX / DROP INDEX
         std::string indexName;   // 索引名（原始拼写）
         bool unique = false;     // CREATE UNIQUE INDEX 标志
-        std::string indexColumn; // 被索引的列名（单列索引）
+        std::string indexColumn; // 被索引的列（单列 = 列名；复合 = "a,b" 逗号拼接，
+                                 // 兼容既有打印/golden 输出；新代码请用 indexColumns）
+        std::vector<std::string> indexColumns; // 复合索引的列清单（按声明序，≥1 项）
     };
 
     struct CELLA_Program

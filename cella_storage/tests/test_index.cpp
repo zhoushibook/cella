@@ -27,13 +27,12 @@ std::unique_ptr<BufferPoolManager> MakeBpm(size_t pool) {
 }
 
 BPlusTree::KeySpec IntSpec() {
-  BPlusTree::KeySpec s;
-  s.type = ValueType::kInt32;
-  s.max_len = 0;
-  return s;
+  return BPlusTree::KeySpec::Single(ValueType::kInt32, 0);
 }
 
 Value Int32(int32_t v) { return Value::Int(v); }
+
+Value Int64(int64_t v) { return Value::BigInt(v); }
 
 Value Varchar(const std::string& s) { return Value::Varchar(s); }
 
@@ -395,9 +394,7 @@ TEST_CASE(bptree_null_key_supported) {
 }
 
 TEST_CASE(bptree_varchar_keys) {
-  BPlusTree::KeySpec spec;
-  spec.type = ValueType::kVarchar;
-  spec.max_len = 32;
+  BPlusTree::KeySpec spec = BPlusTree::KeySpec::Single(ValueType::kVarchar, 32);
 
   auto bpm = MakeBpm(256);
   BPlusTree t(bpm.get(), spec);
@@ -578,4 +575,223 @@ TEST_CASE(bptree_leaf_pages_match_scan) {
   std::vector<std::string> all;
   EXPECT_OK(t.ScanAll(&all));
   EXPECT_EQ(all.size(), 800u);
+}
+
+// ─────────────────────────────────────────────────────────────
+// 复合键（多列索引）：拼接自定界 + NULL 位图 + 前缀扫描
+// ─────────────────────────────────────────────────────────────
+
+namespace {
+
+// 便捷：复合叶子键
+std::string LeafKey(const std::vector<Value>& vals, page_id_t page, uint8_t slot) {
+  return EncodeLeafKeyColumns(vals, page, slot);
+}
+
+}  // namespace
+
+// 拼接 → 按列解码 roundtrip：覆盖负数、0x00 内容、空串、各位置的 NULL。
+// 这是「自定界」声明的直接验证 —— 任何一列错位都会导致解码失败或值错。
+TEST_CASE(composite_key_roundtrip_all_types) {
+  struct Row {
+    std::vector<Value> vals;
+    std::vector<ValueType> types;
+  };
+  const std::string z00(std::size_t(3), '\0');  // 内容含真实 0x00 字节
+  const std::vector<Row> rows = {
+      // NULL 在首/中/尾
+      {{Value::Null(), Int32(5), Varchar("x")}, {ValueType::kInt32, ValueType::kInt32, ValueType::kVarchar}},
+      {{Int32(5), Value::Null(), Varchar("x")}, {ValueType::kInt32, ValueType::kInt32, ValueType::kVarchar}},
+      {{Int32(5), Int32(6), Value::Null()}, {ValueType::kInt32, ValueType::kInt32, ValueType::kVarchar}},
+      // 负数 / 0 / 边界
+      {{Int32(-2147418112), Int64(-9223372036854775807LL - 1), Varchar("abc")},
+       {ValueType::kInt32, ValueType::kInt64, ValueType::kVarchar}},
+      {{Int32(0), Int64(0), Varchar("")},
+       {ValueType::kInt32, ValueType::kInt64, ValueType::kVarchar}},
+      // 0x00 内容 / 空串 / 全 0x00 内容
+      {{Int32(7), Varchar(z00), Varchar("tail")},
+       {ValueType::kInt32, ValueType::kVarchar, ValueType::kVarchar}},
+      {{Int32(7), Varchar(""), Varchar("")},
+       {ValueType::kInt32, ValueType::kVarchar, ValueType::kVarchar}},
+      // 布尔 + 浮点 + 日期文本
+      {{Value::Bool(true), Value::Float(-1.5f), Varchar("2026-01-02")},
+       {ValueType::kBool, ValueType::kFloat, ValueType::kVarchar}},
+      // NULL 与「编码以 00 01 开头的 INT32」同场：位图必须消歧
+      {{Value::Null(), Varchar("xy")}, {ValueType::kInt32, ValueType::kVarchar}},
+      {{Int32(-2147417223), Varchar("")}, {ValueType::kInt32, ValueType::kVarchar}},
+  };
+  for (const Row& r : rows) {
+    std::vector<ValueType> types;
+    for (const Value& v : r.vals) {
+      types.push_back(v.IsNull() ? ValueType::kInt32 : v.type);
+    }
+    const std::string leaf = LeafKey(r.vals, 9, 4);
+    std::vector<Value> out;
+    EXPECT_TRUE(DecodeLeafKeyColumns(leaf, r.types, &out));
+    EXPECT_EQ(out.size(), r.vals.size());
+    for (size_t i = 0; i < r.vals.size(); ++i) {
+      if (r.vals[i].IsNull()) {
+        EXPECT_TRUE(out[i].IsNull());
+        continue;
+      }
+      if (r.vals[i].type == ValueType::kInt32) {
+        EXPECT_EQ(out[i].int32_val, r.vals[i].int32_val);
+      } else if (r.vals[i].type == ValueType::kInt64) {
+        EXPECT_EQ(out[i].int64_val, r.vals[i].int64_val);
+      } else if (r.vals[i].type == ValueType::kFloat) {
+        EXPECT_EQ(out[i].float_val, r.vals[i].float_val);
+      } else if (r.vals[i].type == ValueType::kVarchar) {
+        EXPECT_TRUE(out[i].str_val == r.vals[i].str_val);
+      } else if (r.vals[i].type == ValueType::kBool) {
+        EXPECT_EQ(out[i].bool_val, r.vals[i].bool_val);
+      }
+    }
+    // 行定位 roundtrip
+    page_id_t pg = 0;
+    uint8_t slot = 0;
+    EXPECT_TRUE(DecodeLeafKeyRid(leaf, &pg, &slot));
+    EXPECT_EQ(pg, 9u);
+    EXPECT_EQ(slot, 4);
+  }
+}
+
+// 历史歧义回归：下面两行的**元组编码必须不同**（NULL 标记 00 01 与
+// INT32 极小值编码共享前缀，复合键靠 NULL 位图消除歧义），
+// 且各自都能按完整消费规则解码回自己。
+TEST_CASE(composite_key_null_bitmap_disambiguates) {
+  const std::string a = EncodeColumnKeys({Value::Null(), Varchar("xy")});
+  const std::string b = EncodeColumnKeys({Int32(-2147417223), Varchar("")});
+  EXPECT_TRUE(a != b);
+  // 补一个哑行定位，变成合法叶子键后再解码（长度 ≥ 5 的键会按「尾部 5B
+  // 是行定位」切分 —— 这正是行定位恒在键尾的约定）
+  const std::string dummy_rid(5, '\0');
+  std::vector<Value> da, db;
+  EXPECT_TRUE(DecodeLeafKeyColumns(a + dummy_rid, {ValueType::kInt32, ValueType::kVarchar}, &da));
+  EXPECT_TRUE(da[0].IsNull());
+  EXPECT_TRUE(da[1].str_val == "xy");
+  EXPECT_TRUE(DecodeLeafKeyColumns(b + dummy_rid, {ValueType::kInt32, ValueType::kVarchar}, &db));
+  EXPECT_EQ(db[0].int32_val, -2147417223);
+  EXPECT_TRUE(db[1].str_val == "");
+}
+
+// 拼接后的字节序 == 元组逻辑序：先按第 1 列排，同值再按第 2 列排。
+TEST_CASE(composite_key_byte_order_matches_tuple_order) {
+  auto enc = [](int32_t a, const char* b) {
+    return EncodeColumnKeys({Int32(a), Varchar(b)});
+  };
+  // 第 1 列决定主序
+  EXPECT_TRUE(enc(1, "z") < enc(2, "a"));
+  EXPECT_TRUE(enc(-5, "z") < enc(0, "a"));
+  // 第 1 列相同 → 第 2 列决定次序
+  EXPECT_TRUE(enc(3, "ab") < enc(3, "abc"));
+  EXPECT_TRUE(enc(3, "") < enc(3, "a"));
+  // NULL 在同列非空值之前（常规值域）
+  std::string null_a, zero_a;
+  EncodeIndexColumn(Value::Null(), &null_a);
+  EncodeIndexColumn(Int32(0), &zero_a);
+  EXPECT_TRUE(null_a < zero_a);
+}
+
+// 复合键树的完整生命周期：插入（含触发分裂）、Contains、前缀扫描、删除。
+TEST_CASE(composite_tree_insert_contains_prefix_remove) {
+  auto bpm = MakeBpm(512);
+  BPlusTree::KeySpec spec;
+  spec.columns.push_back({ValueType::kInt32, 0});
+  spec.columns.push_back({ValueType::kVarchar, 32});
+  BPlusTree t(bpm.get(), spec);
+  page_id_t root = kInvalidPageId;
+  EXPECT_OK(t.Create(&root));
+
+  const int32_t n = 300;  // 复合键更长 → 更容易触发多页/分裂
+  for (int32_t i = 0; i < n; ++i) {
+    bool dup = false;
+    const std::string leaf = LeafKey({Int32(i % 30), Varchar("name" + std::to_string(i))},
+                                     static_cast<page_id_t>(1 + i / 100),
+                                     static_cast<uint8_t>(i % 256));
+    EXPECT_OK(t.Insert(leaf, &dup));
+    EXPECT_TRUE(!dup);
+  }
+  EXPECT_TRUE(t.Height() >= 1);
+
+  // 精确查找
+  const std::string probe =
+      LeafKey({Int32(10), Varchar("name10")}, static_cast<page_id_t>(1), 10);
+  bool found = false;
+  EXPECT_OK(t.Contains(probe, &found));
+  EXPECT_TRUE(found);
+
+  // 全量扫描：n 个键，有序
+  std::vector<std::string> all;
+  EXPECT_OK(t.ScanAll(&all));
+  EXPECT_EQ(all.size(), static_cast<size_t>(n));
+  for (size_t i = 1; i < all.size(); ++i) {
+    EXPECT_TRUE(all[i - 1] < all[i]);
+  }
+
+  // 前缀扫描：第 1 列 = 10 的全部行（不论第 2 列）。
+  // 部分前缀必须用 EncodeColumnPrefix —— 位图宽度按索引总列数对齐，
+  // 用 EncodeColumnKeys 会按「1 列键」编码（无位图），匹配不上 2 列键。
+  const std::string prefix = EncodeColumnPrefix({Int32(10)}, 2);
+  std::vector<std::string> hits;
+  EXPECT_OK(t.ScanPrefix(prefix, [&](const std::string& k) -> bool {
+    hits.push_back(k);
+    return true;
+  }));
+  EXPECT_EQ(hits.size(), 10u);  // i % 30 == 0? 10,40,...,280 → 10 个
+  for (const std::string& k : hits) {
+    std::vector<Value> vals;
+    EXPECT_TRUE(DecodeLeafKeyColumns(k, {ValueType::kInt32, ValueType::kVarchar}, &vals));
+    EXPECT_EQ(vals[0].int32_val, 10);
+  }
+
+  // 删除一半后扫描数量减半
+  for (int32_t i = 0; i < n; i += 2) {
+    const std::string leaf = LeafKey({Int32(i % 30), Varchar("name" + std::to_string(i))},
+                                     static_cast<page_id_t>(1 + i / 100),
+                                     static_cast<uint8_t>(i % 256));
+    bool removed = false;
+    EXPECT_OK(t.Remove(leaf, &removed));
+    EXPECT_TRUE(removed);
+  }
+  std::vector<std::string> after;
+  EXPECT_OK(t.ScanAll(&after));
+  EXPECT_EQ(after.size(), static_cast<size_t>(n) / 2);
+}
+
+// 复合前缀扫描的提前终止回调
+TEST_CASE(composite_prefix_scan_early_terminate) {
+  auto bpm = MakeBpm(512);
+  BPlusTree::KeySpec spec;
+  spec.columns.push_back({ValueType::kInt32, 0});
+  spec.columns.push_back({ValueType::kInt32, 0});
+  BPlusTree t(bpm.get(), spec);
+  page_id_t root = kInvalidPageId;
+  EXPECT_OK(t.Create(&root));
+  for (int32_t i = 0; i < 50; ++i) {
+    bool dup = false;
+    EXPECT_OK(t.Insert(LeafKey({Int32(7), Int32(i)}, 1, static_cast<uint8_t>(i)), &dup));
+  }
+  const std::string prefix = EncodeColumnPrefix({Int32(7)}, 2);
+  int seen = 0;
+  EXPECT_OK(t.ScanPrefix(prefix, [&](const std::string&) -> bool {
+    ++seen;
+    return seen < 5;  // 取 5 个就停
+  }));
+  EXPECT_EQ(seen, 5);
+}
+
+// 键长上限校验：两个超长 VARCHAR 的复合索引必须在建索引前被拒绝。
+TEST_CASE(composite_key_too_long_rejected) {
+  auto bpm = MakeBpm(256);
+  BPlusTree::KeySpec ok_spec;
+  ok_spec.columns.push_back({ValueType::kInt32, 0});
+  ok_spec.columns.push_back({ValueType::kVarchar, 32});
+  EXPECT_TRUE(BPlusTree::KeyFitsPage(256, ok_spec));
+
+  BPlusTree::KeySpec bad_spec;
+  bad_spec.columns.push_back({ValueType::kVarchar, 3000});
+  bad_spec.columns.push_back({ValueType::kVarchar, 3000});
+  // 最坏键 = 2*(3000*2+2) + 5 + 4 ≈ 12017 > 256B 页 → 放不下 2 个键
+  EXPECT_TRUE(!BPlusTree::KeyFitsPage(256, bad_spec));
+  EXPECT_TRUE(BPlusTree::MaxLeafKeyBytes(bad_spec) > 256);
 }

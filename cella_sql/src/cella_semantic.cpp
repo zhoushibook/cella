@@ -665,12 +665,57 @@ namespace cella
                                                      "表 \"" + st.tableName + "\" 不存在"));
                 return false;
             }
-            if (!CELLA_Catalog::findColumn(*table, st.indexColumn))
+            // 复合索引：逐列校验（indexColumns 为空时兜底解析 indexColumn，
+            // 兼容手工构造 AST 的调用方）；同一列不允许出现两次。
+            std::vector<std::string> cols = st.indexColumns;
+            if (cols.empty() && !st.indexColumn.empty())
+            {
+                std::string cur;
+                for (char c : st.indexColumn)
+                {
+                    if (c == ',')
+                    {
+                        cols.push_back(cur);
+                        cur.clear();
+                    }
+                    else
+                    {
+                        cur.push_back(c);
+                    }
+                }
+                if (!cur.empty())
+                {
+                    cols.push_back(cur);
+                }
+            }
+            if (cols.empty())
             {
                 res.errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-303", st.line, st.col,
-                                                     "列 \"" + st.indexColumn + "\" 不存在于表 \"" +
-                                                         st.tableName + "\""));
+                                                     "索引必须至少指定一列"));
                 return false;
+            }
+            for (const std::string &c : cols)
+            {
+                if (!CELLA_Catalog::findColumn(*table, c))
+                {
+                    res.errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-303", st.line, st.col,
+                                                         "列 \"" + c + "\" 不存在于表 \"" +
+                                                             st.tableName + "\""));
+                    return false;
+                }
+            }
+            for (size_t i = 0; i < cols.size(); ++i)
+            {
+                for (size_t j = i + 1; j < cols.size(); ++j)
+                {
+                    if (cella_toUpper(cols[i]) == cella_toUpper(cols[j]))
+                    {
+                        res.errors.push_back(cella_makeError(
+                            CELLA_Phase::SEM, "SEM-303", st.line, st.col,
+                            "索引列 \"" + cols[i] + "\" 重复出现在列清单中"));
+                        return false;
+                    }
+                }
             }
             for (const auto &t : cat.allTables())
             {

@@ -14,7 +14,7 @@ namespace cella::storage {
 class BufferPoolManager;
 
 // ─────────────────────────────────────────────────────────────────────────
-// BPlusTree —— 单列 B+ 树索引（键 = 编码后的列值 + 行定位 Rid）。
+// BPlusTree —— B+ 树索引（键 = 编码后的列值元组 + 行定位 Rid）。
 //
 // 结构（标准 B+ 树）：
 //   * 所有数据都在叶子层，叶子用 right_sibling 串成有序链表 → 范围扫描容易；
@@ -23,9 +23,13 @@ class BufferPoolManager;
 //   * 插入自底向上分裂；根分裂时树长高一层。
 //
 // 键是**变长**的字节串（见 index_key.h）。比较统一走 CompareIndexKey：
-//   - 叶子键 = 列值编码 + 行定位（5B）
-//   - 内部键 = 列值编码（无行定位）→ 与叶子键比较时用「前缀比较」
-//     这是 B+ 树变长键实现里最容易出错的地方，比较函数里已显式处理。
+//   - 叶子键 = 列值元组编码 + 行定位（5B）
+//   - 内部键 = 列值元组编码（无行定位）→ 与叶子键比较时用「前缀比较」。
+//     行定位恒在键尾 5 字节 → 去尾后仍是完整元组编码，前缀比较对复合键
+//     继续成立（StripLeafRowId 不需要知道列数）。
+//
+// 支持单列与多列复合键（KeySpec::columns）：单列是列数为 1 的特例，
+// 不写任何特殊分支；复合键的拼接/解码细节见 index_key.h（NULL 位图）。
 //
 // 并发：不做内部加锁。上层（cella_db）的存储互斥量已把存储访问串行化，
 //       本类沿用 IStorage「单线程设计」的既有约定。
@@ -36,13 +40,36 @@ class BufferPoolManager;
 
 class BPlusTree {
  public:
-  // 键列的类型（决定解码方式与最大键长）
-  struct KeySpec {
+  // 键的列规格（决定编码/解码方式与最大键长）
+  struct Column {
     ValueType type = ValueType::kInt32;
     uint16_t max_len = 0;        // VARCHAR/CHAR 的最大字节长（定长类型忽略）
   };
 
+  // 列序列表：单列索引 = 1 个元素；复合索引按声明序排列。
+  struct KeySpec {
+    std::vector<Column> columns;
+
+    // 单列便捷构造（既有调用方/测试用）
+    static KeySpec Single(ValueType type, uint16_t max_len) {
+      KeySpec s;
+      s.columns.push_back(Column{type, max_len});
+      return s;
+    }
+    bool empty() const { return columns.empty(); }
+    size_t column_count() const { return columns.size(); }
+  };
+
   BPlusTree(BufferPoolManager* bpm, KeySpec spec);
+
+  // ── 键长上限（建索引时校验用）─────────────────────────────
+  // 最坏叶子键字节数 = NULL 位图（复合键）+ Σ(各列最大编码) + 行定位 5B。
+  // VARCHAR 转义后最长 2n+2 —— 多个长 VARCHAR 组合可能撑爆一页，
+  // 必须在建索引时拒绝，而不是等插入时才发现放不下。
+  static size_t MaxLeafKeyBytes(const KeySpec& spec);
+  // 页里必须至少放得下 min_keys 个最坏键（一页至少 2~3 个键才能分裂）。
+  // 建索引前调用：超限返回 false，调用方直接拒绝建索引。
+  static bool KeyFitsPage(uint32_t page_size, const KeySpec& spec, size_t min_keys = 2);
 
   // ── 生命周期 ──────────────────────────────────────────────
   // 建一棵空树（分配根叶子页）。成功后 root_page 有效。
@@ -53,10 +80,10 @@ class BPlusTree {
   bool valid() const { return root_ != kInvalidPageId; }
 
   // ── 插入 ──────────────────────────────────────────────────
-  // key 必须由 EncodeLeafKey 生成（含行定位）。
+  // key 必须由 EncodeLeafKeyColumns 生成（含行定位）。
   // duplicate = true 表示遇到完全相同的键（同列值 + 同 Rid）→ 重复插入。
   // unique 检查由上层做（需要区分「同列值不同行」与「完全重复」），
-  // 本层只提供 ContainsKeyValue 供上层查询。
+  // 本层提供前缀扫描原语供上层查询。
   Status Insert(const std::string& leaf_key, bool* duplicate);
 
   // ── 删除 ──────────────────────────────────────────────────
@@ -74,6 +101,14 @@ class BPlusTree {
   using ScanCallback = std::function<bool(const std::string& leaf_key)>;
   Status ScanRange(const std::string* lo_column_key, const std::string* hi_column_key,
                    bool include_hi, const ScanCallback& cb);
+
+  // ── 前缀扫描（复合索引「最左前缀」的原语）─────────────────
+  // prefix 是 EncodeColumnKeys 的输出（NULL 位图 + 前几列的编码）。
+  // 输出所有「列值部分以 prefix 为字节前缀」的叶子键 —— 即元组前缀匹配。
+  // 为什么不用 ScanRange 硬凑 hi 边界：VARCHAR 内容可以含真实 0xFF 字节，
+  // 「enc(a=v) + 0xFF…」这样的排他上界凑不出来；字节前缀比较不需要解码，
+  // 天然正确。回调返回 false 可提前终止。
+  Status ScanPrefix(const std::string& prefix, const ScanCallback& cb);
 
   using ScanLeafCallback = std::function<bool(const std::string& leaf_key)>;
   Status Scan(ScanLeafCallback cb);

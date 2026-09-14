@@ -64,7 +64,7 @@ namespace cella
     {
         std::string name;   // 索引名（原始拼写）
         std::string table;  // 所属表
-        std::string column; // 索引列（单列）
+        std::string column; // 索引列（单列 = 列名；复合 = "a,b" 逗号拼接）
         bool unique = false;
     };
 

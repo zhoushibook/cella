@@ -496,8 +496,12 @@ MT_TEST(执行_复合主键) {
   MT_EQ(pk_cols[1], 1);
   MT_CHECK(meta->columns[0].not_null);
   MT_CHECK(meta->columns[1].not_null);
-  // 复合主键不建 B+ 树（单列键限制），唯一性走扫描校验
-  MT_CHECK(e.engine.catalog().FindIndex("enroll_pk") == nullptr);
+  // 复合主键现在也建唯一 B+ 树（B+ 树已支持复合键）：enroll_pk，
+  // 键 = (sid, cid) 按声明序编码，唯一性由索引元组前缀比较保证
+  const CatalogIndex *pk_ix = e.engine.catalog().FindIndex("enroll_pk");
+  MT_CHECK(pk_ix != nullptr);
+  MT_CHECK(pk_ix != nullptr && pk_ix->unique);
+  MT_CHECK(pk_ix != nullptr && pk_ix->columns.size() == 2u);
 
   MT_CHECK(e.Run("INSERT INTO enroll VALUES (1,10,88.5),(1,11,90.0),(2,10,75.0);").all_ok());
   // 组合值重复 → DB-516（首列相同但次列不同则合法）

@@ -556,18 +556,18 @@ namespace cella::db
 
   // ── P1.4：为表的主键列建立唯一索引 ──────────────────────────
   // 表没有主键列时是空操作。索引名 = <table>_pk，业务语义上属于系统生成，
-  // 但为了不改变 cella_index 的行格式（保持既有 5 列布局与 golden 输出），
+  // 但为了不改变 cella_index 的行格式（保持既有 6 列布局与 golden 输出），
   // 它作为一条**普通索引元数据**登记 —— 由此也自动获得：
   //   * 重启后随 LoadIndexesFromStorage 恢复
   //   * DROP TABLE 时被 DeleteIndexesOfTable 级联清理
   //   * DML 时被 ExecInsert/ExecUpdate/ExecDelete 的索引维护统一覆盖
-  // 注意：**复合主键**（表级 PRIMARY KEY (a, b)）不在此建索引 —— B+ 树当前
-  // 只支持单列键（KeySpec 单列），复合主键的唯一性由 INSERT/UPDATE 的
-  // 扫描式查重保证（见 ExecInsert/ExecUpdate 的 pk_cols 路径）。
+  // 复合主键（表级 PRIMARY KEY (a, b)）同样建索引：键序 = 主键列**声明序**
+  //（系统约定，见 CatalogTable::PrimaryKeyColumns）。B+ 树键 = 各主键列
+  // 依次编码 + 行定位；唯一性由 IndexValueFree 的元组前缀比较保证。
   DbStatus Executor::CreatePrimaryIndex(const CatalogTable &table)
   {
-    const int pk_idx = table.PrimaryKeyColumnIndex();
-    if (pk_idx < 0)
+    const std::vector<int> pk_cols = table.PrimaryKeyColumns();
+    if (pk_cols.empty())
     {
       return DbStatus::Ok(); // 无主键 → 不建
     }
@@ -575,7 +575,6 @@ namespace cella::db
     {
       return DbStatus::Error(DbCode::kInternal, "执行器未绑定存储/目录，无法建主键索引");
     }
-    const CatalogColumn &col = table.columns[static_cast<size_t>(pk_idx)];
 
     // 幂等：同一张表重复调用（重放/迁移）不应建出第二棵
     const std::string index_name = PrimaryIndexName(table.name);
@@ -584,16 +583,29 @@ namespace cella::db
       return DbStatus::Ok();
     }
 
+    // 键规格：按声明序逐列收集（类型 + 长度上限），并校验最坏键长放得进一页
+    storage::BPlusTree::KeySpec spec;
+    std::vector<std::string> pk_names;
+    for (int ci : pk_cols)
+    {
+      const CatalogColumn &col = table.columns[static_cast<size_t>(ci)];
+      spec.columns.push_back(storage::BPlusTree::Column{
+          ToStorageType(col.type), static_cast<uint16_t>(col.len)});
+      pk_names.push_back(col.name);
+    }
+
     StorageGuard guard(storage_mutex_);
     storage::BufferPoolManager *bpm = storage_->buffer_pool();
     if (bpm == nullptr)
     {
       return DbStatus::Error(DbCode::kInternal, "存储引擎未暴露缓冲池，无法建主键索引");
     }
-
-    storage::BPlusTree::KeySpec spec;
-    spec.type = ToStorageType(col.type);
-    spec.max_len = static_cast<uint16_t>(col.len);
+    if (!storage::BPlusTree::KeyFitsPage(bpm->page_size(), spec))
+    {
+      return DbStatus::Error(DbCode::kValueTooLong,
+                             "主键 " + JoinIndexColumns(pk_names) +
+                                 " 的键编码过长，单页放不下最坏情况，拒绝建索引");
+    }
 
     storage::BPlusTree tree(bpm, spec);
     storage::page_id_t root = storage::kInvalidPageId;
@@ -615,13 +627,23 @@ namespace cella::db
     for (auto it = heap->begin(); it != heap->end(); ++it)
     {
       const storage::Record &rec = *it;
-      if (static_cast<size_t>(pk_idx) >= rec.value_count())
+      std::vector<storage::Value> key_vals;
+      bool bad = false;
+      for (int ci : pk_cols)
+      {
+        if (static_cast<size_t>(ci) >= rec.value_count())
+        {
+          bad = true;
+          break;
+        }
+        key_vals.push_back(rec.value(static_cast<size_t>(ci)));
+      }
+      if (bad)
       {
         continue;
       }
-      const std::string leaf = storage::EncodeLeafKey(rec.value(static_cast<size_t>(pk_idx)),
-                                                      it.rid().page_id,
-                                                      static_cast<uint8_t>(it.rid().slot_id));
+      const std::string leaf = storage::EncodeLeafKeyColumns(
+          key_vals, it.rid().page_id, static_cast<uint8_t>(it.rid().slot_id));
       bool dup = false;
       const storage::Status is = tree.Insert(leaf, &dup);
       if (!is.ok())
@@ -634,7 +656,8 @@ namespace cella::db
     CatalogIndex entry;
     entry.name = index_name;
     entry.table = table.name;
-    entry.column = col.name;
+    entry.columns = pk_names;
+    entry.column = entry.JoinedColumns();
     entry.unique = true; // 主键语义就是唯一
     entry.root_page_id = root;
     entry.created_at = static_cast<int64_t>(std::time(nullptr));
@@ -643,8 +666,9 @@ namespace cella::db
     {
       return ws;
     }
-    DbLogInfo(logcat::kCatalog, "已为主键列 " + table.name + "." + col.name + " 自动建索引 " +
-                                   index_name + "（回填 " + std::to_string(backfilled) + " 行）");
+    DbLogInfo(logcat::kCatalog, "已为主键 " + table.name + "(" + entry.column +
+                                   ") 自动建索引 " + index_name +
+                                   "（回填 " + std::to_string(backfilled) + " 行）");
     return DbStatus::Ok();
   }
 
@@ -746,22 +770,36 @@ namespace cella::db
     {
       return DbStatus::Error(DbCode::kIndexExists, "索引已存在: " + st->indexName);
     }
-    const CatalogColumn *col = meta->FindColumn(st->indexColumn);
-    if (col == nullptr)
+    // 复合索引：列清单（AST 里按声明序；兜底解析逗号拼接的 indexColumn）
+    std::vector<std::string> index_cols = st->indexColumns;
+    if (index_cols.empty())
     {
-      return DbStatus::Error(DbCode::kColumnNotFound,
-                             "列不存在: " + st->tableName + "." + st->indexColumn);
+      index_cols = SplitIndexColumns(st->indexColumn);
+    }
+    if (index_cols.empty())
+    {
+      return DbStatus::Error(DbCode::kValueTooLong, "索引必须至少指定一列");
+    }
+    // 逐列校验存在性 + 收集键规格（声明序），同时校验最坏键长放得进一页
+    storage::BPlusTree::KeySpec spec;
+    std::vector<int> col_idxs;
+    for (const std::string &cn : index_cols)
+    {
+      const CatalogColumn *col = meta->FindColumn(cn);
+      if (col == nullptr)
+      {
+        return DbStatus::Error(DbCode::kColumnNotFound,
+                               "列不存在: " + st->tableName + "." + cn);
+      }
+      spec.columns.push_back(storage::BPlusTree::Column{
+          ToStorageType(col->type), static_cast<uint16_t>(col->len)});
+      col_idxs.push_back(meta->ColumnIndex(col->name));
     }
     const DbStatus ls = LockTable(meta->name, LockMode::kShared, ctx, TablePriv::kNone);
     if (!ls.ok())
     {
       return ls;
     }
-
-    // 索引键规格：物理类型 + 长度上限（varchar 用声明长度，其它为 0）
-    storage::BPlusTree::KeySpec spec;
-    spec.type = ToStorageType(col->type);
-    spec.max_len = static_cast<uint16_t>(col->len);
 
     std::unique_ptr<storage::BPlusTree> tree;
     {
@@ -771,6 +809,15 @@ namespace cella::db
       {
         return DbStatus::Error(DbCode::kInternal, "存储引擎未暴露缓冲池，无法建索引");
       }
+      // 键长上限必须在建索引时校验：复合键 = Σ(各列编码) + 位图 + 行定位，
+      // 多个长 VARCHAR 组合可能撑爆一页（一页至少要能放 2~3 个键才能分裂）。
+      if (!storage::BPlusTree::KeyFitsPage(bpm->page_size(), spec))
+      {
+        return DbStatus::Error(DbCode::kValueTooLong,
+                               "索引 " + st->indexName + " 的键编码过长（列 " +
+                                   JoinIndexColumns(index_cols) +
+                                   "），单页放不下最坏情况，拒绝建索引");
+      }
       tree = std::make_unique<storage::BPlusTree>(bpm, spec);
       storage::page_id_t root = storage::kInvalidPageId;
       const storage::Status cs = tree->Create(&root);
@@ -779,25 +826,34 @@ namespace cella::db
         return FromStorage(cs, "建索引 " + st->indexName);
       }
 
-      // 回填：全表扫描现有行，逐行插入索引键
+      // 回填：全表扫描现有行，逐行插入复合索引键
       std::shared_ptr<storage::TableHeap> heap;
       const storage::Status os = storage_->open_table(meta->name, &heap);
       if (!os.ok())
       {
         return FromStorage(os, "回填索引时打开表 " + meta->name);
       }
-      const int col_idx = meta->ColumnIndex(col->name);
       size_t backfilled = 0;
       for (auto it = heap->begin(); it != heap->end(); ++it)
       {
         const storage::Record &rec = *it;
-        if (col_idx < 0 || static_cast<size_t>(col_idx) >= rec.value_count())
+        std::vector<storage::Value> key_vals;
+        bool bad = false;
+        for (int ci : col_idxs)
+        {
+          if (ci < 0 || static_cast<size_t>(ci) >= rec.value_count())
+          {
+            bad = true;
+            break;
+          }
+          key_vals.push_back(rec.value(static_cast<size_t>(ci)));
+        }
+        if (bad)
         {
           continue;
         }
-        const std::string leaf = storage::EncodeLeafKey(
-            rec.value(static_cast<size_t>(col_idx)), it.rid().page_id,
-            static_cast<uint8_t>(it.rid().slot_id));
+        const std::string leaf = storage::EncodeLeafKeyColumns(
+            key_vals, it.rid().page_id, static_cast<uint8_t>(it.rid().slot_id));
         bool dup = false;
         const storage::Status is = tree->Insert(leaf, &dup);
         if (!is.ok())
@@ -807,7 +863,8 @@ namespace cella::db
         ++backfilled;
       }
 
-      // 唯一性检查：同列值不同行（键不同但列值相同）视为冲突
+      // 唯一性检查：同列值元组不同行（键不同但列值前缀相同）视为冲突。
+      // 键按「元组编码 + 行定位」有序 → 相邻键去尾后相等即同元组。
       if (st->unique)
       {
         std::vector<std::string> all;
@@ -821,8 +878,8 @@ namespace cella::db
           if (storage::StripLeafRowId(all[i - 1]).compare(storage::StripLeafRowId(all[i])) == 0)
           {
             return DbStatus::Error(DbCode::kIndexExists,
-                                   "唯一索引 " + st->indexName + " 建立失败：列 \"" +
-                                       col->name + "\" 存在重复值");
+                                   "唯一索引 " + st->indexName + " 建立失败：列 (" +
+                                       JoinIndexColumns(index_cols) + ") 存在重复值");
           }
         }
       }
@@ -830,7 +887,8 @@ namespace cella::db
       CatalogIndex entry;
       entry.name = st->indexName;
       entry.table = meta->name;
-      entry.column = col->name;
+      entry.columns = index_cols;
+      entry.column = entry.JoinedColumns();
       entry.unique = st->unique;
       entry.root_page_id = root;
       entry.created_at = static_cast<int64_t>(std::time(nullptr));
@@ -1209,23 +1267,37 @@ namespace cella::db
       {
         continue;
       }
-      const int col = table.ColumnIndex(m->column);
-      if (col < 0)
+      // 复合适配：索引列清单逐列定位下标；任一列失效则整条索引跳过
+      //（报错会让整张表彻底无法写，代价远大于一条陈旧索引）。
+      std::vector<int> cols;
+      bool stale = false;
+      for (const std::string &cn : m->columns)
       {
-        // 索引列已不在表里（陈旧元数据）→ 跳过维护，而不是报错：
-        // 报错会让整张表彻底无法写，代价远大于一条陈旧索引。
-        DbLogWarn(logcat::kExec, "索引 " + m->name + " 的列 " + m->column +
-                                     " 不在表 " + table.name + " 上，已跳过维护");
+        const int col = table.ColumnIndex(cn);
+        if (col < 0)
+        {
+          DbLogWarn(logcat::kExec, "索引 " + m->name + " 的列 " + cn +
+                                       " 不在表 " + table.name + " 上，已跳过维护");
+          stale = true;
+          break;
+        }
+        cols.push_back(col);
+      }
+      if (stale)
+      {
         continue;
       }
-      const CatalogColumn &cc = table.columns[static_cast<size_t>(col)];
       storage::BPlusTree::KeySpec spec;
-      spec.type = ToStorageType(cc.type);
-      spec.max_len = static_cast<uint16_t>(cc.len);
+      for (int col : cols)
+      {
+        const CatalogColumn &cc = table.columns[static_cast<size_t>(col)];
+        spec.columns.push_back(storage::BPlusTree::Column{
+            ToStorageType(cc.type), static_cast<uint16_t>(cc.len)});
+      }
 
       IndexHandle h;
       h.meta = m;
-      h.column = col;
+      h.columns = std::move(cols);
       h.tree = std::make_unique<storage::BPlusTree>(bpm, spec);
       h.tree->Attach(static_cast<storage::page_id_t>(m->root_page_id));
       out->push_back(std::move(h));
@@ -1234,9 +1306,11 @@ namespace cella::db
     std::sort(out->begin(), out->end(),
               [](const IndexHandle &a, const IndexHandle &b)
               {
-                if (a.column != b.column)
+                const int ca = a.columns.empty() ? -1 : a.columns[0];
+                const int cb = b.columns.empty() ? -1 : b.columns[0];
+                if (ca != cb)
                 {
-                  return a.column < b.column;
+                  return ca < cb;
                 }
                 return a.meta->name < b.meta->name;
               });
@@ -1246,33 +1320,56 @@ namespace cella::db
   bool Executor::IndexKeyOf(const IndexHandle &ix, const std::vector<storage::Value> &row_values,
                             const storage::Rid &rid, std::string *leaf_key)
   {
-    if (ix.column < 0 || static_cast<size_t>(ix.column) >= row_values.size())
+    // 逐列取值（按索引声明序）；任一列越界都视为无效行 → 不维护
+    std::vector<storage::Value> key_vals;
+    key_vals.reserve(ix.columns.size());
+    for (int col : ix.columns)
     {
-      return false;
+      if (col < 0 || static_cast<size_t>(col) >= row_values.size())
+      {
+        return false;
+      }
+      key_vals.push_back(row_values[static_cast<size_t>(col)]);
     }
     // NULL 也进索引（与编码约定一致：NULL 排在最前）。
-    // 唯一性由 IndexValueFree 单独判定（多个 NULL 允许共存）。
-    *leaf_key = storage::EncodeLeafKey(row_values[static_cast<size_t>(ix.column)], rid.page_id,
-                                       static_cast<uint8_t>(rid.slot_id));
+    // 唯一性由 IndexValueFree 单独判定（含 NULL 的元组不参与唯一判定）。
+    *leaf_key = storage::EncodeLeafKeyColumns(key_vals, rid.page_id,
+                                              static_cast<uint8_t>(rid.slot_id));
     return true;
   }
 
-  DbStatus Executor::IndexValueFree(const IndexHandle &ix, const storage::Value &v,
+  DbStatus Executor::IndexValueFree(const IndexHandle &ix,
+                                    const std::vector<storage::Value> &row_values,
                                     const storage::Rid &rid, bool *busy)
   {
     *busy = false;
-    if (!ix.meta->unique || v.IsNull())
+    if (!ix.meta->unique)
     {
-      return DbStatus::Ok();  // 非唯一索引 / NULL 一律放行
+      return DbStatus::Ok();  // 非唯一索引一律放行
     }
-    // 圈出「列值 == v」的等值区间：叶子键按列值编码排序，同一列值的所有行
-    // 在树上连续。边界用只含列值部分的键（hi 不包含 → include_hi=false 会同时
-    // 排除 hi，所以 hi 用 v 本身、include_hi=true 才是「含 v 的全部行」）。
-    const std::string probe = storage::EncodeLeafKey(v, 0, 0);
-    const std::string col_key = storage::StripLeafRowId(probe);
+    // 组装本索引的键值元组；任一列为 NULL → 不参与唯一判定（标准 SQL 语义：
+    // NULL 表示「未知」，两个未知不相等。PK 列隐含 NOT NULL，不受影响）。
+    std::vector<storage::Value> tuple;
+    tuple.reserve(ix.columns.size());
+    for (int col : ix.columns)
+    {
+      if (col < 0 || static_cast<size_t>(col) >= row_values.size())
+      {
+        return DbStatus::Ok();  // 无法定位 → 保守放行
+      }
+      const storage::Value &v = row_values[static_cast<size_t>(col)];
+      if (v.IsNull())
+      {
+        return DbStatus::Ok();  // 含 NULL 的元组不参与唯一判定
+      }
+      tuple.push_back(v);
+    }
+    // 圈出「元组 == tuple」的全部行：元组编码（位图 + 各列）是单射的，
+    // 同元组 ⇔ 字节前缀相同 → 用前缀扫描原语，完全不需要解码。
+    const std::string prefix = storage::EncodeColumnKeys(tuple);
     std::vector<std::string> hits;
-    const storage::Status ss = ix.tree->ScanRange(
-        &col_key, &col_key, /*include_hi=*/true,
+    const storage::Status ss = ix.tree->ScanPrefix(
+        prefix,
         [&](const std::string &leaf) -> bool
         {
           hits.push_back(leaf);
@@ -1291,17 +1388,8 @@ namespace cella::db
       {
         continue;
       }
-      storage::Value got;
-      if (!storage::DecodeLeafKeyColumn(leaf, ix.tree->key_spec().type, &got))
-      {
-        return DbStatus::Error(DbCode::kInternal,
-                               "唯一索引 " + ix.meta->name + " 中存在无法解码的键");
-      }
-      if (IndexValuesEqual(got, v))
-      {
-        *busy = true;
-        return DbStatus::Ok();
-      }
+      *busy = true;   // 前缀相同且 Rid 不同 → 同元组的另一行，冲突
+      return DbStatus::Ok();
     }
     return DbStatus::Ok();
   }
@@ -1317,9 +1405,8 @@ namespace cella::db
       {
         continue;
       }
-      const storage::Value &v = row_values[static_cast<size_t>(ix.column)];
       bool busy = false;
-      const DbStatus vs = IndexValueFree(ix, v, rid, &busy);
+      const DbStatus vs = IndexValueFree(ix, row_values, rid, &busy);
       if (!vs.ok())
       {
         return vs;
@@ -1327,11 +1414,11 @@ namespace cella::db
       if (busy)
       {
         ++index_stats_.violations;
-        const bool is_pk = (table.PrimaryKeyColumnIndex() == ix.column);
+        const bool is_pk = SameIdent(ix.meta->name, PrimaryIndexName(table.name));
         return DbStatus::Error(
             is_pk ? DbCode::kPrimaryKeyViolation : DbCode::kUniqueViolation,
-            std::string(is_pk ? "主键冲突: 列 " : "唯一索引冲突: 列 ") + table.columns[
-                static_cast<size_t>(ix.column)].name + " 的值已存在（表 " + table.name +
+            std::string(is_pk ? "主键冲突: 列 (" : "唯一索引冲突: 列 (") +
+                ix.meta->column + ") 的值已存在（表 " + table.name +
                 (is_pk ? "）" : "，索引 " + ix.meta->name + "）"));
       }
       bool dup = false;
@@ -1387,9 +1474,18 @@ namespace cella::db
       {
         continue;
       }
-      const size_t ci = static_cast<size_t>(ix.column);
-      const bool value_changed =
-          ci < before.size() && ci < after.size() && !IndexValuesEqual(before[ci], after[ci]);
+      // 复合适配：任一索引列的值变了 → 元组变了 → 需要 DELETE_INSERT
+      bool value_changed = false;
+      for (int col : ix.columns)
+      {
+        const size_t ci = static_cast<size_t>(col);
+        if (ci < before.size() && ci < after.size() &&
+            !IndexValuesEqual(before[ci], after[ci]))
+        {
+          value_changed = true;
+          break;
+        }
+      }
       const bool rid_changed =
           old_rid.page_id != new_rid.page_id || old_rid.slot_id != new_rid.slot_id;
       if (!value_changed && !rid_changed)
@@ -1426,17 +1522,27 @@ namespace cella::db
   {
     for (const IndexHandle &ix : indexes)
     {
-      const size_t ci = static_cast<size_t>(ix.column);
-      if (ci >= before.size() || ci >= after.size())
+      // 复合适配：任一索引列的值都没变 → 不可能产生新冲突，跳过
+      bool any_changed = false;
+      for (int col : ix.columns)
       {
-        continue;
+        const size_t ci = static_cast<size_t>(col);
+        if (ci >= before.size() || ci >= after.size())
+        {
+          continue;
+        }
+        if (!IndexValuesEqual(before[ci], after[ci]))
+        {
+          any_changed = true;
+          break;
+        }
       }
-      if (IndexValuesEqual(before[ci], after[ci]))
+      if (!any_changed)
       {
-        continue; // 该列值没变 → 不可能产生新冲突
+        continue; // 该索引的元组没变 → 不可能产生新冲突
       }
       bool busy = false;
-      const DbStatus vs = IndexValueFree(ix, after[ci], old_rid, &busy);
+      const DbStatus vs = IndexValueFree(ix, after, old_rid, &busy);
       if (!vs.ok())
       {
         return vs;
@@ -1444,11 +1550,11 @@ namespace cella::db
       if (busy)
       {
         ++index_stats_.violations;
-        const bool is_pk = (table.PrimaryKeyColumnIndex() == ix.column);
+        const bool is_pk = SameIdent(ix.meta->name, PrimaryIndexName(table.name));
         return DbStatus::Error(
             is_pk ? DbCode::kPrimaryKeyViolation : DbCode::kUniqueViolation,
-            std::string(is_pk ? "主键冲突: 更新后的 " : "唯一索引冲突: 更新后的 ") +
-                table.columns[ci].name + " 值与其它行重复（表 " + table.name +
+            std::string(is_pk ? "主键冲突: 更新后的 (" : "唯一索引冲突: 更新后的 (") +
+                ix.meta->column + ") 值与其它行重复（表 " + table.name +
                 (is_pk ? "）" : "，索引 " + ix.meta->name + "）"));
       }
     }
@@ -1619,7 +1725,20 @@ namespace cella::db
     case AccessPath::kIndexScan:
     {
       std::string how;
-      if (equality)
+      if (!eq_tuple.empty())
+      {
+        // 复合全键等值：逐列渲染 "a = 1 AND b = 'x'"
+        std::vector<std::string> cols = SplitIndexColumns(index_column);
+        for (size_t i = 0; i < eq_tuple.size() && i < cols.size(); ++i)
+        {
+          if (!how.empty())
+          {
+            how += " AND ";
+          }
+          how += cols[i] + " = " + RenderValue(eq_tuple[i]);
+        }
+      }
+      else if (equality)
       {
         how = "= " + RenderValue(lower);
       }
@@ -1828,6 +1947,106 @@ namespace cella::db
     return false;
   }
 
+  // ── 复合索引谓词下推（第一版：全键等值）─────────────────────
+  // 在 AND 谓词树里收集「列 = 字面量」约束（`常量 = 列` 经 FlipCompare 后
+  // 同样成立），要求索引的**每一列**都被约束到。缺任何一列（只约束了
+  // 前缀）→ 不下推，老老实实全表扫描 —— 部分前缀匹配是第二步扩展，
+  // 届时配合 ScanPrefix 的「列数 > 前缀列数」形态即可。
+  bool Executor::TryCompositeEquality(const CatalogTable &table, const CatalogIndex &index,
+                                      const std::vector<int> &columns,
+                                      const cella::CELLA_Expr *pred, AccessPathChoice *choice) const
+  {
+    (void)index;  // 元数据仅用于将来诊断输出；列信息由 columns 携带
+    if (pred == nullptr || columns.empty())
+    {
+      return false;
+    }
+    using Kind = cella::CELLA_Expr::Kind;
+    using B = cella::CELLA_Expr::BinOp;
+
+    // 递归收集 AND 树里的等值约束：键 = 列下标，值 = 已按列类型归一的字面量
+    std::map<int, storage::Value, std::less<int>> eqs;
+    // 递归遍历；返回 false 表示遇到无法处理的形状 → 整体放弃下推
+    std::function<bool(const cella::CELLA_Expr *)> collect =
+        [&](const cella::CELLA_Expr *e) -> bool
+    {
+      if (e == nullptr)
+      {
+        return true;  // 空子树：无约束但也不破坏形状
+      }
+      if (e->kind == Kind::BINARY && e->bop == B::AND)
+      {
+        return collect(e->left.get()) && collect(e->right.get());
+      }
+      if (e->kind != Kind::BINARY || e->bop != B::EQ)
+      {
+        // 非等值比较/其它形状：不下推也不拦截 —— 交给 Filter 兜底，
+        // 但它不能为复合索引提供等值约束
+        return true;
+      }
+      const cella::CELLA_Expr *col_side = nullptr;
+      const cella::CELLA_Expr *lit_side = nullptr;
+      if (e->left && e->left->kind == Kind::COLUMN_REF && e->right &&
+          e->right->kind == Kind::LITERAL)
+      {
+        col_side = e->left.get();
+        lit_side = e->right.get();
+      }
+      else if (e->right && e->right->kind == Kind::COLUMN_REF && e->left &&
+               e->left->kind == Kind::LITERAL)
+      {
+        col_side = e->right.get();
+        lit_side = e->left.get();
+      }
+      if (col_side == nullptr || lit_side == nullptr ||
+          lit_side->lit == cella::CELLA_LiteralKind::NULL_LIT)
+      {
+        return true;  // 不是 `列 = 字面量`：跳过（NULL 等值不可下推）
+      }
+      const int ci = table.ColumnIndex(col_side->column);
+      if (ci < 0)
+      {
+        return true;  // 其它表的列：跳过
+      }
+      storage::Value lit;
+      if (!LiteralToValue(*lit_side, &lit))
+      {
+        return true;
+      }
+      // 与 TryIndexRange 同理：字面量必须归一到**列声明类型**再编码
+      const CatalogColumn &cc = table.columns[static_cast<size_t>(ci)];
+      storage::Value coerced;
+      const DbStatus cs2 = CoerceValue(lit, cc.type, static_cast<uint16_t>(cc.len),
+                                       /*not_null=*/false, &coerced);
+      if (!cs2.ok())
+      {
+        return true;  // 类型不兼容 → 该约束作废（可能只剩 Filter 能过滤）
+      }
+      eqs[ci] = coerced;
+      return true;
+    };
+    if (!collect(pred))
+    {
+      return false;
+    }
+
+    // 每一列都有等值约束 → 全键等值成立；按索引声明序组装元组
+    std::vector<storage::Value> tuple;
+    tuple.reserve(columns.size());
+    for (int col : columns)
+    {
+      const auto it = eqs.find(col);
+      if (it == eqs.end())
+      {
+        return false;  // 缺一列 → 不是全键等值（最左前缀规则，暂不服务）
+      }
+      tuple.push_back(it->second);
+    }
+    choice->eq_tuple = std::move(tuple);
+    choice->equality = true;  // 代价模型按「等值定位」计费
+    return true;
+  }
+
   // 用索引的 min/max 估算范围选择率 = 区间宽度 / 值域宽度。
   //
   // 为什么可以这么做：B+ 树的叶子按列值编码有序，因此**第一个叶子键**就是
@@ -1842,7 +2061,13 @@ namespace cella::db
     {
       return 0.0;
     }
-    const storage::ValueType vt = tree->key_spec().type;
+    // 范围选择率只对单列数值索引有意义（复合索引第一版只做全键等值，
+    // 不会带着范围边界走到这里）
+    if (tree->key_spec().columns.empty())
+    {
+      return 0.0;
+    }
+    const storage::ValueType vt = tree->key_spec().columns[0].type;
     const bool numeric = (vt == storage::ValueType::kInt32 || vt == storage::ValueType::kInt64 ||
                           vt == storage::ValueType::kFloat || vt == storage::ValueType::kDouble);
     if (!numeric)
@@ -1974,8 +2199,23 @@ namespace cella::db
     {
       AccessPathChoice cand;
       cand.index_name = ix.meta->name;
+      // 展示用列名：逗号拼接（单列 = 原名）
       cand.index_column = ix.meta->column;
-      if (!TryIndexRange(table, *ix.meta, ix.column, pred, &cand))
+
+      // 最左前缀规则：复合索引第一版只支持「全键等值」——谓词为每一列都
+      // 提供 `列 = 常量` 时才下推（TryCompositeEquality）。
+      // 单列索引走既有的范围下推（等值/区间），保持历史行为逐字节不变。
+      bool pushed = false;
+      if (ix.columns.size() > 1)
+      {
+        pushed = TryCompositeEquality(table, *ix.meta, ix.columns, pred, &cand);
+      }
+      else
+      {
+        pushed = TryIndexRange(table, *ix.meta,
+                               ix.columns.empty() ? -1 : ix.columns[0], pred, &cand);
+      }
+      if (!pushed)
       {
         continue;  // 该索引下推不了这个谓词
       }
@@ -1987,8 +2227,8 @@ namespace cella::db
       // 条件 ③ 无法在表访问节点处可靠判断（上方算子的列需求在这里看不到），
       // 因此这里**只允许覆盖条件成立时使用 index-only**，其余一律回表 ——
       // 「多回一次表」只是慢一点，而「漏列」是错的。
-      const bool covering = !with_rowid && !PredRefsColumnOutside(pred, table, ix.column) &&
-                            !StmtNeedsOtherColumn(table.name, ix.column);
+      const bool covering = !with_rowid && !PredRefsColumnOutside(pred, table, ix.columns) &&
+                            !StmtNeedsOtherColumn(table.name, ix.columns);
       cand.path = covering ? AccessPath::kIndexOnlyScan : AccessPath::kIndexScan;
 
       // 范围选择率：拿索引首末叶子键当该列的 min/max（索引有序 → 免费统计）。
@@ -2046,7 +2286,7 @@ namespace cella::db
 
   // 谓词是否引用了「该索引列之外」的列（决定能否 index-only scan）
   bool Executor::PredRefsColumnOutside(const cella::CELLA_Expr *pred, const CatalogTable &table,
-                                       int index_column)
+                                       const std::vector<int> &index_columns)
   {
     if (pred == nullptr)
     {
@@ -2055,11 +2295,14 @@ namespace cella::db
     if (pred->kind == cella::CELLA_Expr::Kind::COLUMN_REF)
     {
       const int ci = table.ColumnIndex(pred->column);
-      return ci >= 0 && ci != index_column;  // 引用别的表列 → 必须回表
+      // 引用「索引列集合之外」的表列 → 必须回表（复合索引：集合内任一列都覆盖）
+      const bool inside =
+          std::find(index_columns.begin(), index_columns.end(), ci) != index_columns.end();
+      return ci >= 0 && !inside;
     }
-    return PredRefsColumnOutside(pred->left.get(), table, index_column) ||
-           PredRefsColumnOutside(pred->right.get(), table, index_column) ||
-           PredRefsColumnOutside(pred->child.get(), table, index_column);
+    return PredRefsColumnOutside(pred->left.get(), table, index_columns) ||
+           PredRefsColumnOutside(pred->right.get(), table, index_columns) ||
+           PredRefsColumnOutside(pred->child.get(), table, index_columns);
   }
 
   size_t Executor::CountTableRows(const CatalogTable &table)
@@ -2879,6 +3122,35 @@ namespace cella::db
     {
       return DbStatus::Error(DbCode::kInternal, "索引句柄无效");
     }
+    // ── 复合索引全键等值：前缀扫描原语 ──────────────────────
+    // eq_tuple 非空 = 谓词给每一列都提供了等值约束。把整条元组编码成
+    // 「NULL 位图 + 各列编码」的前缀，用 ScanPrefix 做字节前缀匹配 ——
+    // 元组编码是单射的，字节前缀相同 ⇔ 元组相同；也绕开了「VARCHAR 内容
+    // 可含 0xFF，排他上界凑不出来」的问题。
+    if (!choice.eq_tuple.empty())
+    {
+      const std::string prefix = storage::EncodeColumnKeys(choice.eq_tuple);
+      const storage::Status ss = ix.tree->ScanPrefix(
+          prefix,
+          [&](const std::string &leaf) -> bool
+          {
+            storage::page_id_t p = 0;
+            uint8_t s = 0;
+            if (storage::DecodeLeafKeyRid(leaf, &p, &s))
+            {
+              storage::Rid rid;
+              rid.page_id = p;
+              rid.slot_id = s;
+              out->push_back(rid);
+            }
+            return true;
+          });
+      if (!ss.ok())
+      {
+        return FromStorage(ss, "索引前缀扫描 " + ix.meta->name);
+      }
+      return DbStatus::Ok();
+    }
     std::string lo;
     std::string hi;
     const std::string *lo_p = nullptr;
@@ -3126,7 +3398,8 @@ namespace cella::db
     needed_cols_[cella::cella_toUpper(table)] = std::move(columns);
   }
 
-  bool Executor::StmtNeedsOtherColumn(const std::string &table, int index_column) const
+  bool Executor::StmtNeedsOtherColumn(const std::string &table,
+                                      const std::vector<int> &index_columns) const
   {
     const auto it = needed_cols_.find(cella::cella_toUpper(table));
     if (it == needed_cols_.end())
@@ -3142,9 +3415,12 @@ namespace cella::db
     for (const std::string &col : it->second)
     {
       const int ci = meta->ColumnIndex(col);
-      if (ci >= 0 && ci != index_column)
+      // 用到了「索引列集合之外」的列 → 必须回表（复合索引：集合内任一列都覆盖）
+      const bool inside =
+          std::find(index_columns.begin(), index_columns.end(), ci) != index_columns.end();
+      if (ci >= 0 && !inside)
       {
-        return true;  // 用到了索引列之外的列 → 必须回表
+        return true;
       }
     }
     return false;

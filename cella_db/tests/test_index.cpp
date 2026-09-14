@@ -261,3 +261,150 @@ MT_TEST(索引_SHOW_INDEXES_必须带列元数据) {
   // 每行的列数必须与表头一致
   MT_EQ(static_cast<int>(q.rows[0].size()), 5);
 }
+
+// ── 复合索引（多列 B+ 树）─────────────────────────────────────
+//
+// 覆盖：复合 CREATE INDEX 的元数据（逗号拼接列清单，行格式不变）、
+// 唯一复合索引的冲突判定、重启后恢复、复合主键自动索引的键序。
+
+MT_TEST(索引_复合索引建立与元数据) {
+  Engine e("ix_composite_meta");
+  MT_CHECK(e.opened);
+
+  ScriptReport r = e.Run(std::string(kBase) +
+                         "CREATE INDEX idx_dept_name ON emp (dept, name);");
+  MT_CHECK(r.all_ok());
+
+  // 元数据：列清单以逗号拼接落库（cella_index 行格式不变）
+  const CatalogIndex *ix = e.engine.catalog().FindIndex("idx_dept_name");
+  MT_CHECK(ix != nullptr);
+  MT_CHECK(ix != nullptr && ix->columns.size() == 2u);
+  MT_CHECK(ix != nullptr && ix->columns[0] == "dept");
+  MT_CHECK(ix != nullptr && ix->columns[1] == "name");
+  MT_CHECK(ix != nullptr && ix->column == "dept,name");
+  MT_CHECK(ix != nullptr && !ix->unique);
+
+  r = e.Run("SHOW INDEXES IN emp;");
+  MT_CHECK(r.all_ok());
+  // emp_pk + idx_dept_name
+  MT_EQ(static_cast<int>(r.statements[0].result.rows.size()), 2);
+  MT_CHECK(HasIndex(RowsText(r.statements[0].result), "idx_dept_name"));
+}
+
+MT_TEST(索引_复合唯一索引冲突与放行) {
+  Engine e("ix_composite_unique");
+  MT_CHECK(e.opened);
+
+  // (building, room_no) 组合唯一：同组合拒绝，单列重复但组合不同放行
+  ScriptReport r = e.Run(
+      "CREATE TABLE room (id INT PRIMARY KEY, building VARCHAR(8), room_no VARCHAR(8));"
+      "CREATE UNIQUE INDEX uq_loc ON room (building, room_no);"
+      "INSERT INTO room VALUES (1,'A','101');"
+      "INSERT INTO room VALUES (2,'A','102');");  // building 重复但组合不同 → OK
+  MT_CHECK(r.all_ok());
+
+  r = e.Run("INSERT INTO room VALUES (3,'A','101');");
+  MT_CHECK(!r.all_ok());
+  MT_EQ(static_cast<int>(r.statements[0].status.code()),
+        static_cast<int>(DbCode::kUniqueViolation));
+
+  // 删除后组合键可重用（索引同步维护）
+  MT_CHECK(e.Run("DELETE in room limit id = 1;").all_ok());
+  MT_CHECK(e.Run("INSERT INTO room VALUES (4,'A','101');").all_ok());
+}
+
+MT_TEST(索引_复合唯一索引回填拒绝存量重复) {
+  Engine e("ix_composite_backfill");
+  MT_CHECK(e.opened);
+
+  // 先插数据再建唯一复合索引：存在重复组合 → 建索引失败
+  // 语句下标：0 建表 / 1 插入 / 2 插入（重复组合，无约束时合法）/ 3 建唯一索引
+  ScriptReport r = e.Run(
+      "CREATE TABLE t (a INT, b VARCHAR(8));"
+      "INSERT INTO t VALUES (1,'x');"
+      "INSERT INTO t VALUES (1,'x');"
+      "CREATE UNIQUE INDEX uq_ab ON t (a, b);");
+  MT_CHECK(!r.all_ok());
+  MT_EQ(static_cast<int>(r.statements[3].status.code()),
+        static_cast<int>(DbCode::kIndexExists));
+
+  // 改成普通索引则允许（非唯一索引不做查重）
+  MT_CHECK(e.Run("CREATE INDEX idx_ab ON t (a, b);").all_ok());
+}
+
+MT_TEST(索引_复合索引重启恢复与维护) {
+  Engine e("ix_composite_reopen");
+  MT_CHECK(e.opened);
+
+  ScriptReport r = e.Run(
+      "CREATE TABLE ord (a INT, b VARCHAR(8), v INT);"
+      "CREATE INDEX idx_ab ON ord (a, b);"
+      "INSERT INTO ord VALUES (1,'x',10);"
+      "INSERT INTO ord VALUES (1,'y',20);"
+      "INSERT INTO ord VALUES (2,'x',30);");
+  MT_CHECK(r.all_ok());
+
+  // 全键等值走复合索引（两列都有等值条件 → 前缀扫描）
+  r = e.Run("GET v IN ord limit a = 1 and b = 'y';");
+  MT_CHECK(r.all_ok());
+  MT_EQ(RowsText(r.statements[0].result), std::string("20"));
+
+  // 重启：索引元数据与树一起恢复，等值查找仍正确
+  e.Close();
+  MT_CHECK(e.Reopen());
+  r = e.Run("GET v IN ord limit a = 2 and b = 'x';");
+  MT_CHECK(r.all_ok());
+  MT_EQ(RowsText(r.statements[0].result), std::string("30"));
+  // 更新后索引同步（删旧键 + 插新键）
+  MT_CHECK(e.Run("UPDATE ord SET b = 'z' limit a = 1 and b = 'y';").all_ok());
+  r = e.Run("GET v IN ord limit a = 1 and b = 'z';");
+  MT_CHECK(r.all_ok());
+  MT_EQ(RowsText(r.statements[0].result), std::string("20"));
+}
+
+MT_TEST(索引_复合主键自动索引按声明序) {
+  Engine e("ix_composite_pk");
+  MT_CHECK(e.opened);
+
+  ScriptReport r = e.Run(
+      "CREATE TABLE sc (sid INT, cid INT, grade FLOAT, PRIMARY KEY (sid, cid));"
+      "INSERT INTO sc VALUES (1,10,88.0);"
+      "INSERT INTO sc VALUES (1,11,90.0);");
+  MT_CHECK(r.all_ok());
+
+  // 自动索引存在、唯一、列序 = 声明序
+  const CatalogIndex *ix = e.engine.catalog().FindIndex("sc_pk");
+  MT_CHECK(ix != nullptr);
+  MT_CHECK(ix != nullptr && ix->unique);
+  MT_CHECK(ix != nullptr && ix->columns.size() == 2u);
+  MT_CHECK(ix != nullptr && ix->columns[0] == "sid" && ix->columns[1] == "cid");
+
+  // 组合重复 → 主键冲突（由复合索引判定）
+  r = e.Run("INSERT INTO sc VALUES (1,10,50.0);");
+  MT_CHECK(!r.all_ok());
+  MT_EQ(static_cast<int>(r.statements[0].status.code()),
+        static_cast<int>(DbCode::kPrimaryKeyViolation));
+
+  // 全键等值命中复合主键索引
+  r = e.Run("GET grade IN sc limit sid = 1 and cid = 11;");
+  MT_CHECK(r.all_ok());
+  MT_EQ(RowsText(r.statements[0].result), std::string("90"));
+}
+
+MT_TEST(索引_复合索引缺前缀列退回全表扫描) {
+  Engine e("ix_composite_prefix");
+  MT_CHECK(e.opened);
+
+  ScriptReport r = e.Run(
+      "CREATE TABLE m (a INT, b INT, v INT);"
+      "CREATE INDEX idx_ab ON m (a, b);"
+      "INSERT INTO m VALUES (1,1,10);"
+      "INSERT INTO m VALUES (1,2,20);"
+      "INSERT INTO m VALUES (2,1,30);");
+  MT_CHECK(r.all_ok());
+
+  // 只约束第二列 b（非最左前缀）→ 不下推，交给 Filter（结果必须仍正确）
+  r = e.Run("GET v IN m limit b = 1;");
+  MT_CHECK(r.all_ok());
+  MT_EQ(RowsText(r.statements[0].result), std::string("10\n30"));
+}
