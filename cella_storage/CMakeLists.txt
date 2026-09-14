@@ -39,6 +39,8 @@ add_library(cella_storage STATIC
   src/cella/storage/buffer/replacer_factory.cpp
   src/cella/storage/buffer/buffer_pool_manager.cpp
   src/cella/storage/record/slotted_record_serializer.cpp
+  src/cella/storage/index/index_key.cpp
+  src/cella/storage/index/b_plus_tree.cpp
   src/cella/storage/table/table_heap.cpp
   src/cella/storage/table/table_iterator.cpp
   src/cella/storage/api/file_storage.cpp
@@ -62,6 +64,7 @@ add_executable(storage_tests
   tests/test_buffer.cpp
   tests/test_record_table.cpp
   tests/test_persistence.cpp
+  tests/test_index.cpp
   tests/test_examples.cpp
 )
 target_include_directories(storage_tests PRIVATE
@@ -89,6 +92,15 @@ target_compile_definitions(storage_tests PRIVATE
 # ── demo ───────────────────────────────────────────────────
 add_executable(storage_demo demo/storage_demo.cpp)
 target_link_libraries(storage_demo PRIVATE cella_storage)
+
+# ── 诊断程序（白盒，访问内部头）──────────────────────────────
+add_executable(bptree_diag diag/bptree_diag.cpp)
+target_include_directories(bptree_diag PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(bptree_diag PRIVATE cella_storage)
+
+add_executable(bptree_diag2 diag/bptree_diag2.cpp)
+target_include_directories(bptree_diag2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(bptree_diag2 PRIVATE cella_storage)
 
 enable_testing()
 add_test(NAME storage_tests COMMAND storage_tests)

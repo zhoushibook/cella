@@ -590,6 +590,77 @@ namespace cella
             return true;
         }
 
+        bool semCreateIndex(const CELLA_Stmt &st, CELLA_Catalog &cat, int idx, CELLA_SemanticResult &res)
+        {
+            const CELLA_Table *table = cat.findTable(st.tableName);
+            if (!table)
+            {
+                res.errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-301", st.line, st.col,
+                                                     "表 \"" + st.tableName + "\" 不存在"));
+                return false;
+            }
+            if (!CELLA_Catalog::findColumn(*table, st.indexColumn))
+            {
+                res.errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-303", st.line, st.col,
+                                                     "列 \"" + st.indexColumn + "\" 不存在于表 \"" +
+                                                         st.tableName + "\""));
+                return false;
+            }
+            for (const auto &t : cat.allTables())
+            {
+                for (const auto &ex : t.second.indexes)
+                {
+                    if (cella_toUpper(ex.name) == cella_toUpper(st.indexName))
+                    {
+                        res.errors.push_back(cella_makeError(
+                            CELLA_Phase::SEM, "SEM-315", st.line, st.col,
+                            "索引 \"" + st.indexName + "\" 已存在于表 \"" + t.second.name + "\""));
+                        return false;
+                    }
+                }
+            }
+            CELLA_Index index;
+            index.name = st.indexName;
+            index.table = st.tableName;
+            index.column = st.indexColumn;
+            index.unique = st.unique;
+            cat.addIndex(st.tableName, std::move(index));
+            res.okMessages.push_back("[语义] OK: 语句#" + std::to_string(idx) + " CREATE " +
+                                     std::string(st.unique ? "UNIQUE " : "") + "INDEX " + st.indexName +
+                                     " ON " + st.tableName + "(" + st.indexColumn + ")");
+            return true;
+        }
+
+        bool semDropIndex(const CELLA_Stmt &st, CELLA_Catalog &cat, int idx, CELLA_SemanticResult &res)
+        {
+            const CELLA_Table *owner = nullptr;
+            std::string ownerName;
+            for (const auto &t : cat.allTables())
+            {
+                for (const auto &ex : t.second.indexes)
+                {
+                    if (cella_toUpper(ex.name) == cella_toUpper(st.indexName))
+                    {
+                        owner = &t.second;
+                        ownerName = t.second.name;
+                        break;
+                    }
+                }
+                if (owner)
+                    break;
+            }
+            if (!owner)
+            {
+                res.errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-316", st.line, st.col,
+                                                     "索引 \"" + st.indexName + "\" 不存在"));
+                return false;
+            }
+            const std::string tname = ownerName;
+            cat.dropIndex(tname, st.indexName);
+            res.okMessages.push_back("[语义] OK: 语句#" + std::to_string(idx) + " DROP INDEX " + st.indexName);
+            return true;
+        }
+
         bool semInsert(const CELLA_Stmt &st, CELLA_Catalog &cat, int idx, CELLA_SemanticResult &res)
         {
             const CELLA_Table *table = cat.findTable(st.tableName);
@@ -817,6 +888,10 @@ namespace cella
                 return semCreateTable(st, cat, idx, res);
             case CELLA_Stmt::Kind::DROP_TABLE:
                 return semDropTable(st, cat, idx, res);
+            case CELLA_Stmt::Kind::CREATE_INDEX:
+                return semCreateIndex(st, cat, idx, res);
+            case CELLA_Stmt::Kind::DROP_INDEX:
+                return semDropIndex(st, cat, idx, res);
             case CELLA_Stmt::Kind::INSERT:
                 return semInsert(st, cat, idx, res);
             case CELLA_Stmt::Kind::DELETE:

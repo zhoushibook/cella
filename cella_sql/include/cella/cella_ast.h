@@ -164,7 +164,9 @@ namespace cella
             GET,
             DELETE,
             UPDATE,
-            DROP_TABLE
+            DROP_TABLE,
+            CREATE_INDEX,
+            DROP_INDEX
         };
 
         Kind kind = Kind::CREATE_TABLE;
@@ -201,6 +203,11 @@ namespace cella
 
         // DELETE / UPDATE 共用
         std::unique_ptr<CELLA_Expr> where;
+
+        // CREATE INDEX / DROP INDEX
+        std::string indexName;   // 索引名（原始拼写）
+        bool unique = false;     // CREATE UNIQUE INDEX 标志
+        std::string indexColumn; // 被索引的列名（单列索引）
     };
 
     struct CELLA_Program

@@ -86,6 +86,9 @@ class Executor {
   DbStatus ExecCreateTable(const cella::CELLA_PlanNode& plan, const ExecContext& ctx,
                            QueryResult* out);
   DbStatus ExecDropTable(const cella::CELLA_PlanNode& plan, const ExecContext& ctx, QueryResult* out);
+  DbStatus ExecCreateIndex(const cella::CELLA_PlanNode& plan, const ExecContext& ctx,
+                           QueryResult* out);
+  DbStatus ExecDropIndex(const cella::CELLA_PlanNode& plan, const ExecContext& ctx, QueryResult* out);
   DbStatus ExecInsert(const cella::CELLA_PlanNode& plan, const ExecContext& ctx, QueryResult* out);
   DbStatus ExecDelete(const cella::CELLA_PlanNode& plan, const ExecContext& ctx, QueryResult* out);
   DbStatus ExecUpdate(const cella::CELLA_PlanNode& plan, const ExecContext& ctx, QueryResult* out);

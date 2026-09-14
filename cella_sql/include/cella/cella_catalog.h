@@ -59,10 +59,20 @@ namespace cella
         bool notNull = false;
     };
 
+    // 二级索引（P1.2）：语义层的轻量登记，真实元数据落在 cella_db 的 cella_index 系统表
+    struct CELLA_Index
+    {
+        std::string name;   // 索引名（原始拼写）
+        std::string table;  // 所属表
+        std::string column; // 索引列（单列）
+        bool unique = false;
+    };
+
     struct CELLA_Table
     {
         std::string name; // 原始拼写
         std::vector<CELLA_Column> columns;
+        std::vector<CELLA_Index> indexes;
     };
 
     // 目录：表名/列名比较不区分大小写（内部以大写为键）
@@ -103,6 +113,41 @@ namespace cella
         }
 
         bool dropTable(const std::string &name) { return tables.erase(cella_toUpper(name)) > 0; }
+
+        // 只读遍历（语义层用于全局索引名查重 / 反查所属表）
+        const std::map<std::string, CELLA_Table> &allTables() const { return tables; }
+
+        bool addIndex(const std::string &table, CELLA_Index index)
+        {
+            CELLA_Table *t = findTable(table);
+            if (!t)
+                return false;
+            std::string key = cella_toUpper(index.name);
+            for (const auto &ex : t->indexes)
+            {
+                if (cella_toUpper(ex.name) == key)
+                    return false;
+            }
+            t->indexes.push_back(std::move(index));
+            return true;
+        }
+
+        bool dropIndex(const std::string &table, const std::string &index)
+        {
+            CELLA_Table *t = findTable(table);
+            if (!t)
+                return false;
+            std::string key = cella_toUpper(index);
+            for (auto it = t->indexes.begin(); it != t->indexes.end(); ++it)
+            {
+                if (cella_toUpper(it->name) == key)
+                {
+                    t->indexes.erase(it);
+                    return true;
+                }
+            }
+            return false;
+        }
     };
 
 } // namespace cella

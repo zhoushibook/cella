@@ -42,14 +42,25 @@ $ninjaDir = Join-Path $vsRoot "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninj
 
 if (-not (Test-Path $BuildDir)) { New-Item -ItemType Directory -Path $BuildDir | Out-Null }
 
-# Normalize PATH env-var casing: some managed environments inject a lowercase
-# "path", which makes Enter-VsDevShell throw "duplicate key Path/PATH" and
-# Start-Process fail ("An item with the same key has already been added").
-# Removing and re-adding with canonical casing fixes both.
-$procPath = [Environment]::GetEnvironmentVariable('path', 'Process')
-if ($null -ne $procPath) {
-    [Environment]::SetEnvironmentVariable('path', $null, 'Process')
-    [Environment]::SetEnvironmentVariable('Path', $procPath, 'Process')
+# Normalize env-var casing: some managed environments inject lower/upper-case
+# duplicates of the same key (e.g. "path"+"Path", "http_proxy"+"HTTP_PROXY"),
+# which makes Enter-VsDevShell throw "an item with the same key has already
+# been added" and Start-Process fail. Removing and re-adding with canonical
+# casing fixes it. Enumerating the process block sees both variants, so we
+# dedupe by canonical (uppercase) name, preferring the first value found.
+$canonicalNames = [ordered]@{}
+foreach ($entry in [Environment]::GetEnvironmentVariables('Process').GetEnumerator()) {
+    $canon = $entry.Key.ToUpperInvariant()
+    if (-not $canonicalNames.Contains($canon)) {
+        $canonicalNames[$canon] = $entry.Value
+    }
+}
+$allProcessNames = @([Environment]::GetEnvironmentVariables('Process').Keys)
+foreach ($name in $allProcessNames) {
+    [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+}
+foreach ($canon in $canonicalNames.Keys) {
+    [Environment]::SetEnvironmentVariable($canon, $canonicalNames[$canon], 'Process')
 }
 
 Import-Module $devShell

@@ -93,7 +93,9 @@ namespace cella
         TEXT,
         DATE,
         TIME,
-        DATETIME
+        DATETIME,
+        INDEX,   // CREATE INDEX / DROP INDEX
+        UNIQUE   // CREATE UNIQUE INDEX
     };
 
     // 内部别名：防止后续头文件再次定义 NULL 宏导致使用处被展开
@@ -221,6 +223,10 @@ namespace cella
             return "TIME";
         case CELLA_Keyword::DATETIME:
             return "DATETIME";
+        case CELLA_Keyword::INDEX:
+            return "INDEX";
+        case CELLA_Keyword::UNIQUE:
+            return "UNIQUE";
         }
         return "";
     }
@@ -280,6 +286,8 @@ namespace cella
             {"DATE", CELLA_Keyword::DATE},
             {"TIME", CELLA_Keyword::TIME},
             {"DATETIME", CELLA_Keyword::DATETIME},
+            {"INDEX", CELLA_Keyword::INDEX},
+            {"UNIQUE", CELLA_Keyword::UNIQUE},
         };
         auto it = table.find(cella_toUpper(lexeme));
         return it == table.end() ? CELLA_Keyword::NONE : it->second;

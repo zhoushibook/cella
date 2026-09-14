@@ -331,6 +331,16 @@ namespace cella
                 os << indent(level) << "DropTableStmt @" << st.line << ":" << st.col
                    << "  table=" << st.tableName << "\n";
                 break;
+            case CELLA_Stmt::Kind::CREATE_INDEX:
+                os << indent(level) << "CreateIndexStmt @" << st.line << ":" << st.col
+                   << "  name=" << st.indexName << "  table=" << st.tableName
+                   << "  column=" << st.indexColumn
+                   << "  unique=" << (st.unique ? "true" : "false") << "\n";
+                break;
+            case CELLA_Stmt::Kind::DROP_INDEX:
+                os << indent(level) << "DropIndexStmt @" << st.line << ":" << st.col
+                   << "  name=" << st.indexName << "\n";
+                break;
             }
         }
 

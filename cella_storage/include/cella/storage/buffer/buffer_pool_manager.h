@@ -63,6 +63,9 @@ class BufferPoolManager {
   void LogStats();                             // 输出 [INFO][STATS] 行
   const std::deque<std::string>& recent_evictions() const { return eviction_log_; }
 
+  // 页大小（字节）。索引层按它计算每页可容纳的键数。
+  uint32_t page_size() const { return frames_.empty() ? 0u : frames_[0].page.page_size(); }
+
  private:
   // 一个帧 = 一个内存槽。装的是某页数据的副本。
   struct Frame {
