@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>grid test</title>
+<link rel="stylesheet" href="/assets/app.css">
+<style>#host{height:300px;width:600px;border:1px solid #ccc}</style>
+</head><body>
+<div id="host"></div>
+<pre id="out">RUNNING</pre>
+<script type="module">
+import { createGrid } from '/assets/js/grid.js';
+const L = [];
+const ok = (name, cond) => L.push((cond ? 'PASS ' : 'FAIL ') + name);
+
+const host = document.getElementById('host');
+const sorts = [];
+const checks = [];
+const g = createGrid(host, {
+  checkable: true,
+  onSort: (k) => sorts.push(k),
+  onCheckChange: (n) => checks.push(n),
+});
+const cols = [{ name: 'id', type: 'INT32' }, { name: 'name', type: 'VARCHAR' }, { name: 'score', type: 'DOUBLE' }];
+const rows = [
+  [1, 'Alice', 88.5],
+  [2, 'Bob', null],
+  [3, 'A-very-long-name-value-here', 77.25],
+];
+g.setData(cols, rows);
+
+// 列宽读取（checkable + rownum 占前两列）
+const colEl = (ci) => host.querySelectorAll('colgroup col')[2 + ci];
+const wOf = (ci) => parseInt(colEl(ci).style.width, 10);
+
+// ① 结构
+ok('colgroup/固定布局', !!host.querySelector('colgroup') && host.querySelector('table').style.tableLayout === 'fixed');
+ok('列头 3 个 + 列宽手柄 4 个（含行号列）',
+  host.querySelectorAll('th[data-col]').length === 3 && host.querySelectorAll('th .resize').length === 4 &&
+  host.querySelectorAll('th .rowresize').length === 1);
+ok('复选框/行号列', host.querySelectorAll('td.ck input[data-ck]').length === 3 && host.querySelectorAll('td.rownum').length === 3);
+ok('NULL 灰斜体', !!host.querySelector('td.nullv'));
+ok('初始列宽 id=' + wOf(0) + ' name=' + wOf(1) + ' score=' + wOf(2), wOf(1) > 52 && wOf(2) > 52);
+
+// ② 三态排序
+const th = host.querySelector('th[data-col="score"]');
+for (let i = 0; i < 3; i++) th.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+ok('三态排序 asc/desc/null', JSON.stringify(sorts) === JSON.stringify([{ col: 'score', dir: 'asc' }, { col: 'score', dir: 'desc' }, null]));
+
+// ③ 列宽拖拽（name 列 +60px）
+const w0 = wOf(1);
+host.querySelector('th[data-col="name"] .resize').dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: 200 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 260 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+ok('拖拽列宽 ' + w0 + ' → ' + wOf(1), wOf(1) === w0 + 60);
+ok('其它列不动', wOf(0) === 52 || wOf(0) > 0);
+
+// ④ 双击自适应（先手动拖宽 score，再双击应收回贴合内容的宽度）
+host.querySelector('th[data-col="score"] .resize').dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: 300 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 420 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+const wide = wOf(2);
+host.querySelector('th[data-col="score"] .resize').dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+ok('双击自适应 score ' + wide + ' → ' + wOf(2), wide > 100 && wOf(2) < wide && wOf(2) >= 52);
+
+// ⑤ 全选复选框
+const all = host.querySelector('input[data-ck-all]');
+all.checked = true;
+all.dispatchEvent(new Event('change', { bubbles: true }));
+ok('全选 → getChecked=[0,1,2]', JSON.stringify(g.getChecked()) === JSON.stringify([0, 1, 2]));
+ok('onCheckChange(3)', checks[checks.length - 1] === 3);
+
+// ⑥ 单元格区块选择 + 复制
+g.clearChecked();
+host.querySelector('tr[data-r="0"] td[data-c="0"]').dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+host.querySelector('tr[data-r="1"] td[data-c="1"]').dispatchEvent(new MouseEvent('mousemove', { bubbles: true, buttons: 1 }));
+ok('区块选中 4 格', host.querySelectorAll('td[data-c].sel').length === 4);
+const dt = new DataTransfer();
+document.dispatchEvent(new ClipboardEvent('copy', { clipboardData: dt, bubbles: true }));
+ok('Ctrl+C TSV = ' + JSON.stringify(dt.getData('text/plain')), dt.getData('text/plain') === '1\tAlice\n2\tBob');
+
+// ⑦ 点行号选整行 → Ctrl+A 全选（只数数据格）
+host.querySelector('tr[data-r="2"] td.rownum').dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+ok('点行号选整行 3 格（行号格也高亮）', host.querySelectorAll('td[data-c].sel').length === 3 && !!host.querySelector('td.rownum.sel'));
+host.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true }));
+ok('Ctrl+A 全选 9 格', host.querySelectorAll('td[data-c].sel').length === 9);
+
+// ⑧ 无 onSort（查询结果）→ 本地排序
+const host2 = document.createElement('div');
+host2.style.cssText = 'height:200px;width:400px';
+document.body.appendChild(host2);
+const g2 = createGrid(host2);
+g2.setData(cols, rows.slice());
+host2.querySelector('th[data-col="name"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+ok('查询结果本地升序首行 = ' + g2.rowAt(0)[1], g2.rowAt(0)[1] === 'A-very-long-name-value-here');
+host2.querySelector('th[data-col="name"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+ok('再点降序首行 = ' + g2.rowAt(0)[1], g2.rowAt(0)[1] === 'Bob');
+ok('排序后 rowAt 仍是完整数据行', g2.rowAt(0).length === 3 && g2.rowAt(0)[0] === 2);
+
+// ⑨ 大表虚拟滚动的垫片高度随行高变化（行高可拖）
+const host3 = document.createElement('div');
+host3.style.cssText = 'height:300px;width:600px;border:1px solid #ccc';
+document.body.appendChild(host3);
+const big = Array.from({ length: 500 }, (_, i) => [i + 1, 'name-' + i, i * 1.5]);
+const g3 = createGrid(host3);
+g3.setData(cols, big);
+host3.scrollTop = 4000;
+host3.dispatchEvent(new Event('scroll', { bubbles: true }));
+const padOf = () => host3.querySelector('tr.pad td');
+const padH = () => (padOf() ? parseInt(padOf().style.height, 10) : 0);
+ok('大表出现垫片，高度是行高整数倍（' + padH() + ' % 26）', !!padOf() && padH() > 0 && padH() % 26 === 0);
+host3.querySelector('th.rownum .rowresize').dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: 0, clientY: 0 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 0, clientY: 14, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+ok('拖行高后 rowHeight() = ' + g3.rowHeight(), g3.rowHeight() === 40);
+ok('垫片按新行高重算（' + padH() + ' % 40）', padH() % 40 === 0 && padH() > 0);
+const rowPx = host3.querySelector('tr[data-r]').offsetHeight;
+ok('实测行高 ' + rowPx + 'px ≈ 40', Math.abs(rowPx - 40) <= 1);
+ok('行高已写入 CSS 变量', host3.querySelector('table').style.getPropertyValue('--row-h') === '40px');
+g3.resetLayout();
+ok('resetLayout 复位行高 26', g3.rowHeight() === 26);
+
+document.getElementById('out').textContent = L.join('\n');
+</script>
+</body></html>

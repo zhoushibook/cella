@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>panels parser test</title>
+<link rel="stylesheet" href="/assets/app.css">
+<style>#host{border:1px solid #ccc;padding:8px}</style>
+</head><body>
+<div id="host"></div>
+<pre id="out">RUNNING</pre>
+<script type="module">
+import { parseStats, parseLocks, parseWaitFor, parseTxns, parsePlanTree, initBottomPanel } from '/assets/js/panels.js';
+const L = [];
+const ok = (n, c) => L.push((c ? 'PASS ' : 'FAIL ') + n);
+
+// ① 缓冲池：真实文本（从 /api/diagnostics/stats 抓的）
+const statsText = '  accesses     : 16\n  hits         : 15\n  misses       : 1\n  hit_rate     : 93.75%\n' +
+  '  evictions    : 0\n  dirty_flush  : 0\n  disk_reads   : 2\n  disk_writes  : 0\n' +
+  '  page_allocs  : 0\n  page_frees   : 0\n替换策略: LRU / 缓冲池帧数: 64 / 页大小: 4096\n';
+const st = parseStats(statsText);
+ok('stats 计数项解析 ' + st.counters.length, st.counters.length === 10);
+ok('stats 命中率 ' + st.hitRate, st.hitRate === 93.75);
+ok('stats 配置行 ' + JSON.stringify(st.config),
+  st.config.replacer === 'LRU' && st.config.poolSize === 64 && st.config.pageSize === 4096);
+const st2 = parseStats('  hits : 1\n替换策略: CLOCK / 缓冲池帧数: 8 / 页大小: 4096 / 存盘点 3 次（上方为累计值）\n');
+ok('stats 存盘点次数 ' + st2.checkpoints, st2.checkpoints === 3);
+const st3 = parseStats('  accesses : 5\n最近淘汰(2 条):\n  txn=1 淘汰页 3\n  淘汰页 4\n');
+ok('stats 淘汰明细 ' + st3.evictions.length, st3.evictions.length === 2);
+
+// ② 锁表：真实空文本 + 合成非空
+ok('locks 空表', parseLocks('锁表（资源 = 持有者 / 等待者）:\n  (空)\n').length === 0);
+const lk = parseLocks('锁表（资源 = 持有者 / 等待者）:\n' +
+  '  main.student : [X txn=7][S txn=8][S txn=9] 等待: 10,11\n  main.score : [S txn=8] 等待: 9\n');
+ok('locks 行数 ' + lk.length, lk.length === 2);
+ok('locks X/S 与等待者 ' + JSON.stringify(lk[0]),
+  lk[0].resource === 'main.student' && lk[0].exclusive === 7 && lk[0].shared.join(',') === '8,9' && lk[0].waiters.join(',') === '10,11');
+
+// ③ 等待图：空 + 合成环（死锁高亮）
+ok('waitfor 无等待', parseWaitFor('等待图（txn -> 阻塞它的 txn）:\n  (无等待)\n').edges.length === 0);
+const wf = parseWaitFor('等待图（txn -> 阻塞它的 txn）:\n' +
+  '  1 -> 2   [X main.t]\n  2 -> 1   [X main.u]\n  3 -> 4   [S main.v]\n');
+ok('waitfor 边解析 ' + JSON.stringify(wf.edges[0]),
+  wf.edges.length === 3 && wf.edges[0].txn === 1 && wf.edges[0].blockers[0] === 2 &&
+  wf.edges[0].mode === 'X' && wf.edges[0].resource === 'main.t');
+ok('waitfor 环检测只标环上事务 ' + JSON.stringify(wf.onCycle),
+  wf.onCycle.sort().join(',') === '1,2');
+
+// ④ 事务表：真实文本
+const txnText = '事务表（共 7 个，活动 0）:\n' +
+  '  txn=1 状态=COMMITTED 语句数=1 undo=0 涉及表=[cella_catalog]\n' +
+  '  txn=7 状态=ACTIVE 语句数=3 undo=2 涉及表=[main.student, main.score]\n' +
+  '已提交 6 / 已回滚 1\n';
+const tx = parseTxns(txnText);
+ok('txn 汇总 ' + JSON.stringify({ t: tx.total, a: tx.active, c: tx.committed, ab: tx.aborted }),
+  tx.total === 7 && tx.active === 0 && tx.committed === 6 && tx.aborted === 1);
+ok('txn 明细（含多表与中文分隔）', tx.txns.length === 2 &&
+  tx.txns[1].state === 'ACTIVE' && tx.txns[1].undo === 2 && tx.txns[1].tables.length === 2);
+
+// ⑤ 计划树
+const tree = parsePlanTree('Sort (name ASC)\n  Project [id, name]\n    Filter (score > 80)\n      SeqScan [student]\n');
+ok('plan 树深度 ' + JSON.stringify(tree.map((n) => n.depth)), JSON.stringify(tree.map((n) => n.depth)) === '[0,1,2,3]');
+ok('plan 树文本', tree[3].text === 'SeqScan [student]');
+ok('plan 空文本', parsePlanTree('').length === 0);
+
+// ⑥ 渲染层：诊断面板能真的画出来（DOM 断言）
+document.body.insertAdjacentHTML('beforeend',
+  '<footer id="statusbar"><span id="stMsgs"></span><span id="stPlan"></span><span id="stDiag"></span></footer>' +
+  '<div id="bottomPanel" class="bottompanel hidden"><div class="bottomhead"><span id="bpTitle"></span>' +
+  '<button id="bpClose"></button></div><div id="bpBody"></div></div>');
+const panel = initBottomPanel();
+panel.show('plan', { before: 'Sort (a ASC)\n  SeqScan [t]\n', after: 'Sort (a ASC)\n  SeqScan [t]\n', elapsedMs: 1.5 });
+const host = document.getElementById('bpBody');
+ok('计划视图渲染算子树 + 耗时', host.querySelectorAll('.planrow').length === 4 && host.textContent.includes('编译耗时'));
+panel.show('messages', [{ ok: false, code: 'SEM-201', message: '表不存在', loc: '行 2:8' }]);
+ok('消息区渲染', host.querySelectorAll('.msgitem').length === 1);
+
+document.getElementById('out').textContent = L.join('\n');
+</script>
+</body></html>

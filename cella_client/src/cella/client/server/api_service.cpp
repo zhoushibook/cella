@@ -9,6 +9,7 @@
 #include "cella/client/server/api_service.h"
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <random>
 
@@ -652,7 +653,10 @@ namespace cella::client
     }
     std::lock_guard<std::recursive_mutex> lk(gate_);
     ScriptReport report;
+    const auto t0 = std::chrono::steady_clock::now();
     (void)RequestSession().CompileOnly(sql, &report);
+    const double compile_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     JsonValue stmts = JsonValue::Arr();
     std::int64_t index = 0;
     for (const auto &s : report.statements)
@@ -673,6 +677,7 @@ namespace cella::client
     }
     JsonValue data = JsonValue::Obj();
     data.Set("statements", std::move(stmts));
+    data.Set("elapsedMs", JsonValue::Real(compile_ms)); // 编译（含优化）耗时
     return OkResponse(std::move(data));
   }
 

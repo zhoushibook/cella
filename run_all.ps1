@@ -85,6 +85,15 @@ if (-not $SkipBuild) {
 }
 
 # ------------------------------------------- 2. compiler regression (原编译器)
+# run_tests.ps1 优先用 cella_sql/build 下的 exe（独立构建的默认位置），聚合构建的产物在
+# build/cella_sql/ 下。先把新产物同步过去：否则本地残留的旧 exe 会遮蔽刚构建的结果，
+# 表现为莫名其妙的一批用例失败（曾因此误判掉 4 个新增的索引用例）。
+$sqlExe = Join-Path $BuildDir "cella_sql\cella_sql.exe"
+$sqlExeLocal = Join-Path $Root "cella_sql\build\cella_sql.exe"
+if (Test-Path $sqlExe) {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $sqlExeLocal) | Out-Null
+    Copy-Item $sqlExe $sqlExeLocal -Force
+}
 $sqlOut = [string](& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root "cella_sql\tests\run_tests.ps1") 2>&1 | Out-String)
 $code = $LASTEXITCODE
 $sum = PassFail (LastLine $sqlOut "==========")

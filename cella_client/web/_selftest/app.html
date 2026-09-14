@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>app integration selftest</title>
+<style>iframe{width:1240px;height:820px;border:1px solid #ccc}pre{font:12px monospace}</style>
+</head><body>
+<iframe id="f" src="/"></iframe>
+<pre id="out">RUNNING</pre>
+<script>
+const L = [];
+const ok = (n, c) => L.push((c ? 'PASS ' : 'FAIL ') + n);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 6000) {
+  const t0 = Date.now();
+  for (;;) {
+    try { const v = fn(); if (v) return v; } catch (e) { /* 继续等 */ }
+    if (Date.now() - t0 > ms) return null;
+    await sleep(100);
+  }
+}
+const f = document.getElementById('f');
+f.addEventListener('load', run);
+async function run() {
+  const w = f.contentWindow, d = f.contentDocument;
+  await until(() => d.querySelector('.treenode.tbl'));
+  w.confirm = () => true;
+  w.prompt = () => 'selftest_db';
+
+  // ① 启动与两层树
+  ok('库节点（两层树）', !!d.querySelector('.treenode.db'));
+  ok('表节点存在', !!d.querySelector('.treenode.tbl'));
+  ok('标签栏有「+」新建入口', !!d.querySelector('.tabadd'));
+
+  // ② 点表打开数据标签 → 数据工具条齐备
+  d.querySelector('.treenode.tbl').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await until(() => d.querySelector('.databar'));
+  ok('数据工具条已挂载', !!d.querySelector('.databar'));
+  ok('「+ 新增行」按钮', !!d.querySelector('.databar [data-act="add"]'));
+  ok('「删除选中」按钮（初始禁用）', !!d.querySelector('.databar [data-act="del"]') && d.querySelector('.databar [data-act="del"]').disabled);
+  const sizeSel = d.querySelector('.databar [data-act="pagesize"]');
+  ok('每页行数选择器', !!sizeSel && sizeSel.options.length === 4);
+  await until(() => d.querySelectorAll('td.ck input[data-ck]').length > 0);
+  ok('网格有勾选列', d.querySelectorAll('td.ck input[data-ck]').length > 0);
+  ok('网格有列宽手柄', d.querySelectorAll('th .resize').length > 0);
+
+  // ③ 勾选 → 删除选中按钮可用
+  const firstCk = d.querySelector('td.ck input[data-ck]');
+  firstCk.checked = true;
+  firstCk.dispatchEvent(new Event('change', { bubbles: true }));
+  await sleep(120);
+  const delBtn = d.querySelector('.databar [data-act="del"]');
+  ok('勾选后「删除选中」变为可用：' + delBtn.textContent, !delBtn.disabled);
+
+  // ④ 每页行数切换生效
+  sizeSel.value = '500';
+  sizeSel.dispatchEvent(new Event('change', { bubbles: true }));
+  await sleep(400);
+  ok('切换每页 500 后状态栏/总数更新：' + (d.getElementById('statusbar') || {}).textContent.slice(0, 40),
+    /共 \d+ 行|本页/.test(d.querySelector('.databar').textContent));
+  ok('页大小选择器保持 500', d.querySelector('.databar [data-act="pagesize"]').value === '500');
+
+  // ⑤ 标签：Ctrl+T 新建 / Ctrl+W 关闭
+  const tabs0 = d.querySelectorAll('#tabbar .tab').length;
+  d.dispatchEvent(new KeyboardEvent('keydown', { key: 't', ctrlKey: true, bubbles: true, cancelable: true }));
+  await sleep(200);
+  const tabs1 = d.querySelectorAll('#tabbar .tab').length;
+  ok(`Ctrl+T 新建标签 ${tabs0} → ${tabs1}`, tabs1 === tabs0 + 1);
+  d.dispatchEvent(new KeyboardEvent('keydown', { key: 'w', ctrlKey: true, bubbles: true, cancelable: true }));
+  await sleep(200);
+  ok('Ctrl+W 关闭标签', d.querySelectorAll('#tabbar .tab').length === tabs0);
+
+  // ⑥ 标签切换保留编辑器内容与光标
+  const marker = '-- selftest-' + Date.now() + '\n';
+  const sqlText = marker + 'get 1;';
+  const caretAt = marker.length + 2;
+  d.querySelectorAll('#tabbar .tab')[0].dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await sleep(250);
+  const tas = () => d.querySelectorAll('#tabbody textarea');
+  const ta = d.querySelector('#tabbody textarea');
+  ta.value = sqlText;
+  ta.dispatchEvent(new Event('input', { bubbles: true }));
+  ta.selectionStart = ta.selectionEnd = caretAt;
+  ok(`赋值后 value 长度=${ta.value.length}（期望 ${sqlText.length}）caret=${ta.selectionStart}`,
+    ta.value.length === sqlText.length && ta.selectionStart === caretAt);
+  d.querySelectorAll('#tabbar .tab')[1].dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await sleep(250);
+  const dbg = w.__cella.state$().tabs.map((t) => t.type + ':' + JSON.stringify(t.caret));
+  d.querySelectorAll('#tabbar .tab')[0].dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  const taBack = d.querySelector('#tabbody textarea');
+  const immediate = taBack.selectionStart;
+  await sleep(400);
+  ok('切走再切回，编辑器内容保留', taBack.value === sqlText);
+  ok(`切走再切回，光标位置保留（期望 ${caretAt}｜立刻 ${immediate}｜400ms 后 ${taBack.selectionStart}｜tabs ${dbg}）`,
+    taBack.selectionStart === caretAt);
+  ok('编辑器实例未重建（同一 DOM）', ta === taBack && tas().length >= 1);
+
+  // ⑦ 执行 SQL → 结果网格 + 历史记录 + 消息面板
+  const before = d.getElementById('sqlHistory').options.length;
+  d.getElementById('btnRun').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await sleep(900);
+  const after = d.getElementById('sqlHistory').options.length;
+  ok(`执行后写入 SQL 历史 ${before} → ${after}`, after > before);
+  ok('执行后历史下拉可用', !d.getElementById('sqlHistory').disabled);
+  ok('结果消息面板打开', !d.getElementById('bottomPanel').classList.contains('hidden'));
+  ok('历史记录里是刚执行的那条', d.getElementById('sqlHistory').textContent.includes('selftest-'));
+
+  // ⑧ 右键表名 → 菜单（6 项，含「生成 SELECT」）
+  const tn = d.querySelector('.treenode.tbl');
+  tn.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 60, clientY: 120 }));
+  await sleep(150);
+  const menu = d.querySelector('.ctxmenu');
+  ok('右键菜单弹出', !!menu);
+  ok('菜单 6 项且含「生成 SELECT」',
+    !!menu && menu.children.length === 6 && menu.textContent.includes('生成 SELECT'));
+  if (menu) menu.children[3].dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await sleep(250);
+  ok('「生成 SELECT」新建了查询标签', d.querySelectorAll('#tabbar .tab').length === tabs0 + 1);
+
+  // ⑨ 诊断面板（结构化）+ 计划视图 + 断线横幅 + 加载态元素
+  d.getElementById('stDiag').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await sleep(800);
+  const dv = d.querySelector('.diagview');
+  ok('诊断面板有子页签 4 个', d.querySelectorAll('.diagbar .diagtab').length >= 4);
+  const statTab = [...d.querySelectorAll('.diagbar .diagtab')].find((b) => b.textContent === '缓冲池');
+  statTab.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await sleep(700);
+  ok('缓冲池结构化渲染（命中率进度条 + 计数卡片）',
+    !!d.querySelector('.hitrate .hbar i') && d.querySelectorAll('.diagcards .card').length >= 8);
+  ok('诊断可切原始文本', !!d.querySelector('.viewbar'));
+  ok('切到原始文本后显示 pre',
+    (() => {
+      [...d.querySelectorAll('.viewbar .diagtab')].find((b) => b.textContent === '原始文本')
+        .dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      return !!d.querySelector('.diagview pre');
+    })());
+  [...d.querySelectorAll('.viewbar .diagtab')].find((b) => b.textContent === '结构化')
+    .dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  const txnTab = [...d.querySelectorAll('.diagbar .diagtab')].find((b) => b.textContent === '事务表');
+  txnTab.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await sleep(700);
+  ok('事务表渲染成表格（含表头「事务」）',
+    !!d.querySelector('.diagview table.grid.diag') && d.querySelector('.diagview').textContent.includes('事务'));
+
+  d.querySelector('#tabbar .tab').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await sleep(200);
+  const qta = d.querySelector('#tabbody textarea');
+  qta.value = 'get id, name in student limit id > 1 ordered name asc;';
+  qta.dispatchEvent(new Event('input', { bubbles: true }));
+  d.getElementById('btnRun').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await sleep(1000);
+  d.getElementById('stPlan').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await sleep(300);
+  ok('计划视图渲染算子树（' + d.querySelectorAll('.planrow').length + ' 行） + 编译耗时',
+    d.querySelectorAll('.planrow').length >= 4 && d.querySelector('.planhead').textContent.includes('编译耗时'));
+
+  ok('断线横幅元素存在（默认隐藏）',
+    !!d.getElementById('connBanner') && d.getElementById('connBanner').style.display !== 'flex');
+  ok('加载态元素存在（进度条 + 状态栏提示）',
+    !!d.getElementById('busyBar') && !!d.getElementById('stBusy'));
+
+  // ⑩ 断线横幅：把 iframe 的 fetch 打坏 → 触发请求 → 应显示横幅；修好并重试 → 横幅消失
+  const realFetch = w.fetch;
+  w.fetch = () => Promise.reject(new TypeError('模拟断线'));
+  d.getElementById('btnRefresh').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await sleep(700);
+  ok('请求失败后显示断线横幅', d.getElementById('connBanner').style.display === 'flex');
+  w.fetch = realFetch;
+  d.getElementById('connRetry').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await sleep(900);
+  ok('恢复后横幅消失（自动重连）', d.getElementById('connBanner').style.display === 'none');
+
+  document.getElementById('out').textContent = L.join('\n');
+}
+</script>
+</body></html>
