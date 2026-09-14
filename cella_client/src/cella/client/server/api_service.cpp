@@ -568,6 +568,11 @@ namespace cella::client
     }
     max_rows = std::min(max_rows, kHardMaxRows);
 
+    // 服务端墙钟：从进入处理器（含排队等 gate_ 引擎锁）到结果 JSON 编码完成。
+    // 与前端测得的「端到端」之差 ≈ HTTP + 网络 + 浏览器解析开销，
+    // 两者都报出来才能区分「查询慢」与「传得慢」。
+    const auto t_req = std::chrono::steady_clock::now();
+
     std::lock_guard<std::recursive_mutex> lk(gate_);
     ScriptReport report;
     const DbStatus st = RequestSession().Execute(sql, &report);
@@ -595,6 +600,9 @@ namespace cella::client
       j.Set("txnId", JsonValue::Int(s.txn_id));
       j.Set("affected", JsonValue::Int(static_cast<std::int64_t>(s.result.affected)));
       j.Set("tag", JsonValue::Str(s.result.tag));
+      // 未截断的结果行数。rows 已被 maxRows 砍过，前端拿它的长度做「行数 × 耗时」
+      // 对比会低估；这里报引擎真正产出的行数。
+      j.Set("rowCount", JsonValue::Int(static_cast<std::int64_t>(s.result.rows.size())));
       if (s.result.IsQuery())
       {
         bool truncated = false;
@@ -631,6 +639,12 @@ namespace cella::client
     sess.Set("txnId", JsonValue::Int(session.current_txn()));
     data.Set("session", std::move(sess));
     data.Set("engineOk", JsonValue::Bool(st.ok()));
+    // 服务端处理总耗时（含引擎排队）。语句级 elapsedMs 只覆盖引擎内的编译 + 执行，
+    // 二者差额就是排队与结果编码的时间。
+    data.Set("serverMs",
+             JsonValue::Real(std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - t_req)
+                                 .count()));
     JsonValue root = JsonValue::Obj();
     root.Set("ok", JsonValue::Bool(true));
     root.Set("data", std::move(data));
@@ -932,6 +946,9 @@ namespace cella::client
       order = "asc";
     }
 
+    // 翻页也是一次真实查询（分页慢通常就是排序列没索引），耗时照实报给前端
+    const auto t_req = std::chrono::steady_clock::now();
+
     std::lock_guard<std::recursive_mutex> lk(gate_);
     const CatalogTable *t = FindTableLocked(name);
     if (t == nullptr)
@@ -990,6 +1007,10 @@ namespace cella::client
              total_known ? JsonValue::Int((static_cast<std::int64_t>(page) - 1) * page_size +
                                           static_cast<std::int64_t>(got))
                          : JsonValue::Null());
+    data.Set("elapsedMs",
+             JsonValue::Real(std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - t_req)
+                                 .count()));
     return OkResponse(std::move(data));
   }
 

@@ -211,6 +211,28 @@ async function run() {
   const panelOk = await until(() => !d.getElementById('bottomPanel').classList.contains('hidden'), 5000);
   ok('结果消息面板打开', !!panelOk);
 
+  // ⑨-bis 查询耗时显示：结果栏徽标 / 消息逐条耗时 / 状态栏入口 / 耗时面板历史对比
+  const chip = await until(() => d.querySelector('.resultbar .mschip'), 4000);
+  ok('结果栏出现耗时徽标（' + (chip ? chip.textContent.trim() : '无') + '）',
+    !!chip && /⏱/.test(chip.textContent) && /\d+\.\d+ ms/.test(chip.textContent));
+  ok('徽标 title 说明三个口径', !!chip && /引擎/.test(chip.title) && /服务端/.test(chip.title) &&
+    /端到端/.test(chip.title));
+  ok('徽标未撑破结果栏（左侧文案仍可省略号收尾）',
+    !!d.querySelector('.resultbar .rbleft') && !!d.querySelector('.resultbar .rbtime'));
+  ok('消息条目带语句耗时', !!d.querySelector('.msgitem .ms') &&
+    /ms/.test(d.querySelector('.msgitem .ms').textContent));
+  ok('状态栏有「耗时」入口', !!d.getElementById('stTiming'));
+  chip.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await sleep(300);
+  ok('点徽标打开耗时面板（记录表 + 汇总 + 条形）',
+    d.querySelectorAll('.timing tbody tr').length >= 1 && !!d.querySelector('.timing .msbar i') &&
+    d.querySelector('.timingwrap').textContent.includes('最近'));
+
+  // 数据浏览工具条也应带耗时（不进耗时历史）
+  const dataChip = d.querySelector('.databar .mschip[data-act="ms"]');
+  ok('数据工具条带取数耗时（' + (dataChip ? dataChip.textContent.trim() : '无') + '）',
+    !!dataChip && /⏱/.test(dataChip.textContent) && /ms/.test(dataChip.textContent));
+
   // ⑩ 右键表名 → 菜单 6 项（含「生成 SELECT」）
   const tn = [...d.querySelectorAll('.treenode.tbl')].find((t) => t.textContent === scratch);
   tn.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 60, clientY: 120 }));

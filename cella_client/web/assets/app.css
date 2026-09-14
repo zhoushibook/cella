@@ -457,3 +457,42 @@ table.grid.diag code { font-family: var(--mono); }
 }
 .loginerr { min-height: 16px; font-size: 12px; color: var(--err); margin-bottom: 8px; }
 .loginbox .btn { width: 100%; }
+
+/* ── 查询耗时（结果栏徽标 + 底部「耗时」面板）───────────────
+   只新增，不改既有规则：耗时元素一律 flex:none，靠 .spacer 顶到行尾，
+   所以原来的布局（提示文案 / 分页器 / 编辑器高度）都不受影响。 */
+.rbleft { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.rbtime { flex: none; display: flex; align-items: center; gap: 6px; }
+.mschip {
+  flex: none; font-family: var(--mono); font-size: 11px; line-height: 1.7;
+  border: 1px solid var(--border); border-radius: 4px; padding: 0 6px;
+  color: var(--text-dim); white-space: nowrap; cursor: pointer;
+}
+.mschip:hover { border-color: var(--accent); color: var(--accent); }
+.mschip.fast { color: var(--ok); border-color: var(--ok); }
+.mschip.mid { color: var(--warn); border-color: var(--warn); }
+.mschip.slow { color: var(--err); border-color: var(--err); }
+.mschip.running { color: var(--accent); border-color: var(--accent); }
+.mschip.plain { cursor: default; }
+/* 还没测出耗时（首次加载前 / 请求失败）就别留一个空边框占位 */
+.mschip:empty { display: none; }
+.msgitem .ms { color: var(--text-dim); margin-left: 8px; font-family: var(--mono); font-size: 11px; }
+
+.timingwrap { display: flex; flex-direction: column; gap: 8px; }
+.timinghead { display: flex; align-items: center; gap: 6px; }
+.timinghead b { font-family: var(--mono); color: var(--text); }
+.timing .sql { max-width: 380px; }
+.timing td.nowrap { white-space: nowrap; }
+.timing tr.bad .sql { color: var(--err); }
+.msbar {
+  display: inline-block; vertical-align: middle; width: 56px; height: 8px; margin-right: 8px;
+  background: var(--bg-sub); border: 1px solid var(--border); border-radius: 999px; overflow: hidden;
+}
+.msbar i { display: block; height: 100%; background: var(--text-dim); }
+.msbar i.fast { background: var(--ok); }
+.msbar i.mid { background: var(--warn); }
+.msbar i.slow { background: var(--err); }
+.delta { font-family: var(--mono); font-size: 11px; }
+.delta.up { color: var(--err); }
+.delta.down { color: var(--ok); }
+.delta.same, .delta.first { color: var(--text-dim); }
