@@ -157,6 +157,7 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
     }
     html += '</tbody>';
     table.innerHTML = html;
+    lastEdgeTd = null;   // DOM 已重建，旧高亮引用失效
     applyColWidths();
   }
 
@@ -214,21 +215,42 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
   // ── 列宽 / 行高拖拽（双击自适应、复位）──────────────────
   // 任意单元格交界都能拖：数据格/行号格右缘 = 列宽，任意格下缘 = 行高（Excel 式）。
   // 用事件坐标判定，不给每个 td 挂手柄元素（虚拟滚动下 DOM 频繁重建，挂不住也不划算）。
-  const EDGE = 5;   // 距交界多少像素内算「在交界上」
+  // 命中带要够宽（8px），且边界两侧都算（右缘 + 下一列左缘，等效 16px），否则鼠标很难对准。
+  const EDGE = 8;
+  let lastEdgeTd = null;   // 悬停高亮：把可拖的交界画出来（box-shadow，不参与布局）
+  function clearEdgeHint() {
+    if (lastEdgeTd) {
+      lastEdgeTd.classList.remove('edge-r', 'edge-l', 'edge-b');
+      lastEdgeTd = null;
+    }
+  }
   function edgeZone(e) {
     const td = e.target.closest('td');
     if (!td || !td.isConnected || td.classList.contains('empty')) return null;
     const tr = td.closest('tr');
     if (!tr || tr.classList.contains('pad')) return null;
     const rect = td.getBoundingClientRect();
-    if (rect.right - e.clientX <= EDGE && rect.right - e.clientX >= -1) {
-      if (td.hasAttribute('data-c')) return { kind: 'col', ci: +td.getAttribute('data-c') };
-      if (td.classList.contains('rownum')) return { kind: 'rownum' };
+    const fromR = rect.right - e.clientX;
+    const fromL = e.clientX - rect.left;
+    const fromB = rect.bottom - e.clientY;
+    if (fromR <= EDGE && fromR >= -1) {
+      if (td.hasAttribute('data-c')) return { kind: 'col', ci: +td.getAttribute('data-c'), side: 'r' };
+      if (td.classList.contains('rownum')) return { kind: 'rownum', side: 'r' };
       return null;   // 复选框列宽固定，不给拖
     }
-    if (rect.bottom - e.clientY <= EDGE && rect.bottom - e.clientY >= -1) return { kind: 'row' };
+    if (fromB <= EDGE && fromB >= -1) return { kind: 'row', side: 'b' };
+    // 边界的另一侧：下一列的左缘 = 上一列的右缘（首数据列左缘 = 行号列边界）。
+    // 放在下缘之后：左下角是「行交界」，不是列交界。
+    if (fromL <= EDGE && fromL >= -1) {
+      if (td.hasAttribute('data-c')) {
+        const ci = +td.getAttribute('data-c');
+        return ci > 0 ? { kind: 'col', ci: ci - 1, side: 'l' } : { kind: 'rownum', side: 'l' };
+      }
+      return null;
+    }
     return null;
   }
+  const EDGE_CLS = { r: 'edge-r', l: 'edge-l', b: 'edge-b' };
 
   table.addEventListener('mousedown', (e) => {
     const rowHandle = e.target.closest('.rowresize');
@@ -267,6 +289,7 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
       return;
     }
     suppressClick = false;   // 普通按下：清掉可能残留的标记（上次拖拽没跟来 click 时）
+    clearEdgeHint();
     if (e.target.closest('input')) return;   // 复选框自己处理
     if (e.target.closest('thead')) return;   // 表头交给 click
 
@@ -285,14 +308,27 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
     paintSelection();
   });
 
-  // 悬停在交界上时给出光标提示（拖拽进行中交给 body 级光标）
+  // 悬停在交界上时：光标提示 + 把交界画出来（拖拽进行中交给 body 级光标）
   table.addEventListener('mousemove', (e) => {
     if (resizeState || dragMode) return;
     const z = edgeZone(e);
     table.style.cursor = z ? (z.kind === 'row' ? 'row-resize' : 'col-resize') : '';
+    const td = e.target.closest('td');
+    if (!z || !td) {
+      clearEdgeHint();
+      return;
+    }
+    if (td !== lastEdgeTd) {
+      clearEdgeHint();
+      td.classList.add(EDGE_CLS[z.side] || 'edge-r');
+      lastEdgeTd = td;
+    }
   });
   table.addEventListener('mouseleave', () => {
-    if (!resizeState && !dragMode) table.style.cursor = '';
+    if (!resizeState && !dragMode) {
+      table.style.cursor = '';
+      clearEdgeHint();
+    }
   });
 
   table.addEventListener('mousemove', (e) => {

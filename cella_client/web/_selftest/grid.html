@@ -185,14 +185,35 @@ const tdA = host.querySelector('tr[data-r="0"] td[data-c="0"]');
 // 光标提示
 tdA.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: nearRect(tdA, 'r').x, clientY: nearRect(tdA, 'r').y }));
 ok('悬停单元格右缘出现 col-resize 光标', host.querySelector('table').style.cursor === 'col-resize');
-tdA.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: tdA.getBoundingClientRect().left + 6, clientY: nearRect(tdA, 'r').y }));
-ok('离开交界光标恢复（' + JSON.stringify(host.querySelector('table').style.cursor) + '）', host.querySelector('table').style.cursor === '');
+tdA.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: nearRect(tdA, 'r').x, clientY: nearRect(tdA, 'r').y }));
+ok('悬停交界出现高亮（edge-r）', !!host.querySelector('td.edge-r') && !host.querySelector('td.edge-b'));
+const ra = tdA.getBoundingClientRect();
+tdA.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: ra.left + ra.width / 2, clientY: ra.top + 3 }));
+ok('离开交界光标恢复且高亮消失（cursor=' + JSON.stringify(host.querySelector('table').style.cursor) + '）',
+  host.querySelector('table').style.cursor === '' && !host.querySelector('td.edge-r'));
 // 右缘拖列宽：只改 colgroup、不重建 DOM、不产生选区
 const wa0 = wOf(0);
 tdA.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: nearRect(tdA, 'r').x, clientY: nearRect(tdA, 'r').y, buttons: 1 }));
 document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: nearRect(tdA, 'r').x + 45, clientY: nearRect(tdA, 'r').y, buttons: 1 }));
 document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
 ok('单元格右缘拖列宽 ' + wa0 + ' → ' + wOf(0), wOf(0) === wa0 + 45);
+// 左缘 = 上一列的右边界（等效命中带加倍）
+const wb0 = wOf(0);
+const tdB0 = host.querySelector('tr[data-r="0"] td[data-c="1"]');
+const lb = tdB0.getBoundingClientRect();
+tdB0.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: lb.left + 2, clientY: lb.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: lb.left + 2 + 20, clientY: lb.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+ok('下一列左缘拖同一交界 ' + wb0 + ' → ' + wOf(0), wOf(0) === wb0 + 20);
+// 首数据列左缘 = 行号列右边界
+const rnColL = host.querySelectorAll('colgroup col')[1];
+const rn0L = parseInt(rnColL.style.width, 10);
+const tdC0 = host.querySelector('tr[data-r="0"] td[data-c="0"]');
+const lc = tdC0.getBoundingClientRect();
+tdC0.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: lc.left + 2, clientY: lc.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: lc.left + 2 - 12, clientY: lc.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+ok('首数据列左缘拖行号列宽 ' + rn0L + ' → ' + parseInt(rnColL.style.width, 10), parseInt(rnColL.style.width, 10) === rn0L - 12);
 ok('交界拖拽不重建 DOM（td 实例不变）', host.querySelector('tr[data-r="0"] td[data-c="0"]') === tdA);
 ok('交界拖拽不产生选区', !host.querySelector('td.sel'));
 tdA.dispatchEvent(new MouseEvent('click', { bubbles: true }));

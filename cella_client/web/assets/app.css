@@ -226,6 +226,12 @@ html[data-theme="dark"] .tok-num { color: #fac775; }
 .grid.with-ck th.rownum, .grid.with-ck td.rownum { left: 30px; }
 .grid th.rownum { cursor: pointer; }
 .grid td.rownum.sel, .grid td.ck.sel { background: var(--accent-soft); }
+/* 单元格交界悬停高亮：把可拖的边画出来（box-shadow 不参与布局，不影响行高/列宽） */
+.grid td.edge-r { box-shadow: inset -2px 0 0 0 var(--accent); }
+.grid td.edge-l { box-shadow: inset 2px 0 0 0 var(--accent); }
+.grid td.edge-b { box-shadow: inset 0 -2px 0 0 var(--accent); }
+.grid td.edge-r.edge-b { box-shadow: inset -2px 0 0 0 var(--accent), inset 0 -2px 0 0 var(--accent); }
+.grid td.edge-l.edge-b { box-shadow: inset 2px 0 0 0 var(--accent), inset 0 -2px 0 0 var(--accent); }
 
 /* ── 底部面板（消息/计划/诊断）─────────────── */
 .bottompanel {
