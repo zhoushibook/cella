@@ -56,7 +56,7 @@ get_stmt          := GET [ DISTINCT ] select_list
                      [ HAVING expr ]
                      [ ORDERED order_item { ',' order_item } ] % = ORDER BY
                      [ AMONG uint ]                       % = LIMIT 行数
-                     [ PAGE uint [ ',' uint ] ]           % = 分页（页码 1 起，行数默认 10；
+                     [ PAGE uint [ [ ',' ] uint ] ]       % = 分页（页码 1 起，行数默认 10；逗号可省略
                                                         % 与 among 同现时起始行须落在 among 范围内，否则 SEM-312）
                      [ UNION GET [ DISTINCT ] select_list IN table_ref { join_clause }
                          [ LIMIT expr ] [ GROUPED ... ] [ HAVING expr ]

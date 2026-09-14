@@ -559,7 +559,7 @@ namespace cella
                         return false;
                     }
                 }
-                // 分页：page 页码 [ ',' 每页行数 ]（页码 1 起，每页行数默认 10）
+                // 分页：page 页码 [ [ ',' ] 每页行数 ]（页码 1 起，每页行数默认 10）
                 if (matchKw(CELLA_Keyword::PAGE))
                 {
                     const CELLA_Token &t1 = peek();
@@ -575,7 +575,12 @@ namespace cella
                         synError(t1, "正整数（页码）");
                         return false;
                     }
-                    if (matchDelim(","))
+                    const CELLA_Token &next = peek();
+                    const bool hasComma = matchDelim(",");
+                    const bool hasSpaceSeparatedSize =
+                        next.type == CELLA_TokenType::CONST && next.valueType == CELLA_TokenValueType::NUMBER &&
+                        next.lexeme.find('.') == std::string::npos;
+                    if (hasComma || hasSpaceSeparatedSize)
                     {
                         const CELLA_Token &t2 = peek();
                         if (t2.type == CELLA_TokenType::CONST && t2.valueType == CELLA_TokenValueType::NUMBER &&
@@ -780,7 +785,7 @@ namespace cella
                     return nullptr;
                 // 后缀判空：x IS [NOT] NULL。绑定到左侧（加法级）操作数上，
                 // 结果恒为 TRUE/FALSE，不走三值比较 —— 这是判 NULL 的唯一合法写法
-                //（x = NULL 恒为 UNKNOWN，查不出任何行）。
+                // （x = NULL 恒为 UNKNOWN，查不出任何行）。
                 if (peek().keyword == CELLA_Keyword::IS)
                 {
                     const CELLA_Token isTok = peek();

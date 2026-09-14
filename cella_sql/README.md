@@ -111,11 +111,11 @@ cmake --build build --config Debug
 | `grouped` | GROUP BY | | `distinct` | DISTINCT |
 | `having` | HAVING | | `as` | AS |
 | `ordered` | ORDER BY | | `among` | LIMIT 行数 |
-| `page` | 分页（页码, 每页行数） | | | |
+| `page` | 分页（页码[, 每页行数]，逗号可省略） | | | |
 
-> `page` 与 `among` 可同用：`among` 先限定总行数，`page` 再在其内分页；分页起始行超出 `among` 范围时报 SEM-312。
+> `page` 与 `among` 可同用：`among` 先限定总行数，`page` 再在其内分页；分页起始行超出 `among` 范围时报 SEM-312。每页行数可写为 `page 1, 2` 或 `page 1 2`。
 
-- 查询子句顺序固定：`get [distinct] 列 in 表 [join...] [limit] [grouped] [having] [ordered] [among] [page 页码[,每页行数]] [union get...] ;`
+- 查询子句顺序固定：`get [distinct] 列 in 表 [join...] [limit] [grouped] [having] [ordered] [among] [page 页码[,每页行数]] [union get...] ;`（逗号可省略）
 - DELETE/UPDATE 的过滤条件用 `limit`（已彻底移除 FROM/WHERE：`DELETE in student limit ...`、`UPDATE student SET ... limit ...`）。
 
 冒烟示例（全部合法）：
