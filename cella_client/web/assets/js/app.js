@@ -446,6 +446,10 @@ function showRowMenu(x, y, tab, row) {
     menu.appendChild(d);
   }
   document.body.appendChild(menu);
+  // 定位到鼠标处（position:fixed 不给 left/top 会停在文档流原位置=左上角），并收敛到视口内
+  const mr = menu.getBoundingClientRect();
+  menu.style.left = Math.max(4, Math.min(x, window.innerWidth - mr.width - 8)) + 'px';
+  menu.style.top = Math.max(4, Math.min(y, window.innerHeight - mr.height - 8)) + 'px';
   const close = () => { menu.remove(); rowMenuEl = null; document.removeEventListener('click', close); };
   setTimeout(() => document.addEventListener('click', close), 0);
 }

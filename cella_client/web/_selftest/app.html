@@ -159,6 +159,22 @@ async function run() {
   await sleep(300);
   ok('回退后删除标记消失', !d.querySelector('.grid td.deleted'));
 
+  // ⑥-bis 回归：行右键菜单应出现在鼠标处（而不是 position:fixed 无坐标时的左上角）
+  const trCtx = d.querySelector('tr[data-r="1"]');
+  trCtx.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 420, clientY: 320 }));
+  await sleep(150);
+  const rowMenu = d.querySelector('.ctxmenu');
+  ok('右键行弹出菜单', !!rowMenu);
+  if (rowMenu) {
+    const ml = parseFloat(rowMenu.style.left);
+    const mt = parseFloat(rowMenu.style.top);
+    ok(`菜单位置跟手（left=${ml} top=${mt}，期望≈420/320）`,
+      ml > 300 && ml <= 421 && mt > 200 && mt <= 321);
+    d.body.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await sleep(150);
+    ok('点击空白处菜单关闭', !d.querySelector('.ctxmenu'));
+  }
+
   // ⑦ 标签：Ctrl+T 新建 / Ctrl+W 关闭
   const tabs0 = d.querySelectorAll('#tabbar .tab').length;
   d.dispatchEvent(new KeyboardEvent('keydown', { key: 't', ctrlKey: true, bubbles: true, cancelable: true }));
