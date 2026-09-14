@@ -42,8 +42,9 @@
         <button id="btnRefresh" class="btn icon" title="刷新目录">⟳</button>
       </div>
       <div id="tree" class="tree"></div>
-      <div class="sidebartip">右键表名：打开数据 / 查看结构 / 新建查询 / 删除表</div>
+      <div class="sidebartip">右键表名：打开数据 / 查看结构 / 新建查询 / 删除表<br>拖右边缘调整宽度</div>
     </aside>
+    <div id="sidebarSplit" class="splitter v" title="拖动调整侧边栏宽度（双击复位）"></div>
 
     <section id="content" class="content">
       <div id="tabbar" class="tabbar"></div>
@@ -60,6 +61,7 @@
     <span id="stDiag" class="stlink">诊断</span>
   </footer>
 
+  <div id="panelSplit" class="splitter h hidden" title="拖动调整底部面板高度（双击复位）"></div>
   <div id="bottomPanel" class="bottompanel hidden">
     <div class="bottomhead">
       <span id="bpTitle" class="bptitle"></span>

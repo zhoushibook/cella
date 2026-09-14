@@ -1,6 +1,9 @@
 // editor.js —— SQL 编辑器：<textarea> + 底层 <pre> 高亮层（PLAN §5.2）。
 // 高亮用单遍扫描状态机（普通/字符串/注释），不用正则替换（PLAN §6.6）。
 // 关键字表与引擎保留字一致（PLAN §11.5），另补上会话层拦截的管理语句关键字。
+// 高度可拖：下边缘的分隔条（双击复位），偏好持久化在 localStorage。
+
+import { loadNum, saveNum, makeSplitter } from './ui.js';
 
 const KEYWORDS = new Set(('CREATE TABLE PRIMARY KEY ALTER DROP TRUNCATE RENAME INSERT INTO VALUES ' +
   'UPDATE SET DELETE FROM WHERE GET IN LIMIT GROUPED HAVING ORDERED AMONG PAGE JOIN ON LEFT RIGHT ' +
@@ -104,6 +107,30 @@ export function createEditor(container, { onRun, onChange, onHistory } = {}) {
   ta.spellcheck = false;
   ta.setAttribute('aria-label', 'SQL 编辑器');
   container.append(pre, ta);
+
+  // 编辑器高度可拖（拖下边缘；双击复位），偏好写到 localStorage
+  let height = loadNum('editorH', 168, 80, 900);
+  container.style.height = height + 'px';
+  const grip = document.createElement('div');
+  grip.className = 'edresize';
+  grip.title = '拖动调整编辑器高度（双击复位）';
+  container.appendChild(grip);
+  makeSplitter(grip, {
+    axis: 'y',
+    noClass: true,
+    onMove: (dx, dy) => {
+      height = Math.max(80, Math.min(900, Math.round(height + dy)));
+      container.style.height = height + 'px';
+      sync();
+    },
+    onEnd: () => saveNum('editorH', height),
+  });
+  grip.addEventListener('dblclick', () => {
+    height = 168;
+    container.style.height = height + 'px';
+    saveNum('editorH', height);
+    sync();
+  });
 
   const render = () => {
     pre.innerHTML = highlight(ta.value) + '\n';

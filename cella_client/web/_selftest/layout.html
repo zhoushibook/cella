@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>layout splitter test</title>
+<style>iframe{width:1240px;height:820px;border:1px solid #ccc}pre{font:12px monospace}</style>
+</head><body>
+<iframe id="f" src="/"></iframe>
+<pre id="out">RUNNING</pre>
+<script type="module">
+import { loadNum, saveNum, makeSplitter } from '/assets/js/ui.js';
+const L = [];
+const ok = (n, c) => L.push((c ? 'PASS ' : 'FAIL ') + n);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 8000) {
+  const t0 = Date.now();
+  for (;;) {
+    try { const v = fn(); if (v) return v; } catch (e) { /* 继续等 */ }
+    if (Date.now() - t0 > ms) return null;
+    await sleep(100);
+  }
+}
+
+// ── ① ui.js 单元：偏好读写与夹逼 ─────────────────────────
+saveNum('__t', 123.6);
+ok('saveNum/loadNum 往返取整', loadNum('__t', 0, 0, 999) === 124);
+ok('loadNum 夹逼上限', loadNum('__t', 0, 0, 100) === 100);
+ok('loadNum 夹逼下限', loadNum('__t', 0, 200, 999) === 200);
+localStorage.removeItem('cella.ui.__t');
+ok('loadNum 缺省值', loadNum('__t', 42, 0, 999) === 42);
+
+// ② makeSplitter：位移 → 回调 → 松手收尾
+{
+  const el = document.createElement('div');
+  el.style.cssText = 'width:8px;height:40px';
+  document.body.appendChild(el);
+  const seq = [];
+  makeSplitter(el, { axis: 'x', onMove: (dx) => seq.push('m' + dx), onEnd: () => seq.push('end') });
+  el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: 100, clientY: 10 }));
+  document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 130, clientY: 10 }));
+  document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 150, clientY: 10 }));
+  document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+  ok('makeSplitter 位移与收尾回调 ' + JSON.stringify(seq), seq.join(',') === 'm30,m50,end');
+  ok('松手后还原 body 光标', document.body.style.cursor === '' && document.body.style.userSelect === '');
+}
+
+// ── ③ 真实页面里的四条可拖拽边 ───────────────────────────
+const f = document.getElementById('f');
+let started = false;
+f.addEventListener('load', async () => { if (!started) { started = true; await run(); } });
+
+const drag = (target, doc, dx, dy) => {
+  target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: 200, clientY: 200 }));
+  doc.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 200 + dx, clientY: 200 + dy, buttons: 1 }));
+  doc.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: 200 + dx, clientY: 200 + dy }));
+};
+const dbl = (target, doc) => {
+  target.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true }));
+  void doc;
+};
+const cssVar = (doc, name) => doc.documentElement.style.getPropertyValue(name).trim();
+
+async function run() {
+  const w = f.contentWindow, d = f.contentDocument;
+  await until(() => d.querySelector('.treenode.tbl'));
+  w.confirm = () => true;
+  const lay = w.__cella.layout;
+  lay.reset();                                     // 先回到默认，避免上一轮偏好串场
+
+  // 侧边栏宽度
+  ok('侧边栏默认宽 200', cssVar(d, '--sidebar-w') === '200px');
+  drag(d.getElementById('sidebarSplit'), d, 60, 0);
+  ok('拖侧边栏 +60 → ' + cssVar(d, '--sidebar-w'), cssVar(d, '--sidebar-w') === '260px');
+  ok('侧边栏宽度已持久化', w.localStorage.getItem('cella.ui.sidebarW') === '260');
+  drag(d.getElementById('sidebarSplit'), d, 9999, 0);
+  ok('超上限夹逼到 560 → ' + cssVar(d, '--sidebar-w'), cssVar(d, '--sidebar-w') === '560px');
+  dbl(d.getElementById('sidebarSplit'), d);
+  ok('双击侧边栏手柄复位 200', cssVar(d, '--sidebar-w') === '200px');
+
+  // 底部面板高度（要先打开面板）
+  ok('面板隐藏时手柄也隐藏', d.getElementById('panelSplit').classList.contains('hidden'));
+  d.getElementById('stDiag').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await sleep(600);
+  ok('打开面板后手柄显示', !d.getElementById('panelSplit').classList.contains('hidden'));
+  ok('面板默认高 200', cssVar(d, '--panel-h') === '200px');
+  drag(d.getElementById('panelSplit'), d, 0, -50);      // 向上拖 = 变高
+  ok('向上拖 50 → 高 250', cssVar(d, '--panel-h') === '250px');
+  ok('面板高度已持久化', w.localStorage.getItem('cella.ui.panelH') === '250');
+  drag(d.getElementById('panelSplit'), d, 0, 9999);
+  ok('向下拖到底夹逼到 90 → ' + cssVar(d, '--panel-h'), cssVar(d, '--panel-h') === '90px');
+  dbl(d.getElementById('panelSplit'), d);
+  ok('双击面板手柄复位 200', cssVar(d, '--panel-h') === '200px');
+
+  // 编辑器高度
+  const ed = d.querySelector('.editorwrap');
+  ok('编辑器默认高 168', ed.style.height === '168px' && !!ed.querySelector('.edresize'));
+  drag(ed.querySelector('.edresize'), d, 0, 40);
+  ok('拖编辑器 +40 → ' + ed.style.height, ed.style.height === '208px');
+  ok('编辑器高度已持久化', w.localStorage.getItem('cella.ui.editorH') === '208');
+  dbl(ed.querySelector('.edresize'), d);
+  ok('双击编辑器手柄复位 168', ed.style.height === '168px');
+
+  // 网格行高 / 行号列宽（在数据标签里）
+  d.querySelector('.treenode.tbl').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await until(() => d.querySelector('.databar td, .databar'));
+  await until(() => d.querySelectorAll('td.ck input[data-ck]').length > 0);
+  const grid = w.__cella.state$().tabs.find((t) => t.type === 'data').ui.grid;
+  grid.resetLayout();
+  const table = d.querySelector('.gridwrap table.grid');
+  const h0 = d.querySelector('tr[data-r="0"]').offsetHeight;
+  ok('行高默认 26（实测行高 ' + h0 + 'px）', Math.abs(h0 - 26) <= 1);
+  drag(d.querySelector('th.rownum .rowresize'), d, 0, 14);
+  const h1 = d.querySelector('tr[data-r="0"]').offsetHeight;
+  ok('拖行高 +14 → 40（实测 ' + h1 + 'px）', grid.rowHeight() === 40 && Math.abs(h1 - 40) <= 1);
+  ok('行高已持久化', w.localStorage.getItem('cella.ui.rowH') === '40');
+  dbl(d.querySelector('th.rownum .rowresize'), d);
+  ok('双击行高手柄复位 26', grid.rowHeight() === 26);
+  const rnCol = () => d.querySelectorAll('.gridwrap colgroup col')[1].style.width;
+  const rn0 = rnCol();
+  drag(d.querySelector('th.rownum .resize'), d, 30, 0);
+  ok('拖行号列宽 ' + rn0 + ' → 82', rnCol() === '82px');
+  ok('行号列宽已持久化', w.localStorage.getItem('cella.ui.rownumW') === '82');
+  dbl(d.querySelector('th.rownum .resize'), d);
+  ok('双击行号列复位 52', rnCol() === '52px');
+
+  // 刷新后偏好仍在（localStorage → CSS 变量）
+  ok('偏好键前缀统一为 cella.ui.*',
+    ['sidebarW', 'panelH', 'editorH', 'rowH', 'rownumW']
+      .every((k) => w.localStorage.getItem('cella.ui.' + k) !== null));
+
+  document.getElementById('out').textContent = L.join('\n');
+}
+</script>
+</body></html>

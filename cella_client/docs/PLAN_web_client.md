@@ -806,3 +806,23 @@ out->rows.push_back(in.rows[i]);     // ← 然后才切片
 2. 标签面板从 `display:none` 恢复显示后，浏览器会把 textarea 插入点挪到末尾 → 必须显式还原，
    且要在下一任务再兜一次；`focus()` 应先于还原调用。
 3. 测试断言别依赖上一次运行留在 `localStorage` 的状态（诊断子页签、SQL 历史会串场）。
+
+### 布局可拖拽（2026-09-14 追加）
+
+把「该能拖的边」全部做成可拖拽，统一走新模块 `web/assets/js/ui.js`（`makeSplitter` + 偏好读写），
+偏好统一存 `localStorage` 的 `cella.ui.*` 前缀，双击手柄复位：
+
+| 拖拽点 | 变量 / 存储 | 范围 |
+| --- | --- | --- |
+| 侧边栏右边缘（`#sidebarSplit`） | `--sidebar-w` / `cella.ui.sidebarW` | 140–560 |
+| 底部面板上边缘（`#panelSplit`，面板隐藏时同步隐藏） | `--panel-h` / `cella.ui.panelH` | 90–640 |
+| 编辑器下边缘（`.edresize`，由 `editor.js` 自持） | 元素高度 / `cella.ui.editorH` | 80–900 |
+| 表头「#」格下边缘（`.rowresize`） | `--row-h` / `cella.ui.rowH` | 20–64 |
+| 表头「#」格右边缘（`.resize[data-ci="-1"]`） | `<colgroup>` / `cella.ui.rownumW` | 34–160 |
+
+行高是**虚拟滚动的关键常量**，改成可变后：`rowH` 参与可视行数（`viewport / rowH`）、滚动行定位
+（`scrollTop / rowH`）与上下垫片高度，拖拽时必须 `render()` 重算（不能只改 CSS）；
+单元格高度由 `--row-h` 驱动，并配合 `box-sizing: border-box` 让实测行高与 `rowH` 一致。
+
+自测：新增 `web/_selftest/layout.html`（30 项）覆盖夹逼、持久化、双击复位与真实页面拖拽；
+`grid.html` 追加垫片随行高重算的断言。前端套件合计 **124 项**。

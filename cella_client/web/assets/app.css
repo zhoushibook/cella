@@ -93,10 +93,18 @@ button { font-family: inherit; font-size: 12px; }
 .treelink { color: var(--accent); text-decoration: none; }
 .treelink:hover { text-decoration: underline; }
 
+/* ── 分隔条（可拖拽的边）───────────────────── */
+.splitter { flex: none; position: relative; z-index: 12; background: transparent; transition: background .12s; }
+.splitter.hidden { display: none; }
+.splitter.v { width: 6px; margin: 0 -3px; cursor: col-resize; }
+.splitter.h { height: 6px; margin: -3px 0; cursor: row-resize; }
+.splitter:hover, .splitter.dragging { background: var(--accent); opacity: 0.55; }
+.splitter.v::after, .splitter.h::after { content: ""; position: absolute; inset: 0; }
+
 /* ── 主区 ──────────────────────────────────── */
 .main { display: flex; flex: 1; min-height: 0; }
 .sidebar {
-  width: 200px; flex: none; background: var(--bg-sub);
+  width: var(--sidebar-w, 200px); flex: none; background: var(--bg-sub);
   border-right: 1px solid var(--border);
   display: flex; flex-direction: column; min-height: 0;
 }
@@ -139,9 +147,14 @@ button { font-family: inherit; font-size: 12px; }
 
 /* ── 编辑器 ────────────────────────────────── */
 .editorwrap {
-  position: relative; flex: none; height: 168px; min-height: 80px;
+  position: relative; flex: none; height: var(--editor-h, 168px); min-height: 80px;
   border-bottom: 1px solid var(--border); overflow: hidden;
 }
+.editorwrap .edresize {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 7px; margin: 0; z-index: 7;
+  cursor: row-resize; background: transparent;
+}
+.editorwrap .edresize:hover, .editorwrap .edresize.dragging { background: var(--accent); opacity: 0.4; }
 .editorwrap textarea, .editorwrap pre {
   position: absolute; inset: 0; margin: 0; padding: 10px 14px;
   font-family: var(--mono); font-size: 12.5px; line-height: 1.6;
@@ -186,6 +199,17 @@ html[data-theme="dark"] .tok-num { color: #fac775; }
   cursor: col-resize; z-index: 5; background: transparent;
 }
 .grid th .resize:hover, .grid th .resize:active { background: var(--accent); opacity: 0.55; }
+.grid th .rowresize {
+  position: absolute; left: -2px; bottom: -3px; width: 64px; height: 7px;
+  cursor: row-resize; z-index: 6; background: transparent;
+}
+.grid th .rowresize:hover, .grid th .rowresize:active { background: var(--accent); opacity: 0.55; }
+/* 行高可拖：单元格高度由 CSS 变量驱动（border-box，含 1px 分隔线） */
+.grid tbody td, .grid tbody th {
+  height: var(--row-h, 26px); padding: 0 10px;
+  line-height: calc(var(--row-h, 26px) - 1px);
+}
+.grid td.rownum { cursor: pointer; }
 .grid th { position: sticky; }
 .grid tbody tr:hover td { background: color-mix(in srgb, var(--accent-soft) 45%, transparent); }
 .grid .rownum { color: var(--text-dim); text-align: right; position: sticky; left: 0; background: var(--bg-sub); z-index: 2; }
@@ -195,7 +219,9 @@ html[data-theme="dark"] .tok-num { color: #fac775; }
 /* 单元格拖拽选择用自绘选区，屏蔽原生文本选择 */
 .grid td, .grid thead th { user-select: none; -webkit-user-select: none; }
 .grid th.rownum, .grid td.rownum { left: 0; }
-.grid th.ck, .grid td.ck { position: sticky; left: 0; z-index: 4; text-align: center; padding: 4px 6px; background: var(--bg-sub); }
+.grid th.ck, .grid td.ck { position: sticky; left: 0; z-index: 4; text-align: center; background: var(--bg-sub); }
+.grid th.ck { padding: 4px 6px; }
+.grid tbody td.ck { padding: 0 6px; }
 .grid td.ck { z-index: 2; background: var(--bg); }
 .grid.with-ck th.rownum, .grid.with-ck td.rownum { left: 30px; }
 .grid th.rownum { cursor: pointer; }
@@ -203,7 +229,7 @@ html[data-theme="dark"] .tok-num { color: #fac775; }
 
 /* ── 底部面板（消息/计划/诊断）─────────────── */
 .bottompanel {
-  flex: none; height: 200px; border-top: 1px solid var(--border);
+  flex: none; height: var(--panel-h, 200px); border-top: 1px solid var(--border);
   background: var(--bg); display: flex; flex-direction: column;
 }
 .bottompanel.hidden { display: none; }

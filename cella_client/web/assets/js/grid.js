@@ -1,15 +1,20 @@
-// grid.js —— 结果网格：虚拟滚动 + 列宽拖拽/自适应 + 选区复制 + 行勾选 + 三态排序（PLAN §5.2）。
+// grid.js —— 结果网格：虚拟滚动 + 列宽/行高拖拽 + 选区复制 + 行勾选 + 三态排序（PLAN §5.2）。
 //
-// 虚拟滚动：只渲染视口附近的行，用上下垫片行撑出总高度（行高固定 26px）。
-// 列宽：table-layout:fixed + <colgroup>；宽度由内容测量得来，可拖拽、双击自适应。
+// 虚拟滚动：只渲染视口附近的行，用上下垫片行撑出总高度（行高可拖拽，默认 26px）。
+// 列宽：table-layout:fixed + <colgroup>；宽度由内容测量得来，可拖拽、双击自适应（行号列同理）。
+// 行高：拖表头「#」格下边缘的分隔条；双击复位。
 // 选择：单元格拖拽区块 / 点「#」选整行 / 拖「#」连选多行 / 点「#」表头或 Ctrl+A 全选；
 //       Ctrl+C 把选区复制为 TSV（可直接粘进 Excel）。
 // 勾选：checkable=true 时多出复选框列，供「批量删除」使用，索引对应**视图行号**。
 
-const ROW_H = 26;
+import { loadNum, saveNum } from './ui.js';
+
+const ROW_H_DEF = 26;
+const ROW_H_MIN = 20;
+const ROW_H_MAX = 64;
 const MIN_W = 52;
 const MAX_W = 460;
-const ROWNUM_W = 52;
+const ROWNUM_W_DEF = 52;
 const CK_W = 30;
 const MONO = '12px "Cascadia Mono", Consolas, "Courier New", monospace';
 
@@ -39,7 +44,14 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
   let checked = new Set();  // 勾选的行（视图坐标）
   let firstVisible = 0;
   let dragMode = null;      // 'cell' | 'row'
-  let resizeState = null;   // {ci, x, w}
+  let resizeState = null;   // {kind:'col'|'rownum', x, w}
+  let rowH = loadNum('rowH', ROW_H_DEF, ROW_H_MIN, ROW_H_MAX);          // 行高（可拖）
+  let rownumW = loadNum('rownumW', ROWNUM_W_DEF, 34, 160);              // 「#」列宽（可拖）
+
+  // colgroup 索引：checkable 时 [ck][rownum][数据列...]
+  const CK_COL = 0;
+  const ROWNUM_COL = checkable ? 1 : 0;
+  const dataColIndex = (c) => ROWNUM_COL + 1 + c;
 
   // 有 onSort（服务端/受控排序）时不自排；否则本地排序（查询结果用）
   const localSort = !onSort;
@@ -78,7 +90,7 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
   function colgroupHtml() {
     let h = '<colgroup>';
     if (checkable) h += `<col style="width:${CK_W}px">`;
-    h += `<col style="width:${ROWNUM_W}px">`;
+    h += `<col style="width:${rownumW}px">`;
     for (let c = 0; c < cols.length; c++) h += `<col style="width:${widths[c]}px">`;
     return h + '</colgroup>';
   }
@@ -91,7 +103,7 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
     const viewport = container.clientHeight || 400;
     const total = view.length;
     const start = Math.max(0, firstVisible - 6);
-    const end = Math.min(total, start + Math.ceil(viewport / ROW_H) + 12);
+    const end = Math.min(total, start + Math.ceil(viewport / rowH) + 12);
 
     let html = colgroupHtml();
     html += '<thead><tr>';
@@ -100,18 +112,21 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
       const part = !all && checked.size > 0;
       html += `<th class="ck" title="全选本页"><input type="checkbox" data-ck-all${all ? ' checked' : ''}${part ? ' data-part="1"' : ''}></th>`;
     }
-    html += `<th class="rownum" title="点击选中整行；点表头选中全部">#</th>`;
+    html += `<th class="rownum" title="点选整行；点表头选全部；拖右边缘调列宽，拖下边缘调行高">#` +
+      `<span class="resize size-rownum" data-ci="-1"></span>` +
+      `<span class="rowresize" title="拖动调整行高（双击复位）"></span></th>`;
     for (let c = 0; c < cols.length; c++) {
       const col = cols[c];
       const arrow = sortKey && sortKey.col === col.name ? (sortKey.dir === 'asc' ? ' ▲' : ' ▼') : '';
       html += `<th data-col="${esc(col.name)}" data-ci="${c}" class="${isNumCol(col) ? 'num' : ''}"` +
         ` title="${esc(col.name)}${localSort ? '（点击排序，三次取消）' : '（点击排序，三次恢复默认序）'}">` +
-        `${esc(col.name)}${arrow}<span class="resize"></span></th>`;
+        `${esc(col.name)}${arrow}<span class="resize" data-ci="${c}"></span></th>`;
     }
     html += '</tr></thead><tbody>';
 
+    const span = cols.length + (checkable ? 2 : 1);
     if (start > 0) {
-      html += `<tr class="pad"><td colspan="${cols.length + (checkable ? 2 : 1)}" style="height:${start * ROW_H}px"></td></tr>`;
+      html += `<tr class="pad"><td colspan="${span}" style="height:${start * rowH}px"></td></tr>`;
     }
     for (let r = start; r < end; r++) {
       const row = view[r];
@@ -127,23 +142,25 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
       html += '</tr>';
     }
     if (end < total) {
-      html += `<tr class="pad"><td colspan="${cols.length + (checkable ? 2 : 1)}" style="height:${(total - end) * ROW_H}px"></td></tr>`;
+      html += `<tr class="pad"><td colspan="${span}" style="height:${(total - end) * rowH}px"></td></tr>`;
     }
     html += '</tbody>';
     table.innerHTML = html;
     applyColWidths();
   }
 
-  // 拖拽列宽时只改 colgroup，不重排 DOM
+  // 拖拽列宽/行高时只改 colgroup 与 CSS 变量，不重排整表
   function applyColWidths() {
-    let sum = ROWNUM_W + (checkable ? CK_W : 0);
+    let sum = rownumW + (checkable ? CK_W : 0);
     for (const w of widths) sum += w;
     table.style.tableLayout = 'fixed';
     table.style.width = sum + 'px';
+    table.style.setProperty('--row-h', rowH + 'px');
     const els = table.querySelectorAll('colgroup col');
-    const base = checkable ? 2 : 1;
+    if (checkable && els[CK_COL]) els[CK_COL].style.width = CK_W + 'px';
+    if (els[ROWNUM_COL]) els[ROWNUM_COL].style.width = rownumW + 'px';
     for (let c = 0; c < widths.length; c++) {
-      if (els[base + c]) els[base + c].style.width = widths[c] + 'px';
+      if (els[dataColIndex(c)]) els[dataColIndex(c)].style.width = widths[c] + 'px';
     }
   }
 
@@ -159,12 +176,20 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
     if (onCheckChange) onCheckChange(checked.size);
   }
 
-  // ── 列宽拖拽 / 双击自适应 ──────────────────────────────
+  // ── 列宽 / 行高拖拽（双击自适应、复位）──────────────────
   table.addEventListener('mousedown', (e) => {
+    const rowHandle = e.target.closest('.rowresize');
+    if (rowHandle) {
+      resizeState = { kind: 'row', y: e.clientY, h: rowH };
+      document.body.style.cursor = 'row-resize';
+      e.preventDefault();
+      return;
+    }
     const handle = e.target.closest('.resize');
     if (handle) {
-      const ci = +handle.closest('th[data-col]').getAttribute('data-ci');
-      resizeState = { ci, x: e.clientX, w: widths[ci] };
+      const ci = +handle.getAttribute('data-ci');
+      if (ci === -1) resizeState = { kind: 'rownum', x: e.clientX, w: rownumW };
+      else resizeState = { kind: 'col', ci, x: e.clientX, w: widths[ci] };
       document.body.style.cursor = 'col-resize';
       e.preventDefault();
       return;
@@ -205,27 +230,52 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
     render();
   });
 
-  // 双击列边界 → 该列自适应内容宽度
+  // 双击边界 → 列自适应内容宽度 / 行高复位
   table.addEventListener('dblclick', (e) => {
+    const rowHandle = e.target.closest('.rowresize');
+    if (rowHandle) {
+      e.preventDefault();
+      e.stopPropagation();
+      rowH = ROW_H_DEF;
+      saveNum('rowH', rowH);
+      render();
+      return;
+    }
     const handle = e.target.closest('.resize');
     if (!handle) return;
-    const ci = +handle.closest('th[data-col]').getAttribute('data-ci');
     e.preventDefault();
     e.stopPropagation();
-    widths[ci] = fitWidth(ci);
+    const ci = +handle.getAttribute('data-ci');
+    if (ci === -1) {
+      rownumW = ROWNUM_W_DEF;
+      saveNum('rownumW', rownumW);
+    } else {
+      widths[ci] = fitWidth(ci);
+    }
     applyColWidths();
   });
 
   document.addEventListener('mousemove', (e) => {
     if (resizeState) {
-      const w = Math.max(MIN_W, Math.min(MAX_W, resizeState.w + (e.clientX - resizeState.x)));
-      widths[resizeState.ci] = Math.round(w);
-      applyColWidths();
+      if (resizeState.kind === 'row') {
+        rowH = Math.max(ROW_H_MIN, Math.min(ROW_H_MAX, Math.round(resizeState.h + (e.clientY - resizeState.y))));
+        render();                       // 行高变了：垫片高度与可视行数都要重算
+      } else if (resizeState.kind === 'rownum') {
+        rownumW = Math.max(34, Math.min(160, Math.round(resizeState.w + (e.clientX - resizeState.x))));
+        applyColWidths();
+      } else {
+        widths[resizeState.ci] = Math.round(Math.max(MIN_W, Math.min(MAX_W, resizeState.w + (e.clientX - resizeState.x))));
+        applyColWidths();
+      }
       return;
     }
     if (dragMode && (e.buttons & 1) === 0) dragMode = null;
   });
   document.addEventListener('mouseup', () => {
+    if (resizeState) {
+      if (resizeState.kind === 'row') saveNum('rowH', rowH);
+      else if (resizeState.kind === 'rownum') saveNum('rownumW', rownumW);
+    }
     resizeState = null;
     dragMode = null;
     document.body.style.cursor = '';
@@ -233,7 +283,7 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
 
   // ── 排序（表头点击，三态） / 全选（# 表头） ──────────────
   table.addEventListener('click', (e) => {
-    if (e.target.closest('.resize')) return;
+    if (e.target.closest('.resize') || e.target.closest('.rowresize')) return;
     const thAll = e.target.closest('thead th.rownum');
     if (thAll) {
       sel = { r1: 0, c1: 0, r2: Math.max(0, view.length - 1), c2: Math.max(0, cols.length - 1) };
@@ -288,7 +338,7 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
   });
 
   container.addEventListener('scroll', () => {
-    const fv = Math.floor(container.scrollTop / ROW_H);
+    const fv = Math.floor(container.scrollTop / rowH);
     if (fv !== firstVisible) {
       firstVisible = fv;
       render();
@@ -342,6 +392,15 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
       afterCheck();
     },
     setSort(k) { sortKey = k; },
+    // 行高 / 行号列宽复位（供自测与「恢复默认」用）
+    resetLayout() {
+      rowH = ROW_H_DEF;
+      rownumW = ROWNUM_W_DEF;
+      saveNum('rowH', rowH);
+      saveNum('rownumW', rownumW);
+      render();
+    },
+    rowHeight: () => rowH,
     clear() { cols = []; rows = []; view = []; widths = []; sel = null; checked = new Set(); render(); },
     rowAt(i) { return view[i]; },
     rowCount: () => view.length,

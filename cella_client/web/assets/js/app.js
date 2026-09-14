@@ -7,6 +7,7 @@ import { createEditor, formatSql } from './editor.js';
 import { createGrid } from './grid.js';
 import { createTree } from './tree.js';
 import { initBottomPanel, renderStruct } from './panels.js';
+import { loadNum, saveNum, makeSplitter, setVar } from './ui.js';
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -921,6 +922,58 @@ async function doLogout() {
   showLogin('已登出');
 }
 
+// 布局分隔条：侧边栏宽度、底部面板高度（都持久化；双击复位）
+const SIDEBAR_W = { def: 200, min: 140, max: 560 };
+const PANEL_H = { def: 200, min: 90, max: 640 };
+
+function applySidebarW(px) {
+  setVar('--sidebar-w', px);
+  saveNum('sidebarW', px);
+}
+function applyPanelH(px) {
+  setVar('--panel-h', px);
+  saveNum('panelH', px);
+}
+
+function initSplitters() {
+  const sw0 = loadNum('sidebarW', SIDEBAR_W.def, SIDEBAR_W.min, SIDEBAR_W.max);
+  const ph0 = loadNum('panelH', PANEL_H.def, PANEL_H.min, PANEL_H.max);
+  applySidebarW(sw0);
+  applyPanelH(ph0);
+
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+  const sideEl = $('sidebarSplit');
+  let sideW = sw0;
+  makeSplitter(sideEl, {
+    axis: 'x',
+    onMove: (dx) => {
+      sideW = clamp(sw0 + dx, SIDEBAR_W.min, SIDEBAR_W.max);
+      setVar('--sidebar-w', sideW);
+    },
+    onEnd: () => saveNum('sidebarW', sideW),
+  });
+  sideEl.addEventListener('dblclick', () => { sideW = SIDEBAR_W.def; applySidebarW(sideW); });
+
+  const panelEl = $('panelSplit');
+  let panelH = ph0;
+  makeSplitter(panelEl, {
+    axis: 'y',
+    onMove: (dx, dy) => {
+      panelH = clamp(ph0 - dy, PANEL_H.min, PANEL_H.max);   // 向上拖 = 面板变高
+      setVar('--panel-h', panelH);
+    },
+    onEnd: () => saveNum('panelH', panelH),
+  });
+  panelEl.addEventListener('dblclick', () => { panelH = PANEL_H.def; applyPanelH(panelH); });
+
+  // 面板隐藏时把手柄一起藏起来
+  const panel = $('bottomPanel');
+  const syncSplit = () => panelEl.classList.toggle('hidden', panel.classList.contains('hidden'));
+  syncSplit();
+  new MutationObserver(syncSplit).observe(panel, { attributes: true, attributeFilter: ['class'] });
+}
+
 // ── 启动 ────────────────────────────────────────────────────
 function applyTheme(t) {
   document.documentElement.setAttribute('data-theme', t);
@@ -966,6 +1019,7 @@ async function boot() {
 
   const panel = initBottomPanel();
   showPanel = panel.show;
+  initSplitters();
   const tree = createTree($('tree'), { store: { state$ }, actions });
   subscribe(() => tree.render(state$()));
   $('treeFilter').addEventListener('input', (e) => set({ treeFilter: e.target.value }));
@@ -1090,6 +1144,13 @@ async function boot() {
 }
 
 // 调试/自测句柄（web/_selftest/*.html 依赖；正常使用无副作用）
-window.__cella = { state$, actions, newQueryTab, closeTab, fullRefresh };
+window.__cella = {
+  state$, actions, newQueryTab, closeTab, fullRefresh,
+  layout: {
+    SIDEBAR_W, PANEL_H,
+    applySidebarW, applyPanelH,
+    reset() { applySidebarW(SIDEBAR_W.def); applyPanelH(PANEL_H.def); },
+  },
+};
 
 boot();

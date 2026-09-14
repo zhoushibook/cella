@@ -32,7 +32,9 @@ const wOf = (ci) => parseInt(colEl(ci).style.width, 10);
 
 // ① 结构
 ok('colgroup/固定布局', !!host.querySelector('colgroup') && host.querySelector('table').style.tableLayout === 'fixed');
-ok('列头 3 个 + 手柄 3 个', host.querySelectorAll('th[data-col]').length === 3 && host.querySelectorAll('th .resize').length === 3);
+ok('列头 3 个 + 列宽手柄 4 个（含行号列）',
+  host.querySelectorAll('th[data-col]').length === 3 && host.querySelectorAll('th .resize').length === 4 &&
+  host.querySelectorAll('th .rowresize').length === 1);
 ok('复选框/行号列', host.querySelectorAll('td.ck input[data-ck]').length === 3 && host.querySelectorAll('td.rownum').length === 3);
 ok('NULL 灰斜体', !!host.querySelector('td.nullv'));
 ok('初始列宽 id=' + wOf(0) + ' name=' + wOf(1) + ' score=' + wOf(2), wOf(1) > 52 && wOf(2) > 52);
@@ -91,6 +93,29 @@ ok('查询结果本地升序首行 = ' + g2.rowAt(0)[1], g2.rowAt(0)[1] === 'A-v
 host2.querySelector('th[data-col="name"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
 ok('再点降序首行 = ' + g2.rowAt(0)[1], g2.rowAt(0)[1] === 'Bob');
 ok('排序后 rowAt 仍是完整数据行', g2.rowAt(0).length === 3 && g2.rowAt(0)[0] === 2);
+
+// ⑨ 大表虚拟滚动的垫片高度随行高变化（行高可拖）
+const host3 = document.createElement('div');
+host3.style.cssText = 'height:300px;width:600px;border:1px solid #ccc';
+document.body.appendChild(host3);
+const big = Array.from({ length: 500 }, (_, i) => [i + 1, 'name-' + i, i * 1.5]);
+const g3 = createGrid(host3);
+g3.setData(cols, big);
+host3.scrollTop = 4000;
+host3.dispatchEvent(new Event('scroll', { bubbles: true }));
+const padOf = () => host3.querySelector('tr.pad td');
+const padH = () => (padOf() ? parseInt(padOf().style.height, 10) : 0);
+ok('大表出现垫片，高度是行高整数倍（' + padH() + ' % 26）', !!padOf() && padH() > 0 && padH() % 26 === 0);
+host3.querySelector('th.rownum .rowresize').dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: 0, clientY: 0 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 0, clientY: 14, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+ok('拖行高后 rowHeight() = ' + g3.rowHeight(), g3.rowHeight() === 40);
+ok('垫片按新行高重算（' + padH() + ' % 40）', padH() % 40 === 0 && padH() > 0);
+const rowPx = host3.querySelector('tr[data-r]').offsetHeight;
+ok('实测行高 ' + rowPx + 'px ≈ 40', Math.abs(rowPx - 40) <= 1);
+ok('行高已写入 CSS 变量', host3.querySelector('table').style.getPropertyValue('--row-h') === '40px');
+g3.resetLayout();
+ok('resetLayout 复位行高 26', g3.rowHeight() === 26);
 
 document.getElementById('out').textContent = L.join('\n');
 </script>
