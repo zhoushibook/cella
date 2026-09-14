@@ -41,6 +41,26 @@ async function run() {
   ok('网格有勾选列', d.querySelectorAll('td.ck input[data-ck]').length > 0);
   ok('网格有列宽手柄', d.querySelectorAll('th .resize').length > 0);
 
+  // ②-bis 回归：双击进入单元格编辑。mousedown 若重建表格 DOM，浏览器的 dblclick 计数会被打断
+  const d0 = d.querySelector('tr[data-r="0"] td[data-c="2"]');
+  d0.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+  d0.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+  d0.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  d0.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+  d0.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+  d0.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  ok('两次点击后 td 实例不变（dblclick 可触发）',
+    d.querySelector('tr[data-r="0"] td[data-c="2"]') === d0);
+  d0.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true }));
+  await sleep(250);
+  const cellInput = d0.querySelector('input.cellinput');
+  ok('双击进入单元格编辑（值=' + (cellInput ? cellInput.value : '-') + '）', !!cellInput);
+  if (cellInput) {
+    cellInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+  }
+  await sleep(500);
+  ok('Esc 退出编辑回到展示态', !d.querySelector('tr[data-r="0"] td[data-c="2"] input'));
+
   // ③ 勾选 → 删除选中按钮可用
   const firstCk = d.querySelector('td.ck input[data-ck]');
   firstCk.checked = true;

@@ -181,6 +181,30 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
     if (onCheckChange) onCheckChange(checked.size);
   }
 
+  // 只改选区高亮的类名，**不重建 DOM**。mousedown 里整表重建会打断浏览器的双击计数
+  // （第二次点击落在新建的 td 实例上，click detail 永远到不了 2 → dblclick 不触发 → 单元格编辑失灵）
+  function paintSelection() {
+    table.querySelectorAll('.sel').forEach((el) => el.classList.remove('sel'));
+    if (!sel || !cols.length) return;
+    const r1 = Math.min(sel.r1, sel.r2), r2 = Math.max(sel.r1, sel.r2);
+    const c1 = Math.min(sel.c1, sel.c2), c2 = Math.max(sel.c1, sel.c2);
+    const rowSel = sel.c1 === 0 && sel.c2 === cols.length - 1;
+    table.querySelectorAll('tbody tr[data-r]').forEach((tr) => {
+      const r = +tr.getAttribute('data-r');
+      if (r < r1 || r > r2) return;
+      if (rowSel) {
+        const rn = tr.querySelector('td.rownum');
+        if (rn) rn.classList.add('sel');
+        const ck = tr.querySelector('td.ck');
+        if (ck) ck.classList.add('sel');
+      }
+      for (let c = c1; c <= c2; c++) {
+        const td = tr.querySelector('td[data-c="' + c + '"]');
+        if (td) td.classList.add('sel');
+      }
+    });
+  }
+
   // ── 列宽 / 行高拖拽（双击自适应、复位）──────────────────
   table.addEventListener('mousedown', (e) => {
     const rowHandle = e.target.closest('.rowresize');
@@ -212,12 +236,12 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
     if (td.classList.contains('rownum') || td.classList.contains('ck')) {
       sel = { r1: r, c1: 0, r2: r, c2: cols.length - 1 };
       dragMode = 'row';
-      render();
+      paintSelection();
       return;
     }
     sel = { r1: r, c1: +td.getAttribute('data-c'), r2: r, c2: +td.getAttribute('data-c') };
     dragMode = 'cell';
-    render();
+    paintSelection();
   });
 
   table.addEventListener('mousemove', (e) => {
@@ -235,7 +259,7 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
       if (sel.c2 === +td.getAttribute('data-c') && !changed) return;
       sel.c2 = +td.getAttribute('data-c');
     }
-    render();
+    paintSelection();
   });
 
   // 双击边界 → 列自适应内容宽度 / 行高复位

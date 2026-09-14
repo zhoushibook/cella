@@ -142,6 +142,27 @@ ok('换成别的列则重新自适应', colEl(0).style.width !== wName);
 g.setData(cols, rows);
 ok('换回来仍能按列名找回宽度 ' + colEl(1).style.width, colEl(1).style.width === wName);
 
+// ⑫ 回归：mousedown 选区只改类名、不重建表格 DOM。
+// 整表重建会让第二次点击落在新的 td 实例上，浏览器 dblclick 计数（detail）到不了 2，
+// 双击进入单元格编辑就永远不触发（真实浏览器才有的问题，直接派发 dblclick 测不出来）。
+g.clearSelection();
+const td0 = host.querySelector('tr[data-r="0"] td[data-c="0"]');
+td0.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+ok('mousedown 高亮选区', td0.classList.contains('sel'));
+ok('mousedown 不重建表格 DOM（元素身份不变）',
+  td0.isConnected && host.querySelector('tr[data-r="0"] td[data-c="0"]') === td0);
+// 完整两次点击序列后，dblclick 仍派发到同一个 td 上且能冒泡到容器
+td0.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+td0.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+td0.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+td0.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+td0.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+ok('两次点击后 td 实例仍未替换', host.querySelector('tr[data-r="0"] td[data-c="0"]') === td0);
+let dblSeen = false;
+host.addEventListener('dblclick', () => { dblSeen = true; }, { once: true });
+td0.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+ok('dblclick 冒泡到容器（编辑入口可达）', dblSeen);
+
 document.getElementById('out').textContent = L.join('\n');
 </script>
 </body></html>
