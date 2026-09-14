@@ -426,7 +426,9 @@ function showRowMenu(x, y, tab, row) {
   const isDel = rid != null && p.del.has(rid);
   const items = [];
   items.push({ label: '复制该行 (TSV)', fn: () => {
-    navigator.clipboard.writeText(row.map((v) => (v === null ? 'NULL' : String(v))).join('\t'));
+    // 复制用户可见的数据：跳过内部定位键 rowid
+    const vis = row.filter((_, i) => tab.columns[i] && tab.columns[i].name !== 'rowid');
+    navigator.clipboard.writeText(vis.map((v) => (v === null ? 'NULL' : String(v))).join('\t'));
   } });
   if (insIdx >= 0) {
     items.push({ label: '撤销新增该行', danger: true, fn: () => { p.ins.splice(insIdx, 1); refreshDataGrid(tab); } });
@@ -536,7 +538,9 @@ function makeDirtyFn(tab) {
 // 用当前 tab.pageRows + 暂存集重画网格（不请求服务端）
 function refreshDataGrid(tab) {
   const display = buildDisplayRows(tab);
-  tab.ui.grid.setData(tab.columns, display, makeDirtyFn(tab));
+  // rowid 是引擎定位键（暂存编辑/乐观校验靠它），数据照拉但**不展示**——列从网格消失，
+  // 其余列的 data-c 仍是数据索引，编辑/选区/复制不受影响
+  tab.ui.grid.setData(tab.columns, display, makeDirtyFn(tab), { hidden: ['rowid'] });
   updateEditBar(tab);
 }
 

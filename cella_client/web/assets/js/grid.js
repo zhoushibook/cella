@@ -47,13 +47,14 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
   let resizeState = null;   // {kind:'col'|'rownum', x, w} | {kind:'row', y, h}
   let suppressClick = false; // 拖拽列宽/行高后浏览器会补一个 click，不能当成排序/全选
   let dirtyFn = null;       // (r, c) => bool：c=-1 表示「整行有未提交修改」（画在行号格上）
+  let hiddenSet = new Set(); // 不展示但保留在数据里的列名（如数据浏览的 rowid：定位键，不该亮给用户）
+  let visList = [];          // 可见列的**数据索引**；td 的 data-c 恒为数据索引，选区/编辑/拖拽无需换算
   let rowH = loadNum('rowH', ROW_H_DEF, ROW_H_MIN, ROW_H_MAX);          // 行高（可拖）
   let rownumW = loadNum('rownumW', ROWNUM_W_DEF, 34, 160);              // 「#」列宽（可拖）
 
-  // colgroup 索引：checkable 时 [ck][rownum][数据列...]
+  // colgroup 索引：checkable 时 [ck][rownum][可见数据列...]（隐藏列不占位）
   const CK_COL = 0;
   const ROWNUM_COL = checkable ? 1 : 0;
-  const dataColIndex = (c) => ROWNUM_COL + 1 + c;
 
   // 有 onSort（服务端/受控排序）时不自排；否则本地排序（查询结果用）
   const localSort = !onSort;
@@ -97,7 +98,7 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
     let h = '<colgroup>';
     if (checkable) h += `<col style="width:${CK_W}px">`;
     h += `<col style="width:${rownumW}px">`;
-    for (let c = 0; c < cols.length; c++) h += `<col style="width:${widths[c]}px">`;
+    for (const di of visList) h += `<col style="width:${widths[di]}px">`;
     return h + '</colgroup>';
   }
 
@@ -121,12 +122,12 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
     html += `<th class="rownum" title="点选整行；点表头选全部；拖右边缘调列宽，拖下边缘调行高">#` +
       `<span class="resize size-rownum" data-ci="-1"></span>` +
       `<span class="rowresize" title="拖动调整行高（双击复位）"></span></th>`;
-    for (let c = 0; c < cols.length; c++) {
-      const col = cols[c];
+    for (const di of visList) {
+      const col = cols[di];
       const arrow = sortKey && sortKey.col === col.name ? (sortKey.dir === 'asc' ? ' ▲' : ' ▼') : '';
-      html += `<th data-col="${esc(col.name)}" data-ci="${c}" class="${isNumCol(col) ? 'num' : ''}"` +
+      html += `<th data-col="${esc(col.name)}" data-ci="${di}" class="${isNumCol(col) ? 'num' : ''}"` +
         ` title="${esc(col.name)}${localSort ? '（点击排序，三次取消）' : '（点击排序，三次恢复默认序）'}">` +
-        `${esc(col.name)}${arrow}<span class="resize" data-ci="${c}"></span></th>`;
+        `${esc(col.name)}${arrow}<span class="resize" data-ci="${di}"></span></th>`;
     }
     html += '</tr></thead><tbody>';
 
@@ -143,12 +144,12 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
       html += `<tr data-r="${r}">`;
       if (checkable) html += `<td class="ck${rs}"><input type="checkbox" data-ck="${r}"${checked.has(r) ? ' checked' : ''}></td>`;
       html += `<td class="rownum${rs}${rowKind ? ' ' + rowKind : ''}"${rowTip}>${r + 1}</td>`;
-      for (let c = 0; c < cols.length; c++) {
-        const v = row[c];
-        const kind = dirtyFn ? (dirtyFn(r, c) || '') : '';
-        const cls = (isNumCol(cols[c]) ? 'num ' : '') + (inSel(r, c) ? 'sel ' : '') +
+      for (const di of visList) {
+        const v = row[di];
+        const kind = dirtyFn ? (dirtyFn(r, di) || '') : '';
+        const cls = (isNumCol(cols[di]) ? 'num ' : '') + (inSel(r, di) ? 'sel ' : '') +
           (v === null || v === undefined ? 'nullv ' : '') + (kind ? kind + ' ' : '');
-        html += `<td data-c="${c}" class="${cls.trim()}" title="${esc(cellText(v))}">${esc(cellText(v))}</td>`;
+        html += `<td data-c="${di}" class="${cls.trim()}" title="${esc(cellText(v))}">${esc(cellText(v))}</td>`;
       }
       html += '</tr>';
     }
@@ -164,16 +165,17 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
   // 拖拽列宽/行高时只改 colgroup 与 CSS 变量，不重排整表
   function applyColWidths() {
     let sum = rownumW + (checkable ? CK_W : 0);
-    for (const w of widths) sum += w;
+    for (const di of visList) sum += widths[di];   // 只算可见列（隐藏列不占 col）
     table.style.tableLayout = 'fixed';
     table.style.width = sum + 'px';
     table.style.setProperty('--row-h', rowH + 'px');
     const els = table.querySelectorAll('colgroup col');
     if (checkable && els[CK_COL]) els[CK_COL].style.width = CK_W + 'px';
     if (els[ROWNUM_COL]) els[ROWNUM_COL].style.width = rownumW + 'px';
-    for (let c = 0; c < widths.length; c++) {
-      if (els[dataColIndex(c)]) els[dataColIndex(c)].style.width = widths[c] + 'px';
-    }
+    visList.forEach((di, pos) => {
+      const el = els[ROWNUM_COL + 1 + pos];
+      if (el) el.style.width = widths[di] + 'px';
+    });
   }
 
   function syncCkAll() {
@@ -483,7 +485,10 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
     const lines = [];
     for (let r = r1; r <= r2 && r < view.length; r++) {
       const cells = [];
-      for (let c = c1; c <= c2 && c < cols.length; c++) cells.push(cellText(view[r][c]));
+      for (let c = c1; c <= c2 && c < cols.length; c++) {
+        if (hiddenSet.has(cols[c].name)) continue;   // 隐藏列（如 rowid）不进复制内容
+        cells.push(cellText(view[r][c]));
+      }
       lines.push(cells.join('\t'));
     }
     e.clipboardData.setData('text/plain', lines.join('\n'));
@@ -491,7 +496,9 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
   });
 
   return {
-    setData(columns, dataRows, isDirty) {
+    // opts.hidden：列名数组——这些列保留在数据与索引体系里（data-c 仍是数据索引），
+    // 但不出 colgroup/表头/单元格、不进复制内容（如数据浏览的 rowid 定位键）
+    setData(columns, dataRows, isDirty, opts) {
       // 保留「同名同类型」列的宽度：翻页 / 排序 / 保存 / 重跑查询 / 换列集再换回来，都不冲掉用户调过的列宽
       const prevCols = cols;
       const prevWidths = widths;
@@ -499,6 +506,8 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
       cols = columns || [];
       rows = dataRows || [];
       dirtyFn = isDirty || null;
+      hiddenSet = new Set((opts && opts.hidden) || []);
+      visList = cols.map((_, i) => i).filter((i) => !hiddenSet.has(cols[i].name));
       checked = new Set();
       sel = null;
       firstVisible = 0;
@@ -535,7 +544,7 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
       render();
     },
     rowHeight: () => rowH,
-    clear() { cols = []; rows = []; view = []; widths = []; sel = null; checked = new Set(); dirtyFn = null; render(); },
+    clear() { cols = []; rows = []; view = []; widths = []; sel = null; checked = new Set(); dirtyFn = null; hiddenSet = new Set(); visList = []; render(); },
     rowAt(i) { return view[i]; },
     rowCount: () => view.length,
     getChecked: () => [...checked].sort((a, b) => a - b),

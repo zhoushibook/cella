@@ -245,6 +245,29 @@ tdA2.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
 ok('交界处双击仍冒泡（编辑入口可达）', dblCell);
 g.resetLayout();
 
+// ⑮ 隐藏列（数据浏览的 rowid）：定位键参与数据/索引体系，但不展示、不进复制
+const colsH = [{ name: 'rowid', type: 'INT64' }, { name: 'id', type: 'INT32' }, { name: 'v', type: 'VARCHAR' }];
+const rowsH = [[196608, 1, 'a'], [196609, 2, 'b']];
+g.setData(colsH, rowsH, null, { hidden: ['rowid'] });
+ok('隐藏列不出 colgroup/表头/单元格',
+  host.querySelectorAll('colgroup col').length === 4 &&          // ck + rownum + 2 个可见数据列
+  !host.querySelector('th[data-col="rowid"]') && !host.querySelector('td[data-c="0"]'));
+ok('其余列 data-c 仍是数据索引（v = data-c 2）',
+  !!host.querySelector('td[data-c="2"]') && host.querySelector('tr[data-r="0"] td[data-c="2"]').textContent === 'a');
+g.clearSelection();
+host.querySelector('tr[data-r="0"] td[data-c="2"]').dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+host.querySelector('tr[data-r="1"] td[data-c="2"]').dispatchEvent(new MouseEvent('mousemove', { bubbles: true, buttons: 1 }));
+const dtH = new DataTransfer();
+document.dispatchEvent(new ClipboardEvent('copy', { clipboardData: dtH, bubbles: true }));
+ok('复制不含隐藏列（' + JSON.stringify(dtH.getData('text/plain')) + '）', dtH.getData('text/plain') === 'a\nb');
+host.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true }));
+ok('Ctrl+A 只选中可见格（4 格）', host.querySelectorAll('td[data-c].sel').length === 4);
+g.setData(colsH, rowsH, (r, c) => (r === 1 && c === 2 ? 'dirty' : null), { hidden: ['rowid'] });
+ok('脏标记按数据索引命中隐藏列之外的列', !!host.querySelector('td[data-c="2"].dirty'));
+g.setData(cols, rows);
+ok('不带 hidden 恢复完整展示（id 列回来到 data-c 0）',
+  !!host.querySelector('th[data-col="id"]') && host.querySelectorAll('td[data-c="0"]').length === 3);
+
 document.getElementById('out').textContent = L.join('\n');
 </script>
 </body></html>
