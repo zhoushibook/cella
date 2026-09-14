@@ -16,6 +16,7 @@
     <span class="spacer"></span>
     <button id="btnRun" class="btn primary" title="执行 (Ctrl+Enter)">▶ 执行</button>
     <button id="btnFormat" class="btn" title="格式化 SQL">格式化</button>
+    <select id="sqlHistory" class="histsel" title="SQL 历史（Ctrl+↑ / Ctrl+↓ 回翻）" disabled><option value="">历史…</option></select>
     <button id="btnExport" class="btn" title="导出当前结果（右键=JSON）">导出</button>
     <span class="spacer"></span>
     <span id="userChip" class="userchip" title="当前登录用户"></span>
@@ -26,6 +27,13 @@
     <button id="btnRollback" class="btn" disabled>ROLLBACK</button>
     <button id="btnTheme" class="btn icon" title="切换主题">◐</button>
   </header>
+
+  <div id="busyBar" class="busybar hidden"></div>
+  <div id="connBanner" class="connbanner">
+    <span>⚠ 与服务的连接已断开</span>
+    <span class="hint" id="connHint">服务进程可能已停止。恢复后会自动重连。</span>
+    <button id="connRetry" class="btn">立即重试</button>
+  </div>
 
   <div id="main" class="main">
     <aside id="sidebar" class="sidebar">
@@ -46,6 +54,7 @@
   <footer id="statusbar" class="statusbar">
     <span id="stLeft" class="stleft"></span>
     <span class="spacer"></span>
+    <span id="stBusy" class="stbusy hidden">执行中…</span>
     <span id="stMsgs" class="stlink">消息</span>
     <span id="stPlan" class="stlink">计划</span>
     <span id="stDiag" class="stlink">诊断</span>

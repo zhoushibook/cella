@@ -18,6 +18,18 @@ export function getToken() { return token; }
 // 401 回调（由 app.js 注入：弹出登录框）
 export const Auth = { onUnauthorized: null };
 
+// 连接状态：服务进程挂掉时页面要能直说「已断开」，而不是每条请求各弹一个 toast
+export const Conn = {
+  online: true,
+  listeners: new Set(),
+  onLine(fn) { Conn.listeners.add(fn); return () => Conn.listeners.delete(fn); },
+  set(online) {
+    if (online === Conn.online) return;
+    Conn.online = online;
+    for (const fn of Conn.listeners) fn(online);
+  },
+};
+
 export class ApiError extends Error {
   constructor(payload) {
     super(payload.message || '请求失败');
@@ -40,8 +52,10 @@ async function call(method, path, body) {
   try {
     resp = await fetch(path, opt);
   } catch (e) {
+    Conn.set(false);
     throw new ApiError({ code: 'NET', message: '无法连接服务（可能已停止运行）' });
   }
+  Conn.set(true);
   if (resp.status === 401) {
     setToken('');
     if (Auth.onUnauthorized) Auth.onUnauthorized();

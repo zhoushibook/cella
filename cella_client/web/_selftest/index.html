@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>cella 前端自测</title>
+<link rel="stylesheet" href="/assets/app.css">
+<style>
+  body{display:block;overflow:auto;padding:20px 24px;max-width:880px;margin:0 auto}
+  h1{font-size:18px;margin:0 0 6px}
+  h2{font-size:14px;margin:22px 0 8px}
+  p,li{line-height:1.8;font-size:13px;color:var(--text)}
+  code{font-family:var(--mono);background:var(--bg-sub);border:1px solid var(--border);border-radius:4px;padding:0 4px}
+  pre{font-family:var(--mono);font-size:12px;background:var(--bg-sub);border:1px solid var(--border);border-radius:6px;padding:10px;overflow:auto}
+  .case{border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin:10px 0}
+  .case h3{margin:0 0 4px;font-size:13px}
+  .case a{color:var(--accent)}
+  .dim{color:var(--text-dim)}
+</style>
+</head><body>
+<h1>cella 前端自测</h1>
+<p class="dim">零依赖的行为测试：在真实浏览器里 import 真实模块，派发真实事件，把断言结果写回页面。
+用 headless 浏览器跑（无需 npm / 无需装 agent-browser）。</p>
+
+<div class="case">
+  <h3>① <a href="/_selftest/grid.html">grid.html</a> —— 结果网格</h3>
+  <p class="dim">18 项：固定布局与 colgroup、列宽拖拽 + 双击自适应、三态排序、勾选与全选、区块选区 + Ctrl+C TSV、
+  点行号选整行 / Ctrl+A 全选、无 onSort 时本地排序。</p>
+</div>
+<div class="case">
+  <h3>② <a href="/_selftest/editor.html">editor.html</a> —— SQL 编辑器</h3>
+  <p class="dim">17 项：高亮三类 token、Ctrl+/ 注释开关、Tab / Shift+Tab 整块缩进、括号引号自动配对与跳过、
+  成对删除、Enter 智能缩进、光标/滚动状态存取、Ctrl+↑↓ 历史回调、格式化。</p>
+</div>
+<div class="case">
+  <h3>③ <a href="/_selftest/panels.html">panels.html</a> —— 诊断/计划解析</h3>
+  <p class="dim">18 项：四类诊断文本 → 结构化（缓冲池计数与命中率、锁表 X/S/等待者、等待图边与**环检测**、
+  事务表汇总与明细）、计划缩进树、渲染层 DOM 断言。</p>
+</div>
+<div class="case">
+  <h3>④ <a href="/_selftest/app.html">app.html</a> —— 整体集成</h3>
+  <p class="dim">33 项：在 iframe 里驱动真实页面 —— 两层树、数据工具条与每页行数、勾选批量删除按钮联动、
+  Ctrl+T/W 标签、切换保留光标、SQL 历史落库、右键菜单 6 项、诊断面板结构化与原始文本切换、
+  计划算子树 + 编译耗时、断线横幅与加载态元素。</p>
+</div>
+
+<h2>怎么跑</h2>
+<p>先起服务（<code>cella_web.exe --data ./mydb --port 8080</code>），然后任一浏览器打开上面的页面即可；
+结果直接打印在页面底部。</p>
+<p>命令行（headless Edge，配合脚本化断言解析）：</p>
+<pre>msedge --headless=new --disable-gpu --virtual-time-budget=25000 \
+       --user-data-dir=&lt;临时目录&gt; --dump-dom http://127.0.0.1:8080/_selftest/app.html</pre>
+<p class="dim">注意：<code>--user-data-dir</code> 用独立目录，避免并发实例互相占锁；
+断言结果在输出 DOM 的 <code>&lt;pre id="out"&gt;</code> 里（每个 PASS/FAIL 一行）。</p>
+</body></html>

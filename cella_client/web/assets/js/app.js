@@ -1,7 +1,7 @@
 // app.js —— 装配：顶栏 / 标签 / 数据浏览 / 行编辑 / 事务 / 导出。
 // 约定（PLAN §5.4.1）：组件间不互相调用，一律通过 store 交互。
 
-import { Api, ApiError, setToken, Auth } from './api.js';
+import { Api, ApiError, setToken, Auth, Conn } from './api.js';
 import { state$, set, subscribe, tableByName, pkOf } from './store.js';
 import { createEditor, formatSql } from './editor.js';
 import { createGrid } from './grid.js';
@@ -44,6 +44,69 @@ function cellFromInput(text, type) {
   return text; // CHAR/VARCHAR/TEXT/DATE/TIME/DATETIME
 }
 
+// 空库引导用的示例脚本（cella 方言：get=SELECT, in=FROM, limit=WHERE, ordered=ORDER BY）
+const SAMPLE_SQL = [
+  '-- 建表 → 插数据 → 查询（cella 方言）',
+  'CREATE TABLE student(id INT PRIMARY KEY, name VARCHAR(16), score DOUBLE);',
+  "INSERT INTO student VALUES (1, 'Alice', 88.5), (2, 'Bob', 76.0), (3, 'Cara', 95.25);",
+  'get id, name, score',
+  'in student',
+  'ordered score desc;',
+  '',
+].join('\n');
+
+// ── SQL 历史（localStorage，最近 200 条，去重后置顶）──────
+const HIST_KEY = 'cella.history';
+const HIST_MAX = 200;
+let history = [];
+try {
+  const raw = JSON.parse(localStorage.getItem(HIST_KEY) || '[]');
+  if (Array.isArray(raw)) history = raw.filter((x) => typeof x === 'string');
+} catch (e) { history = []; }
+let histIdx = -1;
+
+function pushHistory(sql) {
+  const s = String(sql || '').trim();
+  if (!s) return;
+  const i = history.indexOf(s);
+  if (i >= 0) history.splice(i, 1);
+  history.unshift(s);
+  if (history.length > HIST_MAX) history.length = HIST_MAX;
+  histIdx = -1;
+  try { localStorage.setItem(HIST_KEY, JSON.stringify(history)); } catch (e) { /* 超限就只留内存 */ }
+  renderHistory();
+}
+
+function renderHistory() {
+  const sel = $('sqlHistory');
+  if (!sel) return;
+  sel.innerHTML = '<option value="">历史…</option>';
+  for (let i = 0; i < history.length; i++) {
+    const o = document.createElement('option');
+    o.value = String(i);
+    const one = history[i].replace(/\s+/g, ' ').trim();
+    o.textContent = `${i + 1}. ${one.length > 64 ? one.slice(0, 64) + '…' : one}`;
+    sel.appendChild(o);
+  }
+  sel.disabled = history.length === 0;
+  sel.value = '';
+}
+
+function activeQueryTab() {
+  const t = state$().tabs.find((x) => x.id === state$().activeTab);
+  return t && t.type === 'query' ? t : null;
+}
+
+// Ctrl+↑ / Ctrl+↓：像 shell 一样回翻历史（dir: -1 更早，+1 更近）
+function historyPick(dir) {
+  const tab = activeQueryTab();
+  if (!tab || !tab.ui || !history.length) return;
+  histIdx = histIdx < 0 ? 0 : Math.min(history.length - 1, Math.max(0, histIdx - dir));
+  tab.sql = history[histIdx];
+  tab.ui.editor.setValue(tab.sql);
+  tab.ui.editor.focus();
+}
+
 // ── 标签管理 ────────────────────────────────────────────────
 let tabSeq = 0;
 function addTab(tab) {
@@ -54,14 +117,24 @@ function addTab(tab) {
 }
 function activateTab(id) {
   const s = state$();
+  // 切走前记下光标/滚动位置（面板 DOM 复用，回来时恢复）
+  const cur = s.tabs.find((t) => t.id === s.activeTab);
+  if (cur && cur.ui && cur.ui.editor) cur.caret = cur.ui.editor.getState();
   s.activeTab = id;
   renderTabs();
   renderTabBody();
+}
+function disposeTab(tab) {
+  if (tab && tab.el) {
+    tab.el.remove();
+    tab.el = null;
+  }
 }
 function closeTab(id) {
   const s = state$();
   const i = s.tabs.findIndex((t) => t.id === id);
   if (i < 0) return;
+  disposeTab(s.tabs[i]);
   s.tabs.splice(i, 1);
   if (s.activeTab === id) {
     const next = s.tabs[Math.max(0, i - 1)];
@@ -77,54 +150,88 @@ function renderTabs() {
   for (const t of state$().tabs) {
     const d = document.createElement('div');
     d.className = 'tab' + (state$().activeTab === t.id ? ' active' : '');
-    d.innerHTML = `<span>${esc(t.title)}</span><span class="close" title="关闭">✕</span>`;
+    d.innerHTML = `<span>${esc(t.title)}</span><span class="close" title="关闭 (Ctrl+W)">✕</span>`;
     d.addEventListener('click', (e) => {
       if (e.target.classList.contains('close')) closeTab(t.id);
       else activateTab(t.id);
     });
     bar.appendChild(d);
   }
+  const plus = document.createElement('div');
+  plus.className = 'tabadd';
+  plus.title = '新建查询 (Ctrl+T)';
+  plus.textContent = '+';
+  plus.addEventListener('click', () => newQueryTab());
+  bar.appendChild(plus);
 }
 
+let emptyEl = null;
 function renderTabBody() {
   const body = $('tabbody');
-  body.innerHTML = '';
   const tab = state$().tabs.find((t) => t.id === state$().activeTab);
+  // 非活动标签的面板**保留在 DOM 里**（只隐藏）：切回来时光标/滚动/列宽原样
+  for (const el of Array.from(body.children)) el.style.display = 'none';
   if (!tab) {
-    body.innerHTML = '<div class="empty">新建一个查询标签开始使用<br><span class="hint">或点左侧表名浏览数据</span></div>';
+    if (!emptyEl) {
+      emptyEl = document.createElement('div');
+      emptyEl.className = 'empty';
+      emptyEl.innerHTML = '新建一个查询标签开始使用<br>' +
+        '<span class="hint">Ctrl+T 新建查询 · 或点左侧表名浏览数据</span>' +
+        '<div style="margin-top:12px"><button class="btn primary" id="btnSample">插入建表示例</button></div>';
+      emptyEl.querySelector('#btnSample').addEventListener('click', () => newQueryTab(SAMPLE_SQL, '示例'));
+    }
+    emptyEl.style.display = '';
+    body.appendChild(emptyEl);
     return;
   }
-  if (tab.type === 'query') mountQueryTab(body, tab);
-  else if (tab.type === 'data') mountDataTab(body, tab);
-  else if (tab.type === 'struct') mountStructTab(body, tab);
+  if (!tab.el) {
+    tab.el = document.createElement('div');
+    tab.el.className = 'tabpane';
+    body.appendChild(tab.el);
+    if (tab.type === 'query') mountQueryTab(tab.el, tab);
+    else if (tab.type === 'data') mountDataTab(tab.el, tab);
+    else if (tab.type === 'struct') mountStructTab(tab.el, tab);
+  }
+  tab.el.style.display = '';
+  if (tab.type === 'query' && tab.ui && tab.ui.editor) {
+    const ed = tab.ui.editor;
+    const caret = tab.caret;
+    // 元素从 display:none 恢复显示后，浏览器会把插入点挪到末尾 → 显式还原，并在下一任务再兜一次
+    ed.focus();
+    ed.restoreState(caret);
+    setTimeout(() => { if (tab.el.style.display !== 'none') ed.restoreState(caret); }, 0);
+  }
+}
+
+// 新建空查询标签
+function newQueryTab(sql = '', titlePrefix = '') {
+  const n = state$().tabs.filter((t) => t.type === 'query').length + 1;
+  return addTab({ type: 'query', title: titlePrefix ? `${titlePrefix} ${n}` : '查询 ' + n, sql });
 }
 
 // ── 查询标签 ────────────────────────────────────────────────
-function mountQueryTab(body, tab) {
-  const pane = document.createElement('div');
-  pane.className = 'tabpane';
+function mountQueryTab(pane, tab) {
   const edwrap = document.createElement('div');
   const bar = document.createElement('div');
   bar.className = 'resultbar';
   const gridwrap = document.createElement('div');
   pane.append(edwrap, bar, gridwrap);
-  body.appendChild(pane);
 
   const editor = createEditor(edwrap, {
     onRun: (sql) => runSql(tab, sql),
-    onChange: (v) => { tab.sql = v; },
+    onChange: (v) => { tab.sql = v; tab.caret = null; },   // 内容变了，旧光标位置作废
+    onHistory: (dir) => historyPick(dir),
   });
   editor.setValue(tab.sql || '');
-  const grid = createGrid(gridwrap, {
-    onSort: () => {},   // 查询结果本地无排序（结果即引擎顺序）；排序请在 SQL 里写 ordered
-  });
+  const grid = createGrid(gridwrap);   // 查询结果在本地排序（引擎顺序为基准，点列头三态切换）
   tab.ui = { editor, grid, bar };
 
-  bar.innerHTML = '<span>按 Ctrl+Enter 执行（选中片段只跑选区）</span>';
+  bar.innerHTML = '<span>Ctrl+Enter 执行（选中片段只跑选区）· 点列头排序 · 点单元格拖选区 · Ctrl+C 复制</span>';
 }
 
 async function runSql(tab, sql) {
   if (!sql || !sql.trim()) return;
+  pushHistory(sql);
   set({ busy: true });
   try {
     const d = await Api.query(sql);
@@ -147,7 +254,9 @@ async function runSql(tab, sql) {
         });
       }
       if (st.columns) shown = st;
-      if (st.plan && (st.plan.before || st.plan.after)) showPanel('plan', st.plan);
+      if (st.plan && (st.plan.before || st.plan.after)) {
+        showPanel('plan', { before: st.plan.before, after: st.plan.after, elapsedMs: st.elapsedMs });
+      }
     }
 
     if (shown) {
@@ -175,32 +284,37 @@ async function runSql(tab, sql) {
 function bar2(tab) { return tab.ui.bar; }
 
 // ── 结构标签 ────────────────────────────────────────────────
-function mountStructTab(body, tab) {
-  const pane = document.createElement('div');
-  pane.className = 'tabpane';
+function mountStructTab(pane, tab) {
   pane.style.overflow = 'auto';
-  body.appendChild(pane);
   renderStruct(pane, tab.table);
 }
 
 // ── 数据标签（浏览 + 编辑）──────────────────────────────────
 const FULL_FETCH = 20000; // §11.7：小表全量拉取阈值
 
-function mountDataTab(body, tab) {
-  const pane = document.createElement('div');
-  pane.className = 'tabpane';
+function mountDataTab(pane, tab) {
   const bar = document.createElement('div');
   bar.className = 'databar';
   const gridwrap = document.createElement('div');
   pane.append(bar, gridwrap);
-  body.appendChild(pane);
 
   const grid = createGrid(gridwrap, {
-    onSort: (k) => { tab.sort = k.col; tab.order = k.dir; loadRows(tab); },
+    checkable: true,
+    onSort: (k) => {
+      // 三态：升 → 降 → 恢复默认序（有主键 = 主键升序，无主键 = rowid）
+      if (k) { tab.sort = k.col; tab.order = k.dir; } else { tab.sort = null; tab.order = 'asc'; }
+      loadRows(tab);
+    },
+    onCheckChange: (n) => {
+      const b = bar.querySelector('[data-act="del"]');
+      b.disabled = n === 0;
+      b.textContent = n ? `删除选中 (${n})` : '删除选中';
+    },
   });
 
   bar.innerHTML = `
     <button class="btn" data-act="add">+ 新增行</button>
+    <button class="btn danger" data-act="del" disabled>删除选中</button>
     <button class="btn" data-act="reload">刷新</button>
     <span class="spacer"></span>
     <span class="pager">
@@ -209,14 +323,28 @@ function mountDataTab(body, tab) {
       第 <input data-act="page" value="1"> 页
       <button class="btn" data-act="next">›</button>
       <button class="btn" data-act="last">»</button>
+      每页 <select data-act="pagesize">
+        <option value="100">100</option>
+        <option value="200" selected>200</option>
+        <option value="500">500</option>
+        <option value="1000">1000</option>
+      </select>
       <span data-act="total">共 … 行</span>
     </span>`;
   bar.querySelector('[data-act="add"]').addEventListener('click', () => openInsertModal(tab));
+  bar.querySelector('[data-act="del"]').addEventListener('click', () => deleteChecked(tab));
   bar.querySelector('[data-act="reload"]').addEventListener('click', () => loadRows(tab));
   const pageInput = bar.querySelector('[data-act="page"]');
   pageInput.addEventListener('change', () => {
     const p = Math.max(1, parseInt(pageInput.value, 10) || 1);
     goPage(tab, p);
+  });
+  const sizeSel = bar.querySelector('[data-act="pagesize"]');
+  sizeSel.addEventListener('change', () => {
+    tab.pageSize = parseInt(sizeSel.value, 10) || 200;
+    tab.page = 1;
+    if (tab.local) renderLocal(tab);
+    else loadRows(tab);
   });
   bar.querySelector('[data-act="first"]').addEventListener('click', () => goPage(tab, 1));
   bar.querySelector('[data-act="prev"]').addEventListener('click', () => goPage(tab, (tab.page || 1) - 1));
@@ -357,6 +485,33 @@ async function deleteRow(tab, row) {
   }
 }
 
+// 批量删除勾选行：自动包一个事务，任一行失败整体回滚（避免删一半）
+async function deleteChecked(tab) {
+  const idx = tab.ui.grid.getChecked();
+  const rows = idx.map((i) => tab.ui.grid.rowAt(i)).filter(Boolean);
+  if (!rows.length) return;
+  if (!confirm(`确认删除选中的 ${rows.length} 行？\n（自动包在一个事务里，任一行失败则整体回滚）`)) return;
+  const autoTxn = !state$().inTxn;
+  set({ busy: true });
+  try {
+    if (autoTxn) await Api.txn('begin');
+    for (const row of rows) {
+      await Api.deleteRow(tab.table, { key: keyForRow(tab, row), expect: expectForRow(tab, row) });
+    }
+    if (autoTxn) await Api.txn('commit');
+    toast(`已删除 ${rows.length} 行` + (autoTxn ? '' : '（外层事务未提交，记得 COMMIT）'), 'ok');
+  } catch (e) {
+    if (autoTxn) {
+      try { await Api.txn('rollback'); } catch (e2) { /* 回滚失败也继续刷新 */ }
+    }
+    toast(e.message, 'err', e.detail);
+  } finally {
+    set({ busy: false });
+    await fullRefresh();
+    await loadRows(tab);
+  }
+}
+
 function openInsertModal(tab) {
   const t = tableByName(tab.table);
   if (!t) return;
@@ -443,8 +598,7 @@ async function loadRows(tab) {
       tab.local = true;
       tab.all = d.rows;
       tab.total = d.total;
-      tab.pageSize = 200;
-      tab.page = 1;
+      if (!tab.pageSize) tab.pageSize = 200;
       tab.totalPages = Math.max(1, Math.ceil(d.total / tab.pageSize));
       renderLocal(tab);
     } else {
@@ -486,25 +640,43 @@ function renderLocal(tab) {
   tab.totalPages = Math.max(1, Math.ceil(sorted.length / tab.pageSize));
   tab.page = Math.min(Math.max(1, tab.page || 1), tab.totalPages);
   const start = (tab.page - 1) * tab.pageSize;
-  const pageRows = sorted.slice(start, start + tab.pageSize);
-  tab.ui.grid.setData(tab.columns, pageRows);
-  updateDataBar(tab, sorted.length, tab.page, tab.totalPages);
-  set({ statusText: `第 ${start + 1}–${start + pageRows.length} 行 · 共 ${sorted.length} 行` });
+  tab.pageRows = sorted.slice(start, start + tab.pageSize);
+  tab.ui.grid.setData(tab.columns, tab.pageRows);
+  updateDataBar(tab, {
+    page: tab.page,
+    shown: tab.pageRows.length,
+    totalKnown: true,
+    total: sorted.length,
+  });
+  set({
+    statusText: tab.pageRows.length
+      ? `第 ${start + 1}–${start + tab.pageRows.length} 行 · 共 ${sorted.length} 行`
+      : `共 ${sorted.length} 行`,
+  });
 }
 
 function renderServer(tab, d) {
+  tab.pageRows = d.rows;
   tab.ui.grid.setData(d.columns, d.rows);
-  updateDataBar(tab, d.rows.length, d.page, tab.totalPages, d.totalKnown, d.total);
+  updateDataBar(tab, { page: d.page, shown: d.rows.length, totalKnown: d.totalKnown, total: d.total });
   set({ statusText: `第 ${d.page} 页 · ${d.rows.length} 行` + (d.totalKnown ? ` · 共 ${d.total} 行` : ' · 共 ≈? 行') });
 }
 
-function updateDataBar(tab, rowCount, page, totalPages, totalKnown, total) {
+function updateDataBar(tab, info) {
   const bar = tab.ui.bar;
   const pageInput = bar.querySelector('[data-act="page"]');
-  if (pageInput) pageInput.value = page;
+  // 大表懒统计时算不出总页数，页码框退化为自由输入
+  if (pageInput) {
+    pageInput.value = info.page;
+    if (info.totalKnown) pageInput.max = tab.totalPages || 1;
+  }
+  const sizeSel = bar.querySelector('[data-act="pagesize"]');
+  if (sizeSel && tab.pageSize) sizeSel.value = String(tab.pageSize);
   const totalEl = bar.querySelector('[data-act="total"]');
   if (totalEl) {
-    totalEl.textContent = totalKnown ? `共 ${total} 行` : `共 ≈? 行（大表懒统计）`;
+    totalEl.textContent = info.totalKnown
+      ? `共 ${info.total} 行`
+      : (info.shown ? `本页 ${info.shown} 行 · 共 ≈? 行（大表懒统计）` : '共 ≈? 行（大表懒统计）');
   }
 }
 
@@ -548,21 +720,7 @@ function renderDbSelect() {
     if (d.current) o.selected = true;
     sel.appendChild(o);
   }
-  sel.addEventListener('change', async () => {
-    try {
-      await Api.useDb(sel.value);
-      toast('已切换到 ' + sel.value, 'ok');
-      // 切库后目录全变：关掉所有数据/结构标签，避免展示旧库内容
-      set({ tabs: state$().tabs.filter((t) => t.type === 'query') });
-      state$().activeTab = state$().tabs.length ? state$().tabs[0].id : null;
-      renderTabs();
-      renderTabBody();
-      await fullRefresh();
-    } catch (e) {
-      toast(e.message, 'err');
-      await refreshDatabases();
-    }
-  });
+  sel.addEventListener('change', () => { actions.useDb(sel.value); });
   const plus = document.createElement('button');
   plus.className = 'btn icon';
   plus.title = '新建数据库';
@@ -637,6 +795,31 @@ function exportResult(kind) {
 
 // ── 动作（树右键等）────────────────────────────────────────
 const actions = {
+  newQuery() { newQueryTab(); },
+  newQuerySample() { newQueryTab(SAMPLE_SQL, '示例'); },
+  refresh() { fullRefresh(); },
+  async useDb(name) {
+    if (!name || name === state$().currentDb) return;
+    try {
+      await Api.useDb(name);
+      toast('已切换到 ' + name, 'ok');
+      // 切库后目录全变：关掉所有数据/结构标签，避免展示旧库内容
+      const s = state$();
+      const doomed = s.tabs.filter((t) => t.type !== 'query');
+      doomed.forEach(disposeTab);
+      set({ tabs: s.tabs.filter((t) => t.type === 'query'), currentDb: name });
+      if (!state$().tabs.find((t) => t.id === state$().activeTab)) {
+        const left = state$().tabs;
+        state$().activeTab = left.length ? left[0].id : null;
+      }
+      renderTabs();
+      renderTabBody();
+      await fullRefresh();
+    } catch (e) {
+      toast(e.message, 'err', e.detail);
+      await refreshDatabases();
+    }
+  },
   openTable(name) {
     const s = state$();
     const exist = s.tabs.find((t) => t.type === 'data' && t.table === name);
@@ -650,8 +833,16 @@ const actions = {
     addTab({ type: 'struct', title: name + ' ⚙', table: name });
   },
   newQueryFor(name) {
-    addTab({ type: 'query', title: '查询 ' + (state$().tabs.filter((t) => t.type === 'query').length + 1),
-      sql: `get rowid, * in ${name};\n` });
+    // 注意：`get rowid, * in t` 是语法错误（`*` 必须独占整条 select 列表）→ 显式列全
+    const t = tableByName(name);
+    const cols = ['rowid'].concat(((t && t.columns) || []).map((c) => c.name)).join(', ');
+    newQueryTab(`get ${cols} in ${name};\n`);
+  },
+  genSelect(name) {
+    const t = tableByName(name);
+    const cols = ((t && t.columns) || []).map((c) => c.name);
+    const list = cols.length ? cols.join(', ') : '*';
+    newQueryTab(`get ${list}\nin ${name}\nordered ${cols[0] || 'rowid'} asc;\n`);
   },
   async dropTable(name) {
     if (!confirm(`确认删除表 ${name}？（DROP TABLE，不可撤销）`)) return;
@@ -659,9 +850,12 @@ const actions = {
       await Api.query(`drop table ${name};`);
       toast('已删除表 ' + name, 'ok');
       const s = state$();
-      set({ tabs: s.tabs.filter((t) => !(t.table && t.table.toLowerCase() === name.toLowerCase())) });
-      if (!s.tabs.find((t) => t.id === s.activeTab)) {
-        s.activeTab = s.tabs.length ? s.tabs[s.tabs.length - 1].id : null;
+      const doomed = s.tabs.filter((t) => t.table && t.table.toLowerCase() === name.toLowerCase());
+      doomed.forEach(disposeTab);
+      set({ tabs: s.tabs.filter((t) => !doomed.includes(t)) });
+      if (!state$().tabs.find((t) => t.id === state$().activeTab)) {
+        const left = state$().tabs;
+        state$().activeTab = left.length ? left[left.length - 1].id : null;
       }
       renderTabs();
       renderTabBody();
@@ -733,6 +927,35 @@ function applyTheme(t) {
   localStorage.setItem('cella.theme', t);
 }
 
+// 断线横幅 + 自动重连探测（服务进程被关掉时给出明确提示，而不是无限转圈）
+function setupConnection() {
+  const banner = $('connBanner');
+  let timer = null;
+  let wasDown = false;
+  const probe = async () => {
+    try {
+      await Api.health();
+      Conn.set(true);
+    } catch (e) { /* 还没恢复，继续等 */ }
+  };
+  Conn.onLine((online) => {
+    banner.style.display = online ? 'none' : 'flex';
+    if (!online) {
+      wasDown = true;
+      if (!timer) timer = setInterval(probe, 3000);
+    } else if (timer) {
+      clearInterval(timer);
+      timer = null;
+      if (wasDown) {
+        wasDown = false;
+        toast('已重新连接到服务', 'ok');
+        fullRefresh();
+      }
+    }
+  });
+  $('connRetry').addEventListener('click', probe);
+}
+
 async function boot() {
   applyTheme(state$().theme);
   $('btnTheme').addEventListener('click', () => {
@@ -763,6 +986,54 @@ async function boot() {
   $('btnExport').addEventListener('click', () => exportResult('csv'));
   $('btnExport').addEventListener('contextmenu', (e) => { e.preventDefault(); exportResult('json'); });
 
+  // SQL 历史下拉：选中即回填到当前查询标签
+  const histSel = $('sqlHistory');
+  renderHistory();
+  histSel.addEventListener('change', () => {
+    const i = parseInt(histSel.value, 10);
+    if (Number.isNaN(i)) return;
+    const tab = activeQueryTab();
+    const sql = history[i];
+    histSel.value = '';
+    if (sql === undefined) return;
+    if (!tab) {
+      const t = newQueryTab(sql);
+      toast(`已在新标签打开历史 #${i + 1}`, 'ok');
+      void t;
+      return;
+    }
+    tab.sql = sql;
+    tab.ui.editor.setValue(sql);
+    tab.ui.editor.focus();
+  });
+
+  // 全局快捷键
+  document.addEventListener('keydown', (e) => {
+    const mod = e.ctrlKey || e.metaKey;
+    const tag = (document.activeElement || {}).tagName || '';
+    const inField = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+    if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 't') {
+      e.preventDefault();
+      newQueryTab();
+      return;
+    }
+    if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'w') {
+      const id = state$().activeTab;
+      if (id) { e.preventDefault(); closeTab(id); }
+      return;
+    }
+    if (e.key === 'F5') {                    // F5 刷新目录（别按到浏览器刷新）
+      e.preventDefault();
+      fullRefresh();
+      return;
+    }
+    if (mod && e.key.toLowerCase() === 'k' && !inField) {   // Ctrl+K 快速筛选表
+      e.preventDefault();
+      $('treeFilter').focus();
+      $('treeFilter').select();
+    }
+  });
+
   $('btnBegin').addEventListener('click', async () => {
     try { const d = await Api.txn('begin'); set({ inTxn: d.inTxn, txnId: d.txnId }); refreshTxnButtons(); toast(d.note || 'BEGIN', 'ok'); }
     catch (e) { toast(e.message, 'err'); }
@@ -778,8 +1049,14 @@ async function boot() {
 
   $('stDiag').addEventListener('click', () => panel.show('diag'));
 
-  // 全局忙碌态：禁用执行按钮
-  subscribe((s) => { $('btnRun').disabled = s.busy; });
+  // 全局忙碌态：禁用执行按钮 + 顶部进度条 + 状态栏提示
+  subscribe((s) => {
+    $('btnRun').disabled = s.busy;
+    $('busyBar').classList.toggle('hidden', !s.busy);
+    $('stBusy').classList.toggle('hidden', !s.busy);
+  });
+
+  setupConnection();
 
   // 访问控制：登录层与用户标识
   subscribe(renderUserChip);
@@ -793,6 +1070,7 @@ async function boot() {
   // 首标签
   addTab({ type: 'query', title: '查询 1',
     sql: '-- cella 方言：get=SELECT, in=FROM, limit=WHERE, ordered=ORDER BY, page 页码, 每页行数\n' +
+         '-- 快捷键：Ctrl+Enter 执行 · Ctrl+/ 注释 · Ctrl+↑/↓ 历史 · Ctrl+T 新标签 · F5 刷新目录\n' +
          '-- 试试：CREATE TABLE student(id INT PRIMARY KEY, name VARCHAR(16), score DOUBLE);\n' });
 
   try {
@@ -810,5 +1088,8 @@ async function boot() {
     else toast(e.message, 'err', e.detail);
   }
 }
+
+// 调试/自测句柄（web/_selftest/*.html 依赖；正常使用无副作用）
+window.__cella = { state$, actions, newQueryTab, closeTab, fullRefresh };
 
 boot();

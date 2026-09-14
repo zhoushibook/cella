@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>editor test</title>
+<link rel="stylesheet" href="/assets/app.css">
+<style>#ed{height:200px;width:640px}</style>
+</head><body>
+<div id="ed"></div>
+<pre id="out">RUNNING</pre>
+<script type="module">
+import { createEditor, formatSql } from '/assets/js/editor.js';
+const L = [];
+const ok = (name, cond) => L.push((cond ? 'PASS ' : 'FAIL ') + name);
+
+const ed = createEditor(document.getElementById('ed'), {});
+const ta = ed.ta;
+const key = (k, opts = {}) => ta.dispatchEvent(new KeyboardEvent('keydown', Object.assign({ key: k, bubbles: true, cancelable: true }, opts)));
+const type = (s) => { ta.value += s; ta.dispatchEvent(new Event('input', { bubbles: true })); };
+
+// ① 高亮
+ta.value = "get id in t -- 注释\nwhere name = 'x'";
+ta.dispatchEvent(new Event('input', { bubbles: true }));
+const pre = document.getElementById('ed').querySelector('pre');
+ok('关键字高亮', pre.querySelectorAll('.tok-kw').length >= 3);
+ok('字符串高亮', pre.querySelectorAll('.tok-str').length === 1);
+ok('注释高亮', pre.querySelectorAll('.tok-com').length === 1);
+
+// ② Ctrl+/ 注释与反注释
+ed.setValue('get id in t;\nget name in t;');
+ta.selectionStart = 0; ta.selectionEnd = ta.value.length;
+key('/', { ctrlKey: true });
+ok('Ctrl+/ 注释两行 -> ' + JSON.stringify(ta.value), ta.value === '-- get id in t;\n-- get name in t;');
+key('/', { ctrlKey: true });
+ok('再 Ctrl+/ 取消注释', ta.value === 'get id in t;\nget name in t;');
+
+// ③ Tab 缩进 / Shift+Tab 反缩进
+ta.selectionStart = 0; ta.selectionEnd = ta.value.length;
+key('Tab');
+ok('Tab 整块缩进', ta.value === '  get id in t;\n  get name in t;');
+key('Tab', { shiftKey: true });
+ok('Shift+Tab 反缩进', ta.value === 'get id in t;\nget name in t;');
+
+// ④ 括号自动配对 + 跳过右符号
+ed.setValue('');
+ta.selectionStart = ta.selectionEnd = 0;
+key('(');
+ok('自动配对 ()', ta.value === '()' && ta.selectionStart === 1);
+key(')');
+ok('右括号跳过不打双份', ta.value === '()' && ta.selectionStart === 2);
+ed.setValue('ab');
+ta.selectionStart = 0; ta.selectionEnd = 2;
+key('(');
+ok('有选区时包裹', ta.value === '(ab)' && ta.selectionStart === 1 && ta.selectionEnd === 3);
+ed.setValue("''");
+ta.selectionStart = ta.selectionEnd = 1;
+key("'");
+ok('引号跳过', ta.selectionStart === 2);
+ed.setValue('()');
+ta.selectionStart = ta.selectionEnd = 1;
+key('Backspace');
+ok('删左半边连带删右半边', ta.value === '');
+// 自动缩进：上一行以 ( 结尾 → 多缩一级
+ed.setValue('create table t(');
+ta.selectionStart = ta.selectionEnd = ta.value.length;
+key('Enter');
+ok('Enter 在 ( 后多缩一级 -> ' + JSON.stringify(ta.value), ta.value === 'create table t(\n  ');
+
+// ⑤ 光标/滚动状态保存与恢复
+ed.setValue(Array.from({ length: 30 }, (_, i) => 'line' + i).join('\n'));
+ta.selectionStart = 5; ta.selectionEnd = 5; ta.scrollTop = 40;
+const st = ed.getState();
+ta.selectionStart = 0; ta.scrollTop = 0;
+ed.restoreState(st);
+ok('getState/restoreState 还原光标与滚动（scroll=' + ta.scrollTop + '）',
+  ta.selectionStart === 5 && ta.scrollTop === 40);
+
+// ⑥ 历史回调
+let hist = [];
+const ed2 = createEditor(document.createElement('div'), { onHistory: (d) => hist.push(d) });
+ed2.ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', ctrlKey: true, bubbles: true, cancelable: true }));
+ed2.ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', ctrlKey: true, bubbles: true, cancelable: true }));
+ok('Ctrl+↑/↓ 触发历史回调', JSON.stringify(hist) === '[-1,1]');
+
+// ⑦ 格式化
+const f = formatSql('create table t(a int); get a in t limit a = 1 ordered a asc;');
+ok('格式化按关键字换行 -> ' + JSON.stringify(f), f === 'CREATE TABLE t(a int);\nGET a\nIN t\nLIMIT a = 1\nORDERED a asc;');
+ok('缺分号自动补', formatSql('get a in t').endsWith(';'));
+
+document.getElementById('out').textContent = L.join('\n');
+</script>
+</body></html>
