@@ -1482,6 +1482,58 @@ namespace cella::db
     return DbStatus::Ok();
   }
 
+  // 聚合函数求值：目前只支持 COUNT(*) / COUNT(col)。
+  // 输入：分组内的全部行；输出：单个计数值（INT64）。
+  DbStatus EvalAggregate(const cella::CELLA_Expr &agg,
+                         const std::vector<std::vector<storage::Value>> &rows,
+                         const std::vector<int> &colIdx, storage::Value *out)
+  {
+    long long cnt = 0;
+    if (agg.aggStar)
+    {
+      cnt = static_cast<long long>(rows.size());
+    }
+    else
+    {
+      // COUNT(col)：只统计非 NULL 值（SQL 标准语义）
+      if (colIdx.empty() || colIdx[0] < 0)
+      {
+        return DbStatus::Error(DbCode::kColumnNotFound,
+                               "聚合列不存在: " +
+                                   (agg.table.empty() ? agg.column : agg.table + "." + agg.column));
+      }
+      const int i = colIdx[0];
+      for (const auto &row : rows)
+      {
+        if (static_cast<size_t>(i) < row.size() && !row[static_cast<size_t>(i)].IsNull())
+        {
+          ++cnt;
+        }
+      }
+    }
+    *out = storage::Value::BigInt(cnt);
+    return DbStatus::Ok();
+  }
+
+  // 在输入字段里解析一个聚合表达式的引用列下标（COUNT(*) 返回空）
+  DbStatus ResolveAggregateColumns(const cella::CELLA_Expr &agg, const RowSet &in,
+                                   const std::vector<FieldRef> &fields, std::vector<int> *out)
+  {
+    (void)in;
+    if (agg.aggStar)
+    {
+      return DbStatus::Ok();
+    }
+    const cella::CELLA_ColName key{agg.table, agg.column, agg.line, agg.col};
+    const int i = ResolveInRange(fields, key, fields.size());
+    if (i < 0)
+    {
+      return DbStatus::Error(DbCode::kColumnNotFound, "聚合列不存在: " + KeyName(key));
+    }
+    out->push_back(i);
+    return DbStatus::Ok();
+  }
+
   DbStatus Executor::OpAggregate(const cella::CELLA_PlanNode &node, const ExecContext &ctx,
                                  RowSet *out)
   {
@@ -1491,45 +1543,115 @@ namespace cella::db
     {
       return s;
     }
-    out->fields = std::move(in.fields);
-    if (node.groupKeys.empty())
+    // 注意：fields 之后会被搬进 out->fields，解析一律基于本地副本
+    const std::vector<FieldRef> inFields = in.fields;
+
+    // 无分组键也无聚合 → 原样透传（理论上计划器不会这样发，防御性保留）
+    if (node.groupKeys.empty() && node.aggExprs.empty())
     {
+      out->fields = std::move(in.fields);
       out->rows = std::move(in.rows);
       return DbStatus::Ok();
     }
-    std::vector<int> idx;
-    idx.reserve(node.groupKeys.size());
-    // 注意：in.fields 已被搬进 out->fields，故后续解析一律基于 out->fields
+
+    // ① 解析分组键下标
+    std::vector<int> keyIdx;
+    keyIdx.reserve(node.groupKeys.size());
     for (const auto &k : node.groupKeys)
     {
-      const int i = ResolveSortKey(*out, k);
+      const int i = ResolveInRange(inFields, k, inFields.size());
       if (i < 0)
       {
         return DbStatus::Error(DbCode::kColumnNotFound, "分组列不存在: " + KeyName(k));
       }
-      idx.push_back(i);
+      keyIdx.push_back(i);
     }
-    // 本方言无聚合函数：GROUP BY 实现为「按分组键去重，每组保留首行」
-    std::vector<std::string> seen;
-    seen.reserve(in.rows.size());
-    for (const auto &row : in.rows)
+
+    // ② 解析聚合项引用列下标（每项一个下标数组，COUNT(*) 为空）
+    std::vector<std::vector<int>> aggColIdx(node.aggExprs.size());
+    for (size_t a = 0; a < node.aggExprs.size(); ++a)
     {
-      const std::string key = KeyOfRow(row, idx);
-      bool dup = false;
-      for (const auto &k : seen)
+      const DbStatus rs = ResolveAggregateColumns(*node.aggExprs[a], in, inFields, &aggColIdx[a]);
+      if (!rs.ok())
       {
-        if (k == key)
+        return rs;
+      }
+    }
+
+    // ③ 按分组键分桶（保持首次出现顺序；NULL 归入同一桶）
+    //    无分组键时：所有行归为唯一一组，全表聚合成单行（COUNT 对空表也输出 0）
+    struct Group
+    {
+      std::vector<std::vector<storage::Value>> rows;
+    };
+    std::vector<std::pair<std::string, Group>> groups;
+    if (node.groupKeys.empty())
+    {
+      groups.emplace_back(std::string(), Group{});
+      groups.back().second.rows = in.rows;
+    }
+    else
+    {
+      for (const auto &row : in.rows)
+      {
+        const std::string key = KeyOfRow(row, keyIdx);
+        Group *g = nullptr;
+        for (auto &kv : groups)
         {
-          dup = true;
-          break;
+          if (kv.first == key)
+          {
+            g = &kv.second;
+            break;
+          }
+        }
+        if (g == nullptr)
+        {
+          groups.emplace_back(key, Group{});
+          g = &groups.back().second;
+        }
+        g->rows.push_back(row);
+      }
+    }
+
+    // ④ 输出布局：分组键列 + 聚合结果列（聚合在分组键之后，与投影顺序无关）
+    out->fields.clear();
+    for (const auto &k : node.groupKeys)
+    {
+      out->fields.push_back(FieldRef{"", k.column});
+    }
+    for (const auto &a : node.aggExprs)
+    {
+      const std::string fn = a->aggFunc.empty() ? "COUNT" : a->aggFunc;
+      std::string name = a->aggStar
+                             ? fn + "(*)"
+                             : fn + "(" + (a->table.empty() ? a->column : a->table + "." + a->column) + ")";
+      out->fields.push_back(FieldRef{"", name});
+    }
+
+    for (const auto &kv : groups)
+    {
+      std::vector<storage::Value> outRow;
+      if (!node.groupKeys.empty())
+      {
+        // 该组首行的分组键值（同组内相等）
+        const std::vector<storage::Value> &first = kv.second.rows.front();
+        for (int i : keyIdx)
+        {
+          outRow.push_back(static_cast<size_t>(i) < first.size() ? first[static_cast<size_t>(i)]
+                                                                 : storage::Value::Null());
         }
       }
-      if (dup)
+      for (size_t a = 0; a < node.aggExprs.size(); ++a)
       {
-        continue;
+        storage::Value v;
+        const DbStatus es = EvalAggregate(*node.aggExprs[a], kv.second.rows, aggColIdx[a], &v);
+        if (!es.ok())
+        {
+          return es;
+        }
+        outRow.push_back(std::move(v));
       }
-      seen.push_back(key);
-      out->rows.push_back(row);
+      out->rows.push_back(std::move(outRow));
     }
     return DbStatus::Ok();
   }

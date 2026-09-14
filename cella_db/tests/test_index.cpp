@@ -214,3 +214,27 @@ MT_TEST(索引_可以查询索引系统表) {
   MT_CHECK(r.all_ok());
   MT_EQ(static_cast<int>(r.statements[0].result.rows.size()), 1);
 }
+
+// SHOW INDEXES 必须带表头：客户端靠 columns 非空判定「这是查询」
+// （QueryResult::IsQuery），缺表头会让 REST JSON 里 columns 为 null，
+// Web 界面渲染不出网格。此用例防止该回归。
+MT_TEST(索引_SHOW_INDEXES_必须带列元数据) {
+  Engine e("ix_show_columns");
+  MT_CHECK(e.opened);
+
+  ScriptReport r = e.Run(std::string(kBase) + "CREATE INDEX idx_name ON emp (name);");
+  MT_CHECK(r.all_ok());
+
+  r = e.Run("SHOW INDEXES;");
+  MT_CHECK(r.all_ok());
+  const QueryResult& q = r.statements[0].result;
+  MT_CHECK(q.IsQuery());
+  MT_EQ(static_cast<int>(q.columns.size()), 5);
+  MT_EQ(q.columns[0].name, std::string("index_name"));
+  MT_EQ(q.columns[1].name, std::string("table_name"));
+  MT_EQ(q.columns[2].name, std::string("column_name"));
+  MT_EQ(q.columns[3].name, std::string("unique"));
+  MT_EQ(q.columns[4].name, std::string("root_page_id"));
+  // 每行的列数必须与表头一致
+  MT_EQ(static_cast<int>(q.rows[0].size()), 5);
+}

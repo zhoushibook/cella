@@ -111,9 +111,14 @@ cmake --build build --config Debug
 | `grouped` | GROUP BY | | `distinct` | DISTINCT |
 | `having` | HAVING | | `as` | AS |
 | `ordered` | ORDER BY | | `among` | LIMIT 行数 |
-| `page` | 分页（页码[, 每页行数]，逗号可省略） | | | |
+| `count(*)` / `count(col)` | COUNT 聚合 | | `page` | 分页（页码[, 每页行数]，逗号可省略） |
 
 > `page` 与 `among` 可同用：`among` 先限定总行数，`page` 再在其内分页；分页起始行超出 `among` 范围时报 SEM-312。每页行数可写为 `page 1, 2` 或 `page 1 2`。
+
+**聚合与分组（P4）**：目前唯一支持的聚合是 `COUNT(*)` / `COUNT(col)`。
+出现聚合或 `grouped` 时，`select_list` 每项只能是**分组键或聚合函数**（否则 SEM-321/322）；
+无 `grouped` 但含聚合 → 全表聚合成单行（空表 `COUNT(*)` = 0）。
+`COUNT(col)` 不计 NULL。`HAVING` 中暂不支持聚合（SEM-320）。`SUM/AVG/MIN/MAX` 尚未实现。
 
 - 查询子句顺序固定：`get [distinct] 列 in 表 [join...] [limit] [grouped] [having] [ordered] [among] [page 页码[,每页行数]] [union get...] ;`（逗号可省略）
 - DELETE/UPDATE 的过滤条件用 `limit`（已彻底移除 FROM/WHERE：`DELETE in student limit ...`、`UPDATE student SET ... limit ...`）。
@@ -266,10 +271,10 @@ Project [name]
 powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1
 ```
 
-- 正向（`ok_*.sql`，11 个）：`-a -s -p` 退出码必须为 0，且 `-p` 输出与 `tests/expected/ok_*_plan.txt` golden 完全一致。
+- 正向（`ok_*.sql`，17 个）：`-a -s -p` 退出码必须为 0，且 `-p` 输出与 `tests/expected/ok_*_plan.txt` golden 完全一致。
 - 优化（`ok_opt_*.sql`）：额外比对 `-o` 输出与 `tests/expected/ok_opt_*_opt.txt`。
-- 负向（`err_*.sql`，16 个）：`--all` 退出码必须为 1，且输出包含首行注释 `-- expect: 错误码` 声明的错误码。
-- 覆盖点：缺分号、未闭合字符串、非法字符、未定义表、列拼写错误、类型不匹配（INSERT/运算/条件）、值个数不一致、重复建表、重复列名、保留字作标识符、limit 列不存在、NULL→NOT NULL、大小写混合、空输入、join/union/distinct/grouped/having/ordered/among、UPDATE/DROP TABLE、优化规则 golden。
+- 负向（`err_*.sql`，25 个）：`--all` 退出码必须为 1，且输出包含首行注释 `-- expect: 错误码` 声明的错误码。
+- 覆盖点：缺分号、未闭合字符串、非法字符、未定义表、列拼写错误、类型不匹配（INSERT/运算/条件）、值个数不一致、重复建表、重复列名、保留字作标识符、limit 列不存在、NULL→NOT NULL、大小写混合、空输入、join/union/distinct/grouped/having/ordered/among、**COUNT 聚合与分组上下文校验（SEM-320/322）**、UPDATE/DROP TABLE、索引 DDL、优化规则 golden。
 - 捕获方式：通过 `cmd` 重定向取原始字节再按 UTF-8 读取，避免控制台代码页造成乱码。
 
 ## 实现决策与偏差说明

@@ -52,6 +52,7 @@ namespace cella
             {
             case CELLA_Expr::Kind::LITERAL:
             case CELLA_Expr::Kind::COLUMN_REF:
+            case CELLA_Expr::Kind::AGGREGATE:
                 return 7;
             case CELLA_Expr::Kind::UNARY:
                 return 6;
@@ -139,6 +140,15 @@ namespace cella
                     s = inner + " IS NOT NULL";
                     break;
                 }
+                break;
+            }
+            case CELLA_Expr::Kind::AGGREGATE:
+            {
+                std::string fn = e.aggFunc.empty() ? "COUNT" : e.aggFunc;
+                if (e.aggStar)
+                    s = fn + "(*)";
+                else
+                    s = fn + "(" + (e.table.empty() ? e.column : e.table + "." + e.column) + ")";
                 break;
             }
             case CELLA_Expr::Kind::BINARY:

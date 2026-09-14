@@ -93,12 +93,45 @@ MT_TEST(执行_去重与分组) {
       "INSERT INTO t VALUES (1,'A'),(2,'A'),(3,'B'),(4,'B'),(5,'C');");
   MT_EQ(RowsText(e.Run("get distinct grp in t ordered grp asc;").statements[0].result),
         std::string("A\nB\nC"));
-  // 无聚合函数：GROUP BY 即按分组键去重（保留组内首行）
-  MT_EQ(RowsText(e.Run("get id, grp in t grouped grp ordered id asc;").statements[0].result),
-        std::string("1|A\n3|B\n5|C"));
+  // 真 GROUP BY：投影只能是分组键或聚合函数。仅投影分组键时每组输出一行
+  MT_EQ(RowsText(e.Run("get grp in t grouped grp ordered grp asc;").statements[0].result),
+        std::string("A\nB\nC"));
   // having 在分组之后过滤
   MT_EQ(RowsText(e.Run("get grp in t grouped grp having grp = 'B';").statements[0].result),
         std::string("B"));
+  // 非分组键、非聚合列出现在投影里 → 语义阶段拒绝（SEM-322）
+  const std::string bad = e.Run("get id, grp in t grouped grp;").statements[0].status.message();
+  MT_CHECK(bad.find("SEM-322") != std::string::npos);
+}
+
+MT_TEST(执行_COUNT聚合) {
+  Engine e("exec_count");
+  e.Run(
+      "CREATE TABLE s(id INT, name VARCHAR(8), age INT);"
+      "INSERT INTO s VALUES (1,'a',10),(2,'b',20),(3,'c',NULL),(4,'d',10);");
+  // COUNT(*)：所有行（含 NULL）
+  MT_EQ(RowsText(e.Run("get count(*) in s;").statements[0].result), std::string("4"));
+  // COUNT(col)：只计非 NULL
+  MT_EQ(RowsText(e.Run("get count(age) in s;").statements[0].result), std::string("3"));
+  // 分组计数
+  MT_EQ(RowsText(e.Run("get age, count(*) in s grouped age ordered age asc;")
+                     .statements[0]
+                     .result),
+        std::string("10|2\n20|1\nNULL|1"));
+  // 分组内 COUNT(col)（NULL 不计入）
+  MT_EQ(RowsText(e.Run("get age, count(age) in s grouped age ordered age asc;")
+                     .statements[0]
+                     .result),
+        std::string("10|2\n20|1\nNULL|0"));
+  // COUNT(*) 与 COUNT(col) 同处分组
+  MT_EQ(RowsText(e.Run("get age, count(*), count(name) in s grouped age ordered age asc;")
+                     .statements[0]
+                     .result),
+        std::string("10|2|2\n20|1|1\nNULL|1|1"));
+  // 空表 COUNT(*) = 0，且仍输出一行
+  Engine e2("exec_count_empty");
+  e2.Run("CREATE TABLE z(id INT);");
+  MT_EQ(RowsText(e2.Run("get count(*) in z;").statements[0].result), std::string("0"));
 }
 
 MT_TEST(执行_连接三种方向) {

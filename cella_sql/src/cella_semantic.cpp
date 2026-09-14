@@ -402,6 +402,15 @@ namespace cella
                 }
                 break;
             }
+            case CELLA_Expr::Kind::AGGREGATE:
+            {
+                // COUNT(*) 不牵扯任何列；COUNT(col) 需要列存在
+                if (!e.aggStar &&
+                    !resolveColumn(e.table, e.column, e.line, e.col, scope, cat, errors))
+                    return false;
+                t = CELLA_ValueType::INT; // 计数结果恒为整数
+                break;
+            }
             }
             if (outType)
                 *outType = t;
@@ -794,6 +803,91 @@ namespace cella
             return true;
         }
 
+        // 收集表达式树里出现的聚合调用（P4 只有 COUNT）
+        void collectAggregates(const CELLA_Expr &e, std::vector<const CELLA_Expr *> &out)
+        {
+            if (e.kind == CELLA_Expr::Kind::AGGREGATE)
+                out.push_back(&e);
+            if (e.left)
+                collectAggregates(*e.left, out);
+            if (e.right)
+                collectAggregates(*e.right, out);
+            if (e.child)
+                collectAggregates(*e.child, out);
+        }
+
+        bool exprHasAggregate(const CELLA_Expr &e)
+        {
+            std::vector<const CELLA_Expr *> v;
+            collectAggregates(e, v);
+            return !v.empty();
+        }
+
+        // 校验一条 SELECT 的聚合语义（任务书 P4）：
+        //  1. 分组键不得是聚合表达式；
+        //  2. HAVING 里不得出现聚合（本阶段不支持）；
+        //  3. 出现聚合时（或存在 grouped），投影项要么是聚合、要么是分组键；
+        //  4. 没有分组键却有聚合 → 全表聚合成一行（COUNT 天然允许）。
+        bool checkAggregateSemantics(const CELLA_Stmt &st, std::vector<CELLA_Error> &errors)
+        {
+            if (st.having)
+            {
+                std::vector<const CELLA_Expr *> aggs;
+                collectAggregates(*st.having, aggs);
+                if (!aggs.empty())
+                {
+                    errors.push_back(cella_makeError(
+                        CELLA_Phase::SEM, "SEM-320", aggs[0]->line, aggs[0]->col,
+                        "HAVING 中暂不支持聚合函数"));
+                }
+            }
+            if (st.star)
+                return true;
+            // 是否存在聚合或分组
+            bool hasAgg = false;
+            std::vector<const CELLA_Expr *> aggList;
+            for (const auto &si : st.selectItems)
+            {
+                collectAggregates(*si.expr, aggList);
+            }
+            hasAgg = !aggList.empty();
+            if (!hasAgg && st.grouped.empty())
+                return true;
+            // 逐项检查：聚合项放行；非聚合项必须恰好等于某个分组键
+            for (const auto &si : st.selectItems)
+            {
+                if (exprHasAggregate(*si.expr))
+                    continue;
+                // 非聚合项：必须是纯列引用且命中分组键
+                if (si.expr->kind != CELLA_Expr::Kind::COLUMN_REF)
+                {
+                    errors.push_back(cella_makeError(
+                        CELLA_Phase::SEM, "SEM-321", si.expr->line, si.expr->col,
+                        "SELECT 项既不是聚合函数也不是分组键（出现聚合/分组时只允许这两类）"));
+                    return false;
+                }
+                bool hit = false;
+                for (const auto &cn : st.grouped)
+                {
+                    if (cella_toUpper(cn.column) == cella_toUpper(si.expr->column) &&
+                        (cn.table.empty() || si.expr->table.empty() ||
+                         cella_toUpper(cn.table) == cella_toUpper(si.expr->table)))
+                    {
+                        hit = true;
+                        break;
+                    }
+                }
+                if (!hit)
+                {
+                    errors.push_back(cella_makeError(
+                        CELLA_Phase::SEM, "SEM-322", si.expr->line, si.expr->col,
+                        "列 \"" + si.expr->column + "\" 既不在 GROUP BY 中也不是聚合函数"));
+                    return false;
+                }
+            }
+            return true;
+        }
+
         bool semGet(const CELLA_Stmt &st, CELLA_Catalog &cat, int idx, CELLA_SemanticResult &res,
                     bool topLevel)
         {
@@ -839,6 +933,8 @@ namespace cella
                 if (!resolveColName(cn, scope, cat, res.errors))
                     return false;
             }
+            if (!checkAggregateSemantics(st, res.errors))
+                return false;
             for (const auto &oi : st.ordered)
             {
                 if (!resolveColName(oi.col, scope, cat, res.errors))

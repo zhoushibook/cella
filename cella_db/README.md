@@ -103,7 +103,7 @@ powershell -ExecutionPolicy Bypass -File run_all.ps1
 | `grouped` | GROUP BY | | `distinct` | DISTINCT |
 | `having` | HAVING | | `as` | AS |
 | `ordered` | ORDER BY | | `among` | LIMIT 行数 |
-| `page 页码, 每页行数` | 分页 | | `is [not] null` | IS [NOT] NULL 判空 |
+| `count(*)` / `count(col)` | COUNT 聚合 | | `page 页码, 每页行数` | 分页 |
 
 事务控制（编译器不识别，由会话拦截）：`BEGIN;` / `COMMIT;` / `ROLLBACK;`
 （也接受 `START TRANSACTION` / `END`）。
@@ -156,9 +156,17 @@ SHOW GRANTS;                             -- 或 SHOW GRANTS FOR alice;
 认证启用而未登录时任何语句都被拒（`DB-806`）；管理员全放行；系统表 `cella_catalog` 读放行。
 `cella_auth` 是保留库名，不出现在 `SHOW DATABASES` 里。
 
-> 注意：`GROUP BY`（`grouped`）在本方言里**没有聚合函数**（未定义 COUNT/SUM），
-> 因此实现为「按分组键去重，每组保留首行」，配合 `having` 使用。
+> 聚合与分组：已支持 `COUNT(*)` 与 `COUNT(col)`（`COUNT(col)` 不计 NULL）。
+> 出现聚合或 `grouped` 时，SELECT 项只能是分组键或聚合函数（否则报 `SEM-322`）；
+> 无 `grouped` 但含聚合则全表聚合为单行。`HAVING` 中暂不支持聚合（报 `SEM-320`）。
+> 尚未实现 `SUM/AVG/MIN/MAX`。
 > 已知简化与边界见 [docs/INTEGRATION.md §6](docs/INTEGRATION.md)。
+
+```sql
+get cid, count(*) in student grouped cid ordered cid asc;
+get count(*) in student;                    -- 全表行数
+get region, count(amount) in sale grouped region;  -- 每组非 NULL 金额数
+```
 
 ---
 
