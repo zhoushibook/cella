@@ -43,6 +43,9 @@ namespace cella::storage
     Status insert_record(const std::string &table, const Record &record, Rid *out) override;
     Status delete_record(const std::string &table, const Rid &rid) override;
 
+    // 缓冲池句柄：B+ 树索引的页 I/O 入口（见 IStorage::buffer_pool）。
+    BufferPoolManager *buffer_pool() override;
+
     const BufferStats &get_stats() const override;
     std::string dump_stats() const override;
     std::vector<std::string> recent_evictions() const override;

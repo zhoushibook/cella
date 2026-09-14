@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -14,7 +15,10 @@
 #include "cella/db/common/db_logger.h"
 #include "cella/db/common/value_bridge.h"
 #include "cella/db/exec/expr_eval.h"
+#include "cella/storage/buffer/buffer_pool_manager.h"
 #include "cella/storage/common/status.h"
+#include "cella/storage/index/b_plus_tree.h"
+#include "cella/storage/index/index_key.h"
 #include "cella/storage/table/table_heap.h"
 
 namespace cella::db
@@ -310,6 +314,14 @@ namespace cella::db
     {
       return ExecDropTable(plan, ctx, out);
     }
+    if (plan.op == "CreateIndex")
+    {
+      return ExecCreateIndex(plan, ctx, out);
+    }
+    if (plan.op == "DropIndex")
+    {
+      return ExecDropIndex(plan, ctx, out);
+    }
     if (plan.op == "Insert")
     {
       return ExecInsert(plan, ctx, out);
@@ -472,7 +484,7 @@ namespace cella::db
       return DbStatus::Error(DbCode::kTableNotFound, "表不存在: " + st->tableName);
     }
     const std::string name = meta->name;
-    if (CatalogManager::IsSystemTable(name))
+    if (CatalogManager::IsProtectedSystemTable(name))
     {
       return DbStatus::Error(DbCode::kSystemTableProtected, "系统表禁止删除: " + name);
     }
@@ -501,8 +513,181 @@ namespace cella::db
       {
         return ss;
       }
+      // 级联清理该表的所有二级索引（P1.2）。物理 B+ 树页随文件回收策略统一处理，
+      // 元数据行必须删干净，否则重建库时会指向不存在的表。
+      const std::vector<const CatalogIndex *> owned = catalog_->IndexesOfTable(name);
+      if (!owned.empty())
+      {
+        const DbStatus is = catalog_->DeleteIndexesOfTable(name);
+        if (!is.ok())
+        {
+          return is;
+        }
+        DbLogInfo(logcat::kCatalog,
+                  "DROP TABLE " + name + " 级联删除 " + std::to_string(owned.size()) + " 个索引");
+      }
     }
     out->tag = "DROP TABLE " + name;
+    DbLogInfo(logcat::kCatalog, out->tag);
+    return DbStatus::Ok();
+  }
+
+  // ── CREATE INDEX ────────────────────────────────────────────
+
+  DbStatus Executor::ExecCreateIndex(const cella::CELLA_PlanNode &plan, const ExecContext &ctx,
+                                     QueryResult *out)
+  {
+    const cella::CELLA_Stmt *st = plan.stmt;
+    if (st == nullptr)
+    {
+      return DbStatus::Error(DbCode::kInternal, "CreateIndex 计划缺少语句信息");
+    }
+    const CatalogTable *meta = catalog_->FindTable(st->tableName);
+    if (meta == nullptr)
+    {
+      return DbStatus::Error(DbCode::kTableNotFound, "表不存在: " + st->tableName);
+    }
+    if (CatalogManager::IsProtectedSystemTable(meta->name))
+    {
+      return DbStatus::Error(DbCode::kSystemTableProtected, "系统表禁止建索引: " + meta->name);
+    }
+    if (catalog_->FindIndex(st->indexName) != nullptr)
+    {
+      return DbStatus::Error(DbCode::kIndexExists, "索引已存在: " + st->indexName);
+    }
+    const CatalogColumn *col = meta->FindColumn(st->indexColumn);
+    if (col == nullptr)
+    {
+      return DbStatus::Error(DbCode::kColumnNotFound,
+                             "列不存在: " + st->tableName + "." + st->indexColumn);
+    }
+    const DbStatus ls = LockTable(meta->name, LockMode::kShared, ctx, TablePriv::kNone);
+    if (!ls.ok())
+    {
+      return ls;
+    }
+
+    // 索引键规格：物理类型 + 长度上限（varchar 用声明长度，其它为 0）
+    storage::BPlusTree::KeySpec spec;
+    spec.type = ToStorageType(col->type);
+    spec.max_len = static_cast<uint16_t>(col->len);
+
+    std::unique_ptr<storage::BPlusTree> tree;
+    {
+      StorageGuard guard(storage_mutex_);
+      storage::BufferPoolManager *bpm = storage_->buffer_pool();
+      if (bpm == nullptr)
+      {
+        return DbStatus::Error(DbCode::kInternal, "存储引擎未暴露缓冲池，无法建索引");
+      }
+      tree = std::make_unique<storage::BPlusTree>(bpm, spec);
+      storage::page_id_t root = storage::kInvalidPageId;
+      const storage::Status cs = tree->Create(&root);
+      if (!cs.ok())
+      {
+        return FromStorage(cs, "建索引 " + st->indexName);
+      }
+
+      // 回填：全表扫描现有行，逐行插入索引键
+      std::shared_ptr<storage::TableHeap> heap;
+      const storage::Status os = storage_->open_table(meta->name, &heap);
+      if (!os.ok())
+      {
+        return FromStorage(os, "回填索引时打开表 " + meta->name);
+      }
+      const int col_idx = meta->ColumnIndex(col->name);
+      size_t backfilled = 0;
+      for (auto it = heap->begin(); it != heap->end(); ++it)
+      {
+        const storage::Record &rec = *it;
+        if (col_idx < 0 || static_cast<size_t>(col_idx) >= rec.value_count())
+        {
+          continue;
+        }
+        const std::string leaf = storage::EncodeLeafKey(
+            rec.value(static_cast<size_t>(col_idx)), it.rid().page_id,
+            static_cast<uint8_t>(it.rid().slot_id));
+        bool dup = false;
+        const storage::Status is = tree->Insert(leaf, &dup);
+        if (!is.ok())
+        {
+          return FromStorage(is, "回填索引 " + st->indexName);
+        }
+        ++backfilled;
+      }
+
+      // 唯一性检查：同列值不同行（键不同但列值相同）视为冲突
+      if (st->unique)
+      {
+        std::vector<std::string> all;
+        const storage::Status ss = tree->ScanAll(&all);
+        if (!ss.ok())
+        {
+          return FromStorage(ss, "校验唯一索引 " + st->indexName);
+        }
+        for (size_t i = 1; i < all.size(); ++i)
+        {
+          if (storage::StripLeafRowId(all[i - 1]).compare(storage::StripLeafRowId(all[i])) == 0)
+          {
+            return DbStatus::Error(DbCode::kIndexExists,
+                                   "唯一索引 " + st->indexName + " 建立失败：列 \"" +
+                                       col->name + "\" 存在重复值");
+          }
+        }
+      }
+
+      CatalogIndex entry;
+      entry.name = st->indexName;
+      entry.table = meta->name;
+      entry.column = col->name;
+      entry.unique = st->unique;
+      entry.root_page_id = root;
+      entry.created_at = static_cast<int64_t>(std::time(nullptr));
+      const DbStatus ws = catalog_->WriteIndexRow(entry);
+      if (!ws.ok())
+      {
+        return ws;
+      }
+      out->tag = "CREATE INDEX " + entry.name;
+      DbLogInfo(logcat::kCatalog, out->tag + " on " + entry.table + "(" + entry.column +
+                                        ")，回填 " + std::to_string(backfilled) + " 行");
+    }
+    return DbStatus::Ok();
+  }
+
+  // ── DROP INDEX ──────────────────────────────────────────────
+
+  DbStatus Executor::ExecDropIndex(const cella::CELLA_PlanNode &plan, const ExecContext &ctx,
+                                   QueryResult *out)
+  {
+    const cella::CELLA_Stmt *st = plan.stmt;
+    if (st == nullptr)
+    {
+      return DbStatus::Error(DbCode::kInternal, "DropIndex 计划缺少语句信息");
+    }
+    const CatalogIndex *meta = catalog_->FindIndex(st->indexName);
+    if (meta == nullptr)
+    {
+      return DbStatus::Error(DbCode::kIndexNotFound, "索引不存在: " + st->indexName);
+    }
+    const std::string index_name = meta->name;
+    const std::string table_name = meta->table;
+    const DbStatus ls = LockTable(table_name, LockMode::kShared, ctx, TablePriv::kNone);
+    if (!ls.ok())
+    {
+      return ls;
+    }
+    {
+      StorageGuard guard(storage_mutex_);
+      const DbStatus ds = catalog_->DeleteIndexRows(index_name);
+      if (!ds.ok())
+      {
+        return ds;
+      }
+      // 物理 B+ 树页不在此处逐页回收（与 DROP TABLE 一致，交给文件级回收策略）。
+      // 关键是元数据失效：后续查询不会再选到这条路径。
+    }
+    out->tag = "DROP INDEX " + index_name;
     DbLogInfo(logcat::kCatalog, out->tag);
     return DbStatus::Ok();
   }
@@ -523,7 +708,7 @@ namespace cella::db
       return DbStatus::Error(DbCode::kTableNotFound, "表不存在: " + st->tableName);
     }
     const std::string name = meta->name;
-    if (CatalogManager::IsSystemTable(name))
+    if (CatalogManager::IsProtectedSystemTable(name))
     {
       return DbStatus::Error(DbCode::kSystemTableProtected, "系统表禁止修改: " + name);
     }
@@ -770,7 +955,7 @@ namespace cella::db
       return DbStatus::Error(DbCode::kTableNotFound, "表不存在: " + st->tableName);
     }
     const std::string name = meta->name;
-    if (CatalogManager::IsSystemTable(name))
+    if (CatalogManager::IsProtectedSystemTable(name))
     {
       return DbStatus::Error(DbCode::kSystemTableProtected, "系统表禁止修改: " + name);
     }
@@ -831,7 +1016,7 @@ namespace cella::db
       return DbStatus::Error(DbCode::kTableNotFound, "表不存在: " + st->tableName);
     }
     const std::string name = meta->name;
-    if (CatalogManager::IsSystemTable(name))
+    if (CatalogManager::IsProtectedSystemTable(name))
     {
       return DbStatus::Error(DbCode::kSystemTableProtected, "系统表禁止修改: " + name);
     }

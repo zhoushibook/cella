@@ -139,12 +139,28 @@ bool CatalogManager::IsSystemTable(const std::string& name) {
   return ToUpper(name) == ToUpper(kSystemTableName);
 }
 
+bool CatalogManager::IsProtectedSystemTable(const std::string& name) {
+  const std::string key = ToUpper(name);
+  return key == ToUpper(kSystemTableName) || key == ToUpper(kIndexTableName);
+}
+
 storage::Schema CatalogManager::SystemTableSchema() {
   storage::Schema s;
   s.AddColumn("name", storage::ValueType::kVarchar, 64);
   s.AddColumn("table_id", storage::ValueType::kInt32, 0);
   s.AddColumn("created_at", storage::ValueType::kInt32, 0);
   s.AddColumn("columns", storage::ValueType::kVarchar, 0);
+  return s;
+}
+
+storage::Schema CatalogManager::IndexTableSchema() {
+  storage::Schema s;
+  s.AddColumn("name", storage::ValueType::kVarchar, 64);
+  s.AddColumn("table_name", storage::ValueType::kVarchar, 64);
+  s.AddColumn("column_name", storage::ValueType::kVarchar, 64);
+  s.AddColumn("is_unique", storage::ValueType::kInt32, 0);
+  s.AddColumn("root_page_id", storage::ValueType::kInt32, 0);
+  s.AddColumn("created_at", storage::ValueType::kInt32, 0);
   return s;
 }
 
@@ -173,6 +189,34 @@ DbStatus CatalogManager::EnsureSystemTable(bool* created) {
     *created = true;
   }
   DbLogInfo(logcat::kCatalog, "已创建系统目录表 " + std::string(kSystemTableName));
+  return DbStatus::Ok();
+}
+
+DbStatus CatalogManager::EnsureIndexTable(bool* created) {
+  if (created != nullptr) {
+    *created = false;
+  }
+  if (storage_ == nullptr) {
+    return DbStatus::Error(DbCode::kCatalogError, "目录未附加存储引擎");
+  }
+  std::shared_ptr<storage::TableHeap> heap;
+  const storage::Status s = storage_->open_table(kIndexTableName, &heap);
+  if (s.ok()) {
+    return DbStatus::Ok();
+  }
+  if (s.code() != storage::StatusCode::kTableNotFound) {
+    return DbStatus::Error(DbCode::kStorageError,
+                           "打开索引元数据表失败: " + s.ToString());
+  }
+  const storage::Status cs = storage_->create_table(kIndexTableName, IndexTableSchema());
+  if (!cs.ok()) {
+    return DbStatus::Error(DbCode::kStorageError,
+                           "创建索引元数据表失败: " + cs.ToString());
+  }
+  if (created != nullptr) {
+    *created = true;
+  }
+  DbLogInfo(logcat::kCatalog, "已创建索引元数据表 " + std::string(kIndexTableName));
   return DbStatus::Ok();
 }
 
@@ -221,6 +265,13 @@ DbStatus CatalogManager::LoadFromStorage() {
   }
 
   AddSystemTableEntry();
+  // 索引系统表：物理表存在才登记（老库没有这张表，LoadIndexesFromStorage 会容忍）
+  {
+    std::shared_ptr<storage::TableHeap> ih;
+    if (storage_->open_table(kIndexTableName, &ih).ok() && ih) {
+      AddIndexTableEntry();
+    }
+  }
   DbLogInfo(logcat::kCatalog, "目录已加载: " + std::to_string(tables_.size()) + " 张表");
   return DbStatus::Ok();
 }
@@ -248,6 +299,33 @@ void CatalogManager::AddSystemTableEntry() {
   tables_[ToUpper(kSystemTableName)] = std::move(sys);
 }
 
+void CatalogManager::AddIndexTableEntry() {
+  CatalogTable sys;
+  sys.table_id = 0;
+  sys.name = kIndexTableName;
+  sys.created_at = 0;
+
+  CatalogColumn c;
+  c.name = "name"; c.type = cella::CELLA_DataType::VARCHAR; c.len = 64; c.not_null = true;
+  sys.columns.push_back(c);
+  c = CatalogColumn{}; c.name = "table_name"; c.type = cella::CELLA_DataType::VARCHAR; c.len = 64; c.not_null = true;
+  sys.columns.push_back(c);
+  c = CatalogColumn{}; c.name = "column_name"; c.type = cella::CELLA_DataType::VARCHAR; c.len = 64; c.not_null = true;
+  sys.columns.push_back(c);
+  c = CatalogColumn{}; c.name = "is_unique"; c.type = cella::CELLA_DataType::INT; c.not_null = true;
+  sys.columns.push_back(c);
+  c = CatalogColumn{}; c.name = "root_page_id"; c.type = cella::CELLA_DataType::INT; c.not_null = true;
+  sys.columns.push_back(c);
+  c = CatalogColumn{}; c.name = "created_at"; c.type = cella::CELLA_DataType::INT; c.not_null = true;
+  sys.columns.push_back(c);
+
+  std::shared_ptr<storage::TableHeap> h;
+  if (storage_ != nullptr && storage_->open_table(kIndexTableName, &h).ok() && h) {
+    sys.first_page_id = h->first_page_id();
+  }
+  tables_[ToUpper(kIndexTableName)] = std::move(sys);
+}
+
 bool CatalogManager::DecodeRow(const storage::Record& row, CatalogTable* out) const {
   if (row.value_count() < 4) {
     return false;
@@ -267,6 +345,194 @@ bool CatalogManager::DecodeRow(const storage::Record& row, CatalogTable* out) co
   out->created_at = static_cast<int64_t>(cat.int32_val);
   out->first_page_id = storage::kInvalidPageId;
   return DecodeColumns(cols.str_val, &out->columns);
+}
+
+bool CatalogManager::DecodeIndexRow(const storage::Record& row, CatalogIndex* out) const {
+  if (row.value_count() < 6) {
+    return false;
+  }
+  const storage::Value& name = row.value(0);
+  const storage::Value& tbl = row.value(1);
+  const storage::Value& col = row.value(2);
+  const storage::Value& uniq = row.value(3);
+  const storage::Value& root = row.value(4);
+  const storage::Value& cat = row.value(5);
+  if (name.type != storage::ValueType::kVarchar ||
+      tbl.type != storage::ValueType::kVarchar ||
+      col.type != storage::ValueType::kVarchar ||
+      uniq.type != storage::ValueType::kInt32 ||
+      root.type != storage::ValueType::kInt32 ||
+      cat.type != storage::ValueType::kInt32) {
+    return false;
+  }
+  out->name = name.str_val;
+  out->table = tbl.str_val;
+  out->column = col.str_val;
+  out->unique = uniq.int32_val != 0;
+  out->root_page_id = static_cast<uint32_t>(root.int32_val);
+  out->created_at = static_cast<int64_t>(cat.int32_val);
+  return out->valid();
+}
+
+DbStatus CatalogManager::LoadIndexesFromStorage() {
+  indexes_.clear();
+  if (storage_ == nullptr) {
+    return DbStatus::Error(DbCode::kCatalogError, "目录未附加存储引擎");
+  }
+  std::shared_ptr<storage::TableHeap> heap;
+  const storage::Status os = storage_->open_table(kIndexTableName, &heap);
+  if (!os.ok()) {
+    // 索引元数据表尚未创建：视为「无索引」，不是错误。
+    if (os.code() == storage::StatusCode::kTableNotFound) {
+      return DbStatus::Ok();
+    }
+    return DbStatus::Error(DbCode::kStorageError,
+                           "打开索引元数据表失败: " + os.ToString());
+  }
+  for (auto it = heap->begin(); it != heap->end(); ++it) {
+    CatalogIndex ix;
+    if (!DecodeIndexRow(*it, &ix)) {
+      DbLogWarn(logcat::kCatalog, "索引表中存在无法解析的行，已跳过");
+      continue;
+    }
+    const std::string key = ToUpper(ix.name);
+    if (indexes_.count(key) != 0) {
+      DbLogWarn(logcat::kCatalog, "索引表中存在重复索引名，已跳过: " + ix.name);
+      continue;
+    }
+    indexes_[key] = std::move(ix);
+  }
+  DbLogInfo(logcat::kCatalog,
+            "已加载索引元数据: " + std::to_string(indexes_.size()) + " 个");
+  return DbStatus::Ok();
+}
+
+storage::Rid CatalogManager::FindIndexRow(const std::string& index_name) const {
+  storage::Rid none;
+  if (storage_ == nullptr) {
+    return none;
+  }
+  std::shared_ptr<storage::TableHeap> heap;
+  if (!storage_->open_table(kIndexTableName, &heap).ok()) {
+    return none;
+  }
+  const std::string key = ToUpper(index_name);
+  for (auto it = heap->begin(); it != heap->end(); ++it) {
+    const storage::Record& rec = *it;
+    if (rec.value_count() > 0 && rec.value(0).type == storage::ValueType::kVarchar &&
+        ToUpper(rec.value(0).str_val) == key) {
+      return it.rid();
+    }
+  }
+  return none;
+}
+
+DbStatus CatalogManager::WriteIndexRow(const CatalogIndex& index) {
+  if (storage_ == nullptr) {
+    return DbStatus::Error(DbCode::kCatalogError, "目录未附加存储引擎");
+  }
+  storage::Record rec;
+  rec.AddValue(storage::Value::Varchar(index.name));
+  rec.AddValue(storage::Value::Varchar(index.table));
+  rec.AddValue(storage::Value::Varchar(index.column));
+  rec.AddValue(storage::Value::Int(index.unique ? 1 : 0));
+  rec.AddValue(storage::Value::Int(static_cast<int32_t>(index.root_page_id)));
+  rec.AddValue(storage::Value::Int(static_cast<int32_t>(index.created_at)));
+  storage::Rid rid;
+  const storage::Status s = storage_->insert_record(kIndexTableName, rec, &rid);
+  if (!s.ok()) {
+    return CatalogStorageError("写索引元数据表失败", s);
+  }
+  indexes_[ToUpper(index.name)] = index;
+  return DbStatus::Ok();
+}
+
+DbStatus CatalogManager::DeleteIndexRows(const std::string& index_name) {
+  if (storage_ == nullptr) {
+    return DbStatus::Error(DbCode::kCatalogError, "目录未附加存储引擎");
+  }
+  const std::string key = ToUpper(index_name);
+  std::vector<storage::Rid> victims;
+  std::shared_ptr<storage::TableHeap> heap;
+  if (storage_->open_table(kIndexTableName, &heap).ok()) {
+    for (auto it = heap->begin(); it != heap->end(); ++it) {
+      const storage::Record& rec = *it;
+      if (rec.value_count() > 0 && rec.value(0).type == storage::ValueType::kVarchar &&
+          ToUpper(rec.value(0).str_val) == key) {
+        victims.push_back(it.rid());
+      }
+    }
+  }
+  for (const storage::Rid& rid : victims) {
+    const storage::Status s = storage_->delete_record(kIndexTableName, rid);
+    if (!s.ok()) {
+      return CatalogStorageError("删索引元数据行失败", s);
+    }
+  }
+  indexes_.erase(key);
+  return DbStatus::Ok();
+}
+
+DbStatus CatalogManager::DeleteIndexesOfTable(const std::string& table_name) {
+  if (storage_ == nullptr) {
+    return DbStatus::Error(DbCode::kCatalogError, "目录未附加存储引擎");
+  }
+  const std::string tkey = ToUpper(table_name);
+  std::vector<storage::Rid> victims;
+  std::vector<std::string> names;
+  std::shared_ptr<storage::TableHeap> heap;
+  if (storage_->open_table(kIndexTableName, &heap).ok()) {
+    for (auto it = heap->begin(); it != heap->end(); ++it) {
+      const storage::Record& rec = *it;
+      if (rec.value_count() > 1 && rec.value(1).type == storage::ValueType::kVarchar &&
+          ToUpper(rec.value(1).str_val) == tkey) {
+        victims.push_back(it.rid());
+        if (rec.value(0).type == storage::ValueType::kVarchar) {
+          names.push_back(ToUpper(rec.value(0).str_val));
+        }
+      }
+    }
+  }
+  for (const storage::Rid& rid : victims) {
+    const storage::Status s = storage_->delete_record(kIndexTableName, rid);
+    if (!s.ok()) {
+      return CatalogStorageError("级联删索引元数据行失败", s);
+    }
+  }
+  for (const std::string& n : names) {
+    indexes_.erase(n);
+  }
+  return DbStatus::Ok();
+}
+
+const CatalogIndex* CatalogManager::FindIndex(const std::string& index_name) const {
+  auto it = indexes_.find(ToUpper(index_name));
+  return it == indexes_.end() ? nullptr : &it->second;
+}
+
+std::vector<const CatalogIndex*> CatalogManager::IndexesOfTable(
+    const std::string& table_name) const {
+  std::vector<const CatalogIndex*> out;
+  const std::string tkey = ToUpper(table_name);
+  for (const auto& kv : indexes_) {
+    if (ToUpper(kv.second.table) == tkey) {
+      out.push_back(&kv.second);
+    }
+  }
+  std::sort(out.begin(), out.end(),
+            [](const CatalogIndex* a, const CatalogIndex* b) { return a->name < b->name; });
+  return out;
+}
+
+std::vector<const CatalogIndex*> CatalogManager::ListIndexes() const {
+  std::vector<const CatalogIndex*> out;
+  out.reserve(indexes_.size());
+  for (const auto& kv : indexes_) {
+    out.push_back(&kv.second);
+  }
+  std::sort(out.begin(), out.end(),
+            [](const CatalogIndex* a, const CatalogIndex* b) { return a->name < b->name; });
+  return out;
 }
 
 storage::Rid CatalogManager::FindCatalogRow(const std::string& name) const {
@@ -570,6 +836,16 @@ cella::CELLA_Catalog CatalogManager::ToCompilerCatalog() const {
       cc.len = c.len;
       cc.notNull = c.not_null;
       ct.columns.push_back(std::move(cc));
+    }
+    // 二级索引也要进编译器目录，否则语义层会在 CREATE/DROP INDEX 上误报
+    // 「索引不存在」。索引以表为单位归组，索引名全局唯一由语义层再校验一次。
+    for (const auto* ix : IndexesOfTable(t->name)) {
+      cella::CELLA_Index ci;
+      ci.name = ix->name;
+      ci.table = ix->table;
+      ci.column = ix->column;
+      ci.unique = ix->unique;
+      ct.indexes.push_back(std::move(ci));
     }
     catalog.addTable(std::move(ct));
   }

@@ -245,6 +245,23 @@ namespace cella
                 node->extra.push_back("table: " + st.tableName);
                 break;
             }
+            case CELLA_Stmt::Kind::CREATE_INDEX:
+            {
+                node = makeNode("CreateIndex", "", st.line, st.col);
+                node->stmt = &st;   // 执行期：索引名/表名/列名/唯一性
+                node->extra.push_back("index: " + st.indexName);
+                node->extra.push_back("table: " + st.tableName);
+                node->extra.push_back("column: " + st.indexColumn);
+                node->extra.push_back(std::string("unique: ") + (st.unique ? "true" : "false"));
+                break;
+            }
+            case CELLA_Stmt::Kind::DROP_INDEX:
+            {
+                node = makeNode("DropIndex", "", st.line, st.col);
+                node->stmt = &st;   // 执行期：索引名
+                node->extra.push_back("index: " + st.indexName);
+                break;
+            }
             case CELLA_Stmt::Kind::GET:
                 node = buildGet(st);
                 break;

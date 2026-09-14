@@ -14,6 +14,7 @@ namespace cella::storage {
 
 class Page;      // 内部句柄：引擎组一般无需直接使用（原始字节读写走 read_page/write_page）
 class TableHeap; // 表访问接口：open_table 返回，用于扫描
+class BufferPoolManager;  // 页缓冲池：BPlusTree 索引需要它做页 I/O
 
 // ── 统一对外接口：引擎组只依赖本头 + common/ 与 table/ ────────
 // 线程安全：单线程设计；事务/并发由引擎组在上层自行处理。
@@ -36,6 +37,11 @@ class IStorage {
   virtual Status unpin_page(page_id_t, bool is_dirty) = 0;
   virtual Status allocate_page(page_id_t* out) = 0;
   virtual Status free_page(page_id_t) = 0;
+
+  // ── 缓冲池访问（B+ 树索引用）──────────────────────────────
+  // 索引是存储层的组件，但「哪个索引叫什么名」是数据库语义，属于引擎组。
+  // 因此这里只暴露缓冲池句柄，由引擎组自行构造 BPlusTree（见 b_plus_tree.h）。
+  virtual BufferPoolManager* buffer_pool() = 0;
 
   // ── 表级操作 ─────────────────────────────────────────────
   virtual Status create_table(const std::string& name, const Schema&) = 0;

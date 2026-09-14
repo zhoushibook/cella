@@ -32,6 +32,8 @@ enum class DbCode {
   kDatabaseError,       // DB-514 数据库不存在/已存在/名字非法
   kDatabaseProtected,   // DB-515 目标数据库不可删除（当前库/启动库）
   kPrimaryKeyViolation, // DB-516 主键冲突（唯一性被破坏）
+  kIndexExists,         // DB-517 索引已存在
+  kIndexNotFound,       // DB-518 索引不存在
 
   // —— 存储层透传（DB-5xx）——
   kStorageError,        // DB-520 存储引擎返回失败（message 携带原始码）

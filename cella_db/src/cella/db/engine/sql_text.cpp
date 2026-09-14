@@ -308,6 +308,23 @@ bool IsDatabaseControl(const std::string& stmt_text, std::string* kind, std::str
     if (arg != nullptr) arg->clear();
     return true;
   }
+  // SHOW INDEXES            → 列出所有索引
+  // SHOW INDEXES IN <table> → 只看某张表的索引
+  if (u1 == "SHOW" && u2 == "INDEXES") {
+    std::string w3;
+    if (!TakeWord(stmt_text, &i, &w3)) {
+      // 无附加词：整体列出
+      if (kind != nullptr) *kind = "SHOW INDEXES";
+      if (arg != nullptr) arg->clear();
+      return true;
+    }
+    if (Upper(w3) != "IN" || !TakeWord(stmt_text, &i, &w3) || !RestIsTrivia(stmt_text, i)) {
+      return false;
+    }
+    if (kind != nullptr) *kind = "SHOW INDEXES";
+    if (arg != nullptr) *arg = w3;
+    return true;
+  }
   return false;
 }
 

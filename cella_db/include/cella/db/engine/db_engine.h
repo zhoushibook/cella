@@ -160,6 +160,11 @@ class DbEngine {
   // SHOW DATABASES：列 <data_dir>/*.db 的库名（单列查询结果，字母序）
   DbStatus ShowDatabases(QueryResult* out);
 
+  // SHOW INDEXES [IN table]：列当前库的二级索引元数据（P1.2）。
+  // 列：index_name | table_name | column_name | unique | root_page_id
+  // table 为空表示列出全部；指定的表不存在时报 DB-502。
+  DbStatus ShowIndexes(const std::string& table, QueryResult* out);
+
   // 诊断文本
   std::string StatsText();
   std::string LockText() const;

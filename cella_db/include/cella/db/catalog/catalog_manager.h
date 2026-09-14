@@ -64,6 +64,21 @@ struct CatalogTable {
   int PrimaryKeyColumnIndex() const;
 };
 
+// ── 一个二级索引的元数据（P1.2）─────────────────────────────
+// 存放在独立的系统表 cella_index 中（不塞进 cella_catalog，避免改动既有行格式
+// 与 golden 输出）。一行一个索引。
+struct CatalogIndex {
+  std::string name;                  // 索引名（原始拼写）
+  std::string table;                 // 所属表名（原始拼写）
+  std::string column;                // 索引列（单列，原始拼写）
+  bool unique = false;               // 唯一索引
+  uint32_t root_page_id = 0;         // B+ 树根页号
+  int64_t created_at = 0;            // Unix 秒
+
+  // 归属表存在且列存在时有效
+  bool valid() const { return !name.empty() && !table.empty() && !column.empty(); }
+};
+
 // ── 目录管理器 ──────────────────────────────────────────────
 class CatalogManager {
  public:
@@ -73,7 +88,11 @@ class CatalogManager {
 
   // ── 系统表相关 ────────────────────────────────────────────
   static constexpr const char* kSystemTableName = "cella_catalog";
+  // 二级索引元数据表（独立系统表；P1.2）
+  static constexpr const char* kIndexTableName = "cella_index";
   static bool IsSystemTable(const std::string& name);
+  // 是否为只读系统表（cella_catalog / cella_index 都只读）
+  static bool IsProtectedSystemTable(const std::string& name);
 
   // 附加存储引擎（读写系统表用）。写接口须在持有 storage_mutex_ 的临界区内调用。
   void AttachStorage(storage::IStorage* storage) { storage_ = storage; }
@@ -81,9 +100,28 @@ class CatalogManager {
   // 确保系统目录表存在（不存在则创建）。返回是否「本次新建」。
   DbStatus EnsureSystemTable(bool* created);
 
+  // 确保索引系统表存在（不存在则创建）。返回是否「本次新建」。
+  DbStatus EnsureIndexTable(bool* created);
+
   // 从系统目录表全表扫描重建内存目录；逐表 open_table 校验并补 first_page_id。
   // 校验失败的陈旧条目（表名在目录里、物理表却没了）会被剔除并告警，而不是重建。
   DbStatus LoadFromStorage();
+
+  // 索引系统表：全量重建内存索引视图（在 LoadFromStorage 之后调用）。
+  DbStatus LoadIndexesFromStorage();
+
+  // ── 二级索引元数据 ────────────────────────────────────────
+  // 写/删一条索引元数据（供执行器 DDL 调用；须在 storage_mutex_ 临界区内）。
+  DbStatus WriteIndexRow(const CatalogIndex& index);
+  DbStatus DeleteIndexRows(const std::string& index_name);
+  // 删除一张表的全部索引元数据（DROP TABLE 级联；须在临界区内）。
+  DbStatus DeleteIndexesOfTable(const std::string& table_name);
+
+  // 内存索引视图查询
+  const CatalogIndex* FindIndex(const std::string& index_name) const;
+  std::vector<const CatalogIndex*> IndexesOfTable(const std::string& table_name) const;
+  std::vector<const CatalogIndex*> ListIndexes() const;
+  size_t index_count() const { return indexes_.size(); }
 
   // 写/删一张用户表的目录行（供执行器 DDL 调用；须在 storage_mutex_ 临界区内）。
   DbStatus WriteTableRow(const CatalogTable& table);
@@ -127,15 +165,22 @@ class CatalogManager {
   static std::string EncodeColumns(const std::vector<CatalogColumn>& cols);
   static bool DecodeColumns(const std::string& text, std::vector<CatalogColumn>* cols);
   static storage::Schema SystemTableSchema();
+  static storage::Schema IndexTableSchema();
   storage::Rid FindCatalogRow(const std::string& name) const;
+  storage::Rid FindIndexRow(const std::string& index_name) const;
   // 扫描到的每行 → CatalogTable；失败返回 false
   bool DecodeRow(const storage::Record& row, CatalogTable* out) const;
+  // 索引系统表每行 → CatalogIndex；失败返回 false
+  bool DecodeIndexRow(const storage::Record& row, CatalogIndex* out) const;
   // 把系统表自身作为一条合成条目放进内存目录（可查、可 FindTable）
   void AddSystemTableEntry();
+  // 把索引系统表作为一条合成条目放进内存目录（可查）
+  void AddIndexTableEntry();
 
   std::string data_dir_;
   uint32_t next_table_id_ = 1;
   std::map<std::string, CatalogTable> tables_;  // 键 = 大写表名
+  std::map<std::string, CatalogIndex> indexes_; // 键 = 大写索引名
   storage::IStorage* storage_ = nullptr;
 };
 

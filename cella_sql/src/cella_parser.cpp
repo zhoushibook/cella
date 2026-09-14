@@ -228,6 +228,11 @@ namespace cella
                     switch (t.keyword)
                     {
                     case CELLA_Keyword::CREATE:
+                        // CREATE INDEX / CREATE UNIQUE INDEX 优先判定
+                        if (peek(1).type == CELLA_TokenType::KEYWORD &&
+                            (peek(1).keyword == CELLA_Keyword::INDEX ||
+                             peek(1).keyword == CELLA_Keyword::UNIQUE))
+                            return parseCreateIndex();
                         return parseCreateTable();
                     case CELLA_Keyword::INSERT:
                         return parseInsert();
@@ -238,6 +243,9 @@ namespace cella
                     case CELLA_Keyword::UPDATE:
                         return parseUpdate();
                     case CELLA_Keyword::DROP:
+                        if (peek(1).type == CELLA_TokenType::KEYWORD &&
+                            peek(1).keyword == CELLA_Keyword::INDEX)
+                            return parseDropIndex();
                         return parseDropTable();
                     default:
                         break;
@@ -723,6 +731,46 @@ namespace cella
                 if (!expectKw(CELLA_Keyword::TABLE))
                     return nullptr;
                 if (!expectIdent(st->tableName))
+                    return nullptr;
+                if (!expectSemicolon())
+                    return nullptr;
+                return st;
+            }
+
+            // CREATE [UNIQUE] INDEX idx ON table '(' column ')' ';'
+            std::unique_ptr<CELLA_Stmt> parseCreateIndex()
+            {
+                const CELLA_Token &t = advance(); // CREATE
+                auto st = makeStmt(CELLA_Stmt::Kind::CREATE_INDEX, t);
+                if (matchKw(CELLA_Keyword::UNIQUE))
+                    st->unique = true;
+                if (!expectKw(CELLA_Keyword::INDEX))
+                    return nullptr;
+                if (!expectIdent(st->indexName))
+                    return nullptr;
+                if (!expectKw(CELLA_Keyword::ON))
+                    return nullptr;
+                if (!expectIdent(st->tableName))
+                    return nullptr;
+                if (!expectDelim("("))
+                    return nullptr;
+                if (!expectIdent(st->indexColumn))
+                    return nullptr;
+                if (!expectDelim(")"))
+                    return nullptr;
+                if (!expectSemicolon())
+                    return nullptr;
+                return st;
+            }
+
+            // DROP INDEX idx ';'
+            std::unique_ptr<CELLA_Stmt> parseDropIndex()
+            {
+                const CELLA_Token &t = advance(); // DROP
+                auto st = makeStmt(CELLA_Stmt::Kind::DROP_INDEX, t);
+                if (!expectKw(CELLA_Keyword::INDEX))
+                    return nullptr;
+                if (!expectIdent(st->indexName))
                     return nullptr;
                 if (!expectSemicolon())
                     return nullptr;

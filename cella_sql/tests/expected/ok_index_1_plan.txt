@@ -1,0 +1,20 @@
+CreateTable
+  table: t_user
+  columns: id INT PRIMARY KEY, name VARCHAR(20), age INT
+
+CreateIndex
+  index: idx_user_name
+  table: t_user
+  column: name
+  unique: false
+
+CreateIndex
+  index: uq_user_age
+  table: t_user
+  column: age
+  unique: true
+
+DropIndex
+  index: idx_user_name
+
+SeqScan [t_user]

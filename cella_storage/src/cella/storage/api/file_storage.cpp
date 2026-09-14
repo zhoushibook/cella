@@ -333,6 +333,9 @@ namespace cella::storage
     return std::vector<std::string>(q.begin(), q.end());
   }
 
+  // 缓冲池句柄：引擎组据此构造 BPlusTree 做索引页 I/O。
+  BufferPoolManager *FileStorage::buffer_pool() { return bpm_.get(); }
+
   // ─────────────────────────────────────────────────────────────────────────
   // 目录持久化：把 tables_（表名 → schema + 首数据页）序列化进一个 kCatalogPage。
   //

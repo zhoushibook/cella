@@ -70,6 +70,10 @@ namespace cella::db
         return "UPDATE";
       case cella::CELLA_Stmt::Kind::DROP_TABLE:
         return "DROP TABLE";
+      case cella::CELLA_Stmt::Kind::CREATE_INDEX:
+        return "CREATE INDEX";
+      case cella::CELLA_Stmt::Kind::DROP_INDEX:
+        return "DROP INDEX";
       }
       return "?";
     }
@@ -351,6 +355,12 @@ namespace cella::db
       {
         return cs;
       }
+      // ④a 二级索引元数据表（独立系统表 cella_index；P1.2）
+      const DbStatus is = catalog_.EnsureIndexTable(nullptr);
+      if (!is.ok())
+      {
+        return is;
+      }
     }
 
     // ④b 旧文本目录一次性迁移（catalog.meta → 系统表），迁移完改名留档
@@ -398,6 +408,12 @@ namespace cella::db
       if (!ls.ok())
       {
         return ls;
+      }
+      // 索引元数据随目录一并加载（无表 → 视为无索引，非错误）
+      const DbStatus ixs = catalog_.LoadIndexesFromStorage();
+      if (!ixs.ok())
+      {
+        return ixs;
       }
     }
 
@@ -739,10 +755,20 @@ namespace cella::db
     {
       return cs;
     }
+    const DbStatus xs = catalog_.EnsureIndexTable(nullptr);
+    if (!xs.ok())
+    {
+      return xs;
+    }
     const DbStatus ls = catalog_.LoadFromStorage();
     if (!ls.ok())
     {
       return ls;
+    }
+    const DbStatus ixs = catalog_.LoadIndexesFromStorage();
+    if (!ixs.ok())
+    {
+      return ixs;
     }
     current_db_ = name;
     if (note != nullptr)
@@ -792,6 +818,49 @@ namespace cella::db
       out->rows.push_back(std::move(row));
     }
     out->tag = "SHOW DATABASES " + std::to_string(out->rows.size());
+    return DbStatus::Ok();
+  }
+
+  DbStatus DbEngine::ShowIndexes(const std::string &table, QueryResult *out)
+  {
+    if (out == nullptr)
+    {
+      return DbStatus::Error(DbCode::kInternal, "ShowIndexes: 输出为空");
+    }
+    out->Clear();
+    std::lock_guard<std::recursive_mutex> guard(storage_mutex_);
+
+    std::vector<const CatalogIndex *> found;
+    if (table.empty())
+    {
+      found = catalog_.ListIndexes();
+    }
+    else
+    {
+      if (catalog_.FindTable(table) == nullptr)
+      {
+        return DbStatus::Error(DbCode::kTableNotFound, "表不存在: " + table);
+      }
+      found = catalog_.IndexesOfTable(table);
+    }
+    // 表头必须先建：客户端靠 columns 非空来判定「这是一条查询」
+    // （QueryResult::IsQuery），缺了会导致 JSON 里 columns 为 null。
+    out->columns.push_back(ResultColumn{"index_name"});
+    out->columns.push_back(ResultColumn{"table_name"});
+    out->columns.push_back(ResultColumn{"column_name"});
+    out->columns.push_back(ResultColumn{"unique"});
+    out->columns.push_back(ResultColumn{"root_page_id"});
+    for (const CatalogIndex *ix : found)
+    {
+      std::vector<storage::Value> row;
+      row.push_back(storage::Value::Varchar(ix->name));
+      row.push_back(storage::Value::Varchar(ix->table));
+      row.push_back(storage::Value::Varchar(ix->column));
+      row.push_back(storage::Value::Int(ix->unique ? 1 : 0));
+      row.push_back(storage::Value::Int(static_cast<int32_t>(ix->root_page_id)));
+      out->rows.push_back(std::move(row));
+    }
+    out->tag = "SHOW INDEXES " + std::to_string(out->rows.size());
     return DbStatus::Ok();
   }
 
@@ -1396,7 +1465,10 @@ namespace cella::db
       out->kind = db_kind;
       DbStatus st;
       std::string note;
-      if (db_kind != "SHOW DATABASES" && in_transaction())
+      // SHOW DATABASES / SHOW INDEXES 是只读的，事务中放行；CREATE/DROP/USE
+      // 会换库或动文件系统，事务中一律拒绝（undo 记的是旧库表名，跨库切换会悬空）。
+      const bool readonly_show = (db_kind == "SHOW DATABASES" || db_kind == "SHOW INDEXES");
+      if (!readonly_show && in_transaction())
       {
         st = DbStatus::Error(DbCode::kDatabaseTxnActive,
                              db_kind + " 前须结束当前事务（COMMIT / ROLLBACK）");
@@ -1429,6 +1501,11 @@ namespace cella::db
             st = engine_->UseDatabase(db_arg, &note);
           }
         }
+      }
+      else if (db_kind == "SHOW INDEXES")
+      { // SHOW INDEXES [IN table]
+        st = engine_->ShowIndexes(db_arg, &out->result);
+        note = out->result.tag;
       }
       else
       { // SHOW DATABASES
@@ -1570,6 +1647,15 @@ namespace cella::db
       {
         ps = CheckDbPrivilege(Priv::kDrop, "DROP TABLE");
       }
+      else if (sk == cella::CELLA_Stmt::Kind::CREATE_INDEX)
+      {
+        // 建索引会改写表的物理布局语义 → 与建表同级，要求 kCreate
+        ps = CheckDbPrivilege(Priv::kCreate, "CREATE INDEX");
+      }
+      else if (sk == cella::CELLA_Stmt::Kind::DROP_INDEX)
+      {
+        ps = CheckDbPrivilege(Priv::kDrop, "DROP INDEX");
+      }
       if (!ps.ok())
       {
         // 语义阶段可能已把这张（不存在的）表登记进编译器目录副本 → 必须复位，
@@ -1593,10 +1679,11 @@ namespace cella::db
     }
 
     // ── ④ 事务上下文：显式事务优先，否则为单语句开自动提交事务 ──
-    // DDL 例外：建表/删表会立即改写目录文件（元数据无法回滚），故按 MySQL 惯例
+    // DDL 例外：建表/删表/建删索引会立即改写目录（元数据无法回滚），故按 MySQL 惯例
     // 先隐式提交前置事务，再以自动提交方式执行 DDL，避免出现「目录已改、事务回滚」
     // 造成的元数据与数据不一致。
-    const bool is_ddl = (out->kind == "CREATE TABLE" || out->kind == "DROP TABLE");
+    const bool is_ddl = (out->kind == "CREATE TABLE" || out->kind == "DROP TABLE" ||
+                         out->kind == "CREATE INDEX" || out->kind == "DROP INDEX");
     if (is_ddl && in_transaction())
     {
       const txn_id_t prev = txn_;
