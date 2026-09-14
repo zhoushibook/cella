@@ -158,7 +158,7 @@ cella_web.exe
   - **C++ 层** `build/cella_client/cella_client_tests.exe`（JSON 往返与容错 / HTTP 解析与畸形请求 /
     SQL 生成 / API 端到端 / 坐标换算黄金样本）。`run_all.ps1` 已纳入。
   - **前端行为层** `web/_selftest/`（零依赖、零 npm）：在真实浏览器里 import 真实模块、派发真实事件、
-    把断言写回页面。grid 24 / editor 17 / panels 18 / layout 40 / app 集成 35，共 **134 项**。
+    把断言写回页面。grid 31 / editor 17 / panels 18 / layout 40 / app 集成 35，共 **141 项**。
     入口 `http://127.0.0.1:8080/_selftest/index.html`，或用 headless 浏览器跑（见该页说明）。
 
 ---

@@ -44,7 +44,8 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
   let checked = new Set();  // 勾选的行（视图坐标）
   let firstVisible = 0;
   let dragMode = null;      // 'cell' | 'row'
-  let resizeState = null;   // {kind:'col'|'rownum', x, w}
+  let resizeState = null;   // {kind:'col'|'rownum', x, w} | {kind:'row', y, h}
+  let suppressClick = false; // 拖拽列宽/行高后浏览器会补一个 click，不能当成排序/全选
   let rowH = loadNum('rowH', ROW_H_DEF, ROW_H_MIN, ROW_H_MAX);          // 行高（可拖）
   let rownumW = loadNum('rownumW', ROWNUM_W_DEF, 34, 160);              // 「#」列宽（可拖）
 
@@ -55,6 +56,10 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
 
   // 有 onSort（服务端/受控排序）时不自排；否则本地排序（查询结果用）
   const localSort = !onSort;
+
+  // 列宽备忘：key = 列名|类型。手动拖过的宽度跨 setData 记住（翻页/排序/换查询都不丢）
+  const widthMemo = new Map();
+  const colKey = (c) => c.name + '|' + c.type;
 
   function fitWidth(ci) {
     const c = cols[ci];
@@ -181,6 +186,7 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
     const rowHandle = e.target.closest('.rowresize');
     if (rowHandle) {
       resizeState = { kind: 'row', y: e.clientY, h: rowH };
+      suppressClick = true;
       document.body.style.cursor = 'row-resize';
       e.preventDefault();
       return;
@@ -190,10 +196,12 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
       const ci = +handle.getAttribute('data-ci');
       if (ci === -1) resizeState = { kind: 'rownum', x: e.clientX, w: rownumW };
       else resizeState = { kind: 'col', ci, x: e.clientX, w: widths[ci] };
+      suppressClick = true;
       document.body.style.cursor = 'col-resize';
       e.preventDefault();
       return;
     }
+    suppressClick = false;   // 普通按下：清掉可能残留的标记（上次拖拽没跟来 click 时）
     if (e.target.closest('input')) return;   // 复选框自己处理
     if (e.target.closest('thead')) return;   // 表头交给 click
 
@@ -283,6 +291,11 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
 
   // ── 排序（表头点击，三态） / 全选（# 表头） ──────────────
   table.addEventListener('click', (e) => {
+    // 拖完列宽/行高后浏览器补发的 click：既不能排序，也不能触发「点 # 表头全选」
+    if (suppressClick) {
+      suppressClick = false;
+      return;
+    }
     if (e.target.closest('.resize') || e.target.closest('.rowresize')) return;
     const thAll = e.target.closest('thead th.rownum');
     if (thAll) {
@@ -368,6 +381,10 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
 
   return {
     setData(columns, dataRows) {
+      // 保留「同名同类型」列的宽度：翻页 / 排序 / 保存 / 重跑查询 / 换列集再换回来，都不冲掉用户调过的列宽
+      const prevCols = cols;
+      const prevWidths = widths;
+      prevCols.forEach((c, i) => widthMemo.set(colKey(c), prevWidths[i]));
       cols = columns || [];
       rows = dataRows || [];
       checked = new Set();
@@ -376,7 +393,10 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
       container.scrollTop = 0;
       view = rows;
       applySort();
-      widths = cols.map((_, c) => fitWidth(c));
+      widths = cols.map((c, i) => {
+        const remembered = widthMemo.get(colKey(c));
+        return remembered != null ? remembered : fitWidth(i);
+      });
       render();
       afterCheck();
     },

@@ -117,6 +117,31 @@ ok('行高已写入 CSS 变量', host3.querySelector('table').style.getPropertyV
 g3.resetLayout();
 ok('resetLayout 复位行高 26', g3.rowHeight() === 26);
 
+// ⑩ 回归：拖列宽/行高后浏览器补发的 click，不能当成「点列头排序」或「点 # 全选」
+const sortsBefore = sorts.length;
+host.querySelector('th[data-col="score"] .resize').dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: 100, clientY: 0 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 130, clientY: 0, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+host.querySelector('th[data-col="score"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+ok('拖列宽后的尾随 click 不触发排序（sorts=' + sorts.length + '）', sorts.length === sortsBefore);
+ok('拖列宽后的尾随 click 不清掉列宽 ' + colEl(2).style.width, parseInt(colEl(2).style.width, 10) === 96);
+g.clearSelection();
+host.querySelector('th.rownum .rowresize').dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: 0, clientY: 0 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 0, clientY: 10, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+host.querySelector('th.rownum').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+ok('拖行高后的尾随 click 不触发全选', host.querySelectorAll('td[data-c].sel').length === 0);
+ok('行高保持拖后的值 ' + g.rowHeight(), g.rowHeight() === 36);
+
+// ⑪ setData（翻页 / 排序 / 保存 / 重跑查询都会走这里）保留手动列宽
+const wName = colEl(1).style.width;
+g.setData(cols, rows);
+ok('setData 后手动列宽保留（' + wName + ' → ' + colEl(1).style.width + '）', colEl(1).style.width === wName);
+g.setData([{ name: 'other', type: 'INT' }], [[1]]);
+ok('换成别的列则重新自适应', colEl(0).style.width !== wName);
+g.setData(cols, rows);
+ok('换回来仍能按列名找回宽度 ' + colEl(1).style.width, colEl(1).style.width === wName);
+
 document.getElementById('out').textContent = L.join('\n');
 </script>
 </body></html>
