@@ -19,6 +19,7 @@
 //   * 计划树内的 stmt/tableRef 指针指向调用方持有的 AST，调用期间必须存活。
 #pragma once
 
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -35,10 +36,53 @@
 #include "cella/storage/api/i_storage.h"
 #include "cella/storage/common/record.h"
 #include "cella/storage/common/types.h"
+#include "cella/storage/index/b_plus_tree.h"
 
 namespace cella::db {
 
 class AuthStore;
+
+// ── 访问路径（P1.3 + P1.6）──────────────────────────────────
+//
+// 计划树里的表访问节点统一是 `SeqScan`（这是编译器打印的 golden 契约，不能动）。
+// 「到底走堆扫描还是索引扫描」由执行器在**运行时**决定：只有执行层同时看得到
+// 索引元数据（cella_index）、表的列类型和真实行数，而编译器看不到。
+// 这样既拿到了索引加速，又保持了计划文本逐字节兼容。
+enum class AccessPath {
+  kSeqScan,          // 全表堆扫描 + 谓词过滤
+  kIndexScan,        // 索引定位 + 回表取整行（非覆盖）
+  kIndexOnlyScan,    // 索引覆盖扫描：只读索引，不回表
+  kRowidLookup,      // `rowid = N` 直接物理定位（既有优化，也纳入同一套选择框架）
+};
+
+// 一次表访问的最终选择结果（也是 EXPLAIN 的输出载体）。
+struct AccessPathChoice {
+  AccessPath path = AccessPath::kSeqScan;
+  std::string index_name;        // 走索引时用的索引名；否则为空
+  std::string index_column;      // 索引列名
+  std::string reason;            // 人类可读的选择理由（EXPLAIN 直接展示）
+  // 索引扫描的边界（列值形态，nullptr/未设置表示无界）
+  bool has_lower = false;
+  bool has_upper = false;
+  bool lower_inclusive = true;
+  bool upper_inclusive = true;
+  storage::Value lower;
+  storage::Value upper;
+  bool equality = false;         // 等值定位（比范围更省）
+  // 范围选择率 = 谓词区间宽度 / 索引列值域宽度（0 = 无统计，用经验值）。
+  // 由 ChooseAccessPath 从索引的 min/max（首末叶子键）算出 —— 索引有序，
+  // 这等价于一份免费的一维统计。没有它，窄范围与宽范围会被估成同一选择率。
+  double range_span = 0.0;
+  // 代价估算（P1.6 填充；P1.3 阶段先用简化估算，见 EstimateAccessPath）
+  double est_rows = 0.0;         // 预计产出行数
+  double est_cost = 0.0;         // 预计代价（抽象单位）
+
+  bool uses_index() const {
+    return path == AccessPath::kIndexScan || path == AccessPath::kIndexOnlyScan;
+  }
+  // EXPLAIN 里的单行描述
+  std::string Describe() const;
+};
 
 // 语句执行的上下文：事务 + 触碰表记录
 struct ExecContext {
@@ -74,12 +118,74 @@ class Executor {
   // 绑定身份库（访问控制判定用；不接管所有权）。引擎在打开后调用一次即可。
   void AttachAuth(const AuthStore* auth) { auth_ = auth; }
 
+  // ── undo 补偿期间的索引维护（P1.5）──────────────────────────
+  // 事务回滚只补偿表行，索引会与表数据分叉。本方法是 TxnManager::UndoIndexHooks
+  // 的执行器侧实现：回滚过程中每撤销一步，就把对应索引项一并修正。
+  // 由 DbEngine 在装配时注册给 TxnManager。
+  class IndexUndoAdapter : public TxnManager::UndoIndexHooks {
+   public:
+    explicit IndexUndoAdapter(Executor* owner) : owner_(owner) {}
+    void OnUndoInsertDeleted(const std::string& table, const storage::Rid& rid) override;
+    void OnUndoRowRestored(const std::string& table, const storage::Rid& rid,
+                           const storage::Record& record) override;
+
+   private:
+    Executor* owner_;
+  };
+  IndexUndoAdapter* undo_adapter() { return &undo_adapter_; }
+
   // 只跑查询算子子树（GET 的各类算子也可单独驱动，便于测试）
   DbStatus Run(const cella::CELLA_PlanNode& node, const ExecContext& ctx, RowSet* out);
 
   // 统计：执行的算子次数（可观测「计划驱动」确实发生了）
   size_t operator_calls() const { return operator_calls_; }
   void ResetOperatorCalls() { operator_calls_ = 0; }
+
+  // ── 索引维护观测（P1.5）──────────────────────────────────────
+  // DML 每维护一条索引项记一次；测试据此断言「索引确实被同步维护」，
+  // 而不是只能间接从查询结果推断。
+  struct IndexMaintenanceStats {
+    size_t inserts = 0;   // 索引项插入次数
+    size_t deletes = 0;   // 索引项删除次数
+    size_t updates = 0;   // 同一列值未变的「删除 + 重插」（DELETE_INSERT）
+    size_t violations = 0;  // 唯一性冲突次数（含主键与唯一二级索引）
+  };
+  const IndexMaintenanceStats& index_stats() const { return index_stats_; }
+  void ResetIndexStats() { index_stats_ = IndexMaintenanceStats{}; }
+
+  // ── 访问路径观测（P1.3）────────────────────────────────────
+  // 每发生一次表访问就记一条（含 SeqScan 与索引扫描），供 EXPLAIN 与测试断言。
+  // 之所以记在执行器上而不是语句结果里：计划文本必须保持与改造前逐字节一致，
+  // EXPLAIN 是**额外**通道，不能污染 QueryResult 或 plan_text。
+  struct AccessPathRecord {
+    std::string table;   // 真实表名
+    AccessPathChoice choice;
+    size_t rows_out = 0;   // 该路径实际产出的行数
+    size_t pages_read = 0; // 索引路径访问的索引页数（近似，0 = 未统计）
+  };
+  const std::vector<AccessPathRecord>& access_paths() const { return access_paths_; }
+  void ResetAccessPaths() { access_paths_.clear(); }
+
+  // 解析一条语句的访问路径选择（不执行）：供 EXPLAIN 使用。
+  // 传入的是**已优化的计划树**；返回每个表访问节点的选择（自下而上，与算子树同序）。
+  DbStatus Explain(const cella::CELLA_PlanNode& plan, std::vector<AccessPathRecord>* out);
+
+  // 把访问路径选择树渲染成缩进文本（EXPLAIN 的最终展示）。
+  // 形如：
+  //   Project [name]
+  //     Filter (age > 18)
+  //       IndexScan [student] using student_age_idx (age = 20)   rows≈2 cost≈4.0
+  //
+  // 非 const 的原因：它会先 RegisterNeededColumns(plan) 登记本语句的列需求，
+  // 再跑 ChooseAccessPath。**这一步不能省**：ExplAIN 与真正执行必须看到
+  // 同一份列需求，否则 index-only scan 在 EXPLAIN 里会被保守地降级成回表，
+  // 报表与实跑不一致（P1.6 覆盖扫描用例就是这么暴露出来的）。
+  // 它改的只是 needed_cols_ 这个纯缓存，不触碰任何数据。
+  std::string ExplainText(const cella::CELLA_PlanNode& plan);
+
+  // 只读版本：不做列需求登记，直接按当前缓存渲染。
+  // 用于「已经登记过、只想再渲染一次」的场景（如把选择树追加到 EXPLAIN 输出）。
+  std::string ExplainTextNoRegister(const cella::CELLA_PlanNode& plan) const;
 
  private:
   // ── 语句级算子 ──
@@ -96,6 +202,12 @@ class Executor {
 
   // ── 查询算子（与计划节点一一对应）──
   DbStatus OpSeqScan(const cella::CELLA_PlanNode& node, const ExecContext& ctx, RowSet* out);
+  // IndexScan：由用户在计划里显式给出索引（"IndexScan" 节点）时直接驱动。
+  // 正常运行时不走这里 —— 计划树里只有 SeqScan，OpSeqScan 内部会按访问路径
+  // 选择结果改走索引（见 ResolveAccessPath）。本算子存在是为了：
+  //   1) 单测可以直接构造 IndexScan 计划驱动索引扫描的各种边界；
+  //   2) EXPLAIN 与执行共用同一条索引扫描代码路径，避免两套实现漂移。
+  DbStatus OpIndexScan(const cella::CELLA_PlanNode& node, const ExecContext& ctx, RowSet* out);
   DbStatus OpFilter(const cella::CELLA_PlanNode& node, const ExecContext& ctx, RowSet* out);
   DbStatus OpProject(const cella::CELLA_PlanNode& node, const ExecContext& ctx, RowSet* out);
   DbStatus OpDistinct(const cella::CELLA_PlanNode& node, const ExecContext& ctx, RowSet* out);
@@ -130,6 +242,177 @@ class Executor {
   // 解析 SeqScan 的 detail 文本 "[name alias]"（tableRef 缺失时的兜底）
   static bool ParseTableDisplay(const std::string& detail, std::string* name, std::string* alias);
 
+  // ── 主键自动索引（P1.4）──────────────────────────────────────
+  // CREATE TABLE 后为有主键的表建唯一索引（无主键则是空操作）。
+  // 索引名固定为 <table>_pk，登记进 cella_index 系统表 → 自动获得持久化、
+  // DROP TABLE 级联清理、以及 DML 索引维护。幂等：已存在同名索引时直接返回。
+  DbStatus CreatePrimaryIndex(const CatalogTable& table);
+  // 主键索引的命名规则（执行器与测试共用，避免魔法字符串散落）
+  static std::string PrimaryIndexName(const std::string& table);
+  // 该表当前是否已有主键自动索引
+  bool HasPrimaryIndex(const std::string& table) const;
+
+  // ── 索引维护（P1.5）──────────────────────────────────────────  // 表上全部有效索引的运行时句柄：元数据 + 已 Attach 的 B+ 树。
+  // 键按列下标升序，便于多列维护时保持稳定顺序。
+  struct IndexHandle {
+    const CatalogIndex* meta = nullptr;
+    std::unique_ptr<storage::BPlusTree> tree;
+    int column = -1;  // 索引列在表内的下标；< 0 表示索引已失效（列被删）
+  };
+
+  // 打开一张表的全部索引（元数据 + B+ 树句柄）。须在 storage_mutex_ 临界区内调用。
+  // 表上没有索引时返回空 vector 且成功。
+  DbStatus OpenTableIndexes(const CatalogTable& table, std::vector<IndexHandle>* out);
+
+  // 把一个已（反）规范化的行值编码成该索引的叶子键。
+  // row_values 必须与表列一一对齐（含被索引列）。
+  static bool IndexKeyOf(const IndexHandle& ix, const std::vector<storage::Value>& row_values,
+                         const storage::Rid& rid, std::string* leaf_key);
+
+  // 唯一性检查：值 v 是否已被「rid 之外」的行占用。
+  // 返回 true 表示可用（unique_ok=true 且 busy=false），busy=true 表示冲突。
+  // 仅对 ix.meta->unique 有意义；非唯一索引直接判为可用。
+  DbStatus IndexValueFree(const IndexHandle& ix, const storage::Value& v, const storage::Rid& rid,
+                          bool* busy);
+
+  // 向全部索引插入某行的索引项（唯一索引先查重）。冲突返回 kUniqueViolation / kPrimaryKeyViolation。
+  DbStatus IndexRowInsert(std::vector<IndexHandle>* indexes, const CatalogTable& table,
+                          const std::vector<storage::Value>& row_values, const storage::Rid& rid);
+  // 从全部索引删除某行的索引项。
+  DbStatus IndexRowDelete(std::vector<IndexHandle>* indexes, const CatalogTable& table,
+                          const std::vector<storage::Value>& row_values, const storage::Rid& rid);
+  // 行内容变化时的索引维护：取值变化的索引做 DELETE_INSERT，未变的索引原地不动。
+  DbStatus IndexRowUpdate(std::vector<IndexHandle>* indexes, const CatalogTable& table,
+                          const std::vector<storage::Value>& before,
+                          const std::vector<storage::Value>& after, const storage::Rid& old_rid,
+                          const storage::Rid& new_rid);
+  // UPDATE 的唯一性预检（只读，不动树）。必须在「删旧行」之前调用，这样冲突时
+  // 表和索引都处于未改动状态，不需要依赖回滚来收尾。
+  DbStatus IndexRowCheckUpdate(const std::vector<IndexHandle>& indexes, const CatalogTable& table,
+                               const std::vector<storage::Value>& before,
+                               const std::vector<storage::Value>& after,
+                               const storage::Rid& old_rid);
+
+  // 用索引判定某表在「按 rowid 定位的旧行」是否仍存在（回滚后一致性校验用）。
+  DbStatus IndexVerifyRow(const std::vector<IndexHandle>& indexes, const CatalogTable& table,
+                          const std::vector<storage::Value>& row_values, const storage::Rid& rid,
+                          bool* present);
+
+  // undo 钩子的内部实现：按表名重新打开索引句柄再做维护（回滚路径上没有
+  // 现成的句柄可用，且可能要撤销多张表的改动）。
+  void UndoIndexDropRow(const std::string& table, const storage::Rid& rid);
+  void UndoIndexRebuildRow(const std::string& table, const storage::Rid& rid,
+                           const storage::Record& record);
+
+  // ── 访问路径选择（P1.3）──────────────────────────────────────
+  // 判断一个谓词能否被某个索引「下推」成索引区间。能则填好 choice 的边界与
+  // equality 字段并返回 true。只识别可安全下推的形状：
+  //     <索引列> <op> <常量>  /  <常量> <op> <索引列>   (op ∈ =, <, <=, >, >=)
+  // 以及上述条件的 AND 组合（左右两侧分别尝试，区间取交集）。
+  // 不识别 OR / 函数调用 / 列与列比较 —— 下推不了就老老实实全表扫描。
+  bool TryIndexRange(const CatalogTable& table, const CatalogIndex& index, int column,
+                     const cella::CELLA_Expr* pred, AccessPathChoice* choice) const;
+
+  // 谓词里是否引用了某个列（用于判断索引覆盖扫描的可行性）。
+  static bool PredRefsColumn(const cella::CELLA_Expr* pred, const std::string& column);
+  // 谓词是否引用了「索引列之外」的表列（引用则必须回表，不能 index-only）。
+  static bool PredRefsColumnOutside(const cella::CELLA_Expr* pred, const CatalogTable& table,
+                                    int index_column);
+
+  // 为一次表访问挑选访问路径。pred 是该表上方最近的过滤谓词（可为空）。
+  // 决策顺序：
+  //   1) rowid 等值 → kRowidLookup（最省，直接物理定位）；
+  //   2) 有可用索引且索引区间能把行数压下来 → kIndexScan / kIndexOnlyScan；
+  //   3) 否则 kSeqScan。
+  // 「能不能压下来」由 EstimateAccessPath 的代价比较决定（P1.6 完善）。
+  DbStatus ChooseAccessPath(const CatalogTable& table, const cella::CELLA_Expr* pred,
+                            bool need_rowid, AccessPathChoice* out);
+
+  // 估算某条访问路径的代价与产出行数（P1.6 代价模型）。
+  //
+  // 输入：
+  //   row_count —— 表行数（估算的基数来源）
+  //   ix        —— 索引的实测几何（高度、叶子页数）。仅当 choice 走索引时使用；
+  //                全表扫描时传默认值即可。
+  //
+  // 为什么索引几何要**从外面传进来**而不是在函数里现算：
+  //   ① 代价估算必须是纯函数（无 I/O），否则 EXPLAIN 会变得比执行还贵；
+  //   ② 一次 ChooseAccessPath 里要对多个候选索引分别估算，几何可以在
+  //      选路径之前一次性取好（O(树高)，见 BPlusTree::Height）。
+  struct IndexStats {
+    double height = 0.0;      // 树高（叶子层 = 1）；0 表示未知 → 退回默认值
+    double leaf_pages = 0.0;  // 叶子页数；0 表示未知 → 按行数估算
+    bool known() const { return height > 0.0; }
+  };
+  void EstimateAccessPath(const CatalogTable& table, size_t row_count, const IndexStats& ix,
+                          const AccessPathChoice& choice, double* est_rows,
+                          double* est_cost) const;
+
+  // 收集计划树里所有 SeqScan 节点，与「其上方最近的过滤谓词」配对。
+  // 索引下推的本质就是：把 Filter 的谓词交给它正下方的表访问节点。
+  struct ScanPredicate {
+    const cella::CELLA_PlanNode* scan = nullptr;  // SeqScan 节点
+    const cella::CELLA_Expr* pred = nullptr;      // 该扫描上方最近的谓词（可空）
+    bool need_rowid = false;
+  };
+  static void CollectScanPredicates(const cella::CELLA_PlanNode& node, const cella::CELLA_Expr* pred,
+                                    bool with_rowid, std::vector<ScanPredicate>* out);
+
+  // 查找表上可用的索引（元数据 + 列下标）。列已被删掉的索引跳过。
+  DbStatus UsableIndexes(const CatalogTable& table, std::vector<IndexHandle>* out);
+
+  // 用索引首末叶子键（= 该列 min/max）估算范围选择率；不适合时返回 0。
+  double ComputeRangeSpan(storage::BPlusTree* tree, const AccessPathChoice& choice) const;
+
+  // 表的行数（存储层没有行数统计，只能扫一遍数；空表返回 0）。
+  // 代价模型需要它，P1.6 会在执行器上做缓存以避免重复计数。
+  size_t CountTableRows(const CatalogTable& table);
+
+  // ── EXPLAIN 渲染 ──
+  // 递归打印计划树，表访问节点显示最终选中的访问路径（而不是计划里的字面算子）。
+  // 非 const：内部要经 ChooseAccessPath（它可能刷新 needed_cols_ 缓存）。
+  void ExplainNode(const cella::CELLA_PlanNode& node, const cella::CELLA_Expr* pred, int depth,
+                   std::string* out) const;
+
+  // ── 表访问算子的公共实现（P1.3）───────────────────────────────
+  // SeqScan 与 IndexScan 共用：先做访问路径选择，再按结果走堆扫描或索引扫描。
+  // explicit_index_scan = true 表示计划节点本身就是 IndexScan（单测/EXPLAIN 构造），
+  // 此时强制走索引框架（没有可用区间时退化为整索引扫 + 回表）。
+  DbStatus OpTableAccess(const cella::CELLA_PlanNode& node, const ExecContext& ctx, RowSet* out,
+                         bool explicit_index_scan);
+
+  // 在索引上按区间定位候选 Rid（等值 / 范围 / 无界全索引）。
+  DbStatus ScanIndexRids(const CatalogTable& table, const IndexHandle& ix,
+                         const AccessPathChoice& choice, std::vector<storage::Rid>* out);
+
+  // 表上的第一个有效索引名（显式 IndexScan 但无区间时兜底）
+  std::string FirstIndexName(const CatalogTable& table) const;
+
+  // ── 谓词登记（Filter → 下方表访问节点）──────────────────────
+  // 计划形状固定为 Filter -> Scan，但执行是自底向上的：Scan 先被调用，
+  // 此时它还不知道上面的过滤条件。于是 Filter 在驱动子算子**之前**把谓词
+  // 登记进来，Scan 取出后据此做索引下推。键是表名（大写）。
+  // 这是执行器内部状态，必须在语句执行结束时清空 —— 见 ResetScanPredicates。
+  void PushScanPredicate(const std::string& table, const cella::CELLA_Expr* pred);
+  const cella::CELLA_Expr* TakeScanPredicate(const std::string& table);
+  void ResetScanPredicates() { scan_pred_.clear(); }
+  // 把谓词登记到一棵子树中所有表访问节点（Join 之下停止，见实现注释）
+  void PushPredicateToScans(const cella::CELLA_PlanNode& node, const cella::CELLA_Expr* pred);
+
+  // ── 语句列需求（判定 index-only scan 用）────────────────────
+  // 表访问节点位于算子树最底层，看不到上方 Project/Sort 需要哪些列。
+  // 因此在语句开始执行前，由 ExecGet 把「本语句该表需要的全部列」登记进来。
+  // 规则：索引列的集合 ⊇ 语句需要的列 → 可以 index-only；否则必须回表。
+  // 保守取向：**只要不确定就回表**（多读一次只是慢，漏列是错的）。
+  void SetNeededColumns(const std::string& table, std::vector<std::string> columns);
+  // 该表在本语句中是否用到了 index_column 之外的列（true = 需要回表）
+  bool StmtNeedsOtherColumn(const std::string& table, int index_column) const;
+  // 遍历优化后计划，把各表需要的列登记进 needed_cols_
+  void RegisterNeededColumns(const cella::CELLA_PlanNode& plan);
+  void CollectNeededColumns(const cella::CELLA_PlanNode& node, Executor* self);
+  void RegisterColumnsForSubtree(const cella::CELLA_PlanNode& node,
+                                 const std::vector<std::string>& cols);
+
   storage::IStorage* storage_;
   CatalogManager* catalog_;
   TxnManager* txn_manager_;
@@ -137,6 +420,12 @@ class Executor {
   std::recursive_mutex* storage_mutex_;
   const AuthStore* auth_ = nullptr;  // 访问控制判定（可为空 = 不做检查）
   size_t operator_calls_ = 0;
+  IndexMaintenanceStats index_stats_;
+  std::vector<AccessPathRecord> access_paths_;  // 最近一次执行的访问路径记录（P1.3）
+  std::map<std::string, const cella::CELLA_Expr*> scan_pred_;  // Filter → Scan 的谓词登记表
+  std::map<std::string, std::vector<std::string>> needed_cols_;  // 表 → 本语句需要的列（index-only 判定）
+  bool explain_mode_ = false;  // true = 只解析访问路径不取数据（Explain 期间）
+  IndexUndoAdapter undo_adapter_{this};
 
   // ── ORDER BY 引用未投影列时的「隐藏排序键」通道 ──
   // 计划形状固定为 Project → Distinct → Sort，而 SQL 语义里 ORDER BY 作用在

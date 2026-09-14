@@ -115,6 +115,23 @@ namespace cella::db
   class TxnManager
   {
   public:
+    // ── undo 补偿的外挂钩子（P1.5）──────────────────────────
+    // 表行与二级索引是两份派生关系的数据：回滚只补偿表行会让索引与表数据
+    // 重新分叉。为了让「索引维护」的归属留在执行层（它才知道目录与索引定义），
+    // 这里提供一个纯虚接口，由 DbEngine 注入执行器侧的实现：
+    //   OnUndoInsertDeleted(table, rid)          —— 补偿撤销了新插入的行 → 索引项也要删
+    //   OnUndoRowRestored(table, rid, record)    —— 补偿恢复了旧内容 → 索引项按新 Rid 重建
+    // 两个钩子都在 storage_mutex 临界区内被调用。
+    class UndoIndexHooks
+    {
+    public:
+      virtual ~UndoIndexHooks() = default;
+      virtual void OnUndoInsertDeleted(const std::string &table, const storage::Rid &rid) = 0;
+      virtual void OnUndoRowRestored(const std::string &table, const storage::Rid &rid,
+                                     const storage::Record &record) = 0;
+    };
+    void SetUndoIndexHooks(UndoIndexHooks *hooks) { undo_hooks_ = hooks; }
+
     TxnManager(storage::IStorage *storage, LockManager *locks, std::recursive_mutex *storage_mutex);
     ~TxnManager();
     TxnManager(const TxnManager &) = delete;
@@ -158,6 +175,7 @@ namespace cella::db
     size_t aborted_total_ = 0;
     std::string journal_path_;
     std::ofstream journal_;
+    UndoIndexHooks *undo_hooks_ = nullptr; // 可为空（不维护索引 / 单元测试直连）
   };
 
 } // namespace cella::db

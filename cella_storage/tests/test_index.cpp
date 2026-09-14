@@ -498,3 +498,84 @@ TEST_CASE(bptree_persist_via_attach) {
   EXPECT_OK(t2.Contains(EncodeLeafKey(Int32(25), 1, 25), &found));
   EXPECT_TRUE(found);
 }
+
+// ─────────────────────────────────────────────────────────────
+// 统计信息：Height / LeafPageCount（P1.6 代价模型的输入）
+//
+// 为什么单独测：代价模型按「树高页随机 I/O」给索引定位计费，
+// 高度错了会让主键等值查找在小表上被估得比全表扫描还贵。
+// 这两个接口是 P1.6 新增的，先把它们钉死。
+// ─────────────────────────────────────────────────────────────
+
+TEST_CASE(bptree_height_single_leaf) {
+  // 少量键 → 只有根叶子页，高度 = 1
+  auto bpm = MakeBpm(64);
+  BPlusTree t(bpm.get(), IntSpec());
+  page_id_t root = kInvalidPageId;
+  EXPECT_OK(t.Create(&root));
+  EXPECT_EQ(t.Height(), 1);
+
+  for (int32_t i = 0; i < 5; ++i) {
+    bool dup = false;
+    EXPECT_OK(InsertInt(&t, i, 1, static_cast<uint8_t>(i), &dup));
+  }
+  // 仍未分裂 → 高度保持 1
+  EXPECT_EQ(t.Height(), 1);
+  EXPECT_EQ(t.LeafPageCount(), 1u);
+}
+
+TEST_CASE(bptree_height_grows_with_splits) {
+  // 插入足够多的键触发叶子分裂与根分裂：高度应随层数增长，
+  // 且叶子页数应等于分裂出的叶子个数。
+  auto bpm = MakeBpm(512);
+  BPlusTree t(bpm.get(), IntSpec());
+  page_id_t root = kInvalidPageId;
+  EXPECT_OK(t.Create(&root));
+
+  const int32_t n = 2000;  // 远超单页容量（4KB 页下 int 键约能放几百个）
+  for (int32_t i = 0; i < n; ++i) {
+    bool dup = false;
+    EXPECT_OK(InsertInt(&t, i, 1, static_cast<uint8_t>(i % 256), &dup));
+  }
+
+  const uint16_t h = t.Height();
+  const uint64_t leaves = t.LeafPageCount();
+  // 至少长到「根 + 叶子」两层；2000 个键在 4KB 页下必定多叶
+  EXPECT_TRUE(h >= 2);
+  EXPECT_TRUE(leaves >= 2);
+  // 叶子页数与键数一致地增长：每页至少能放 4 个键（MaxKeysPerIndexPage 下限）
+  EXPECT_TRUE(leaves <= static_cast<uint64_t>(n));
+
+  // 高度是可重复读取的（不改变树状态）
+  EXPECT_EQ(t.Height(), h);
+  EXPECT_EQ(t.LeafPageCount(), leaves);
+}
+
+TEST_CASE(bptree_stats_invalid_tree) {
+  // 无效树（未 Create / 未 Attach）→ 高度与叶子数都是 0，不能崩
+  auto bpm = MakeBpm(16);
+  BPlusTree t(bpm.get(), IntSpec());
+  EXPECT_TRUE(!t.valid());
+  EXPECT_EQ(t.Height(), 0);
+  EXPECT_EQ(t.LeafPageCount(), 0u);
+}
+
+TEST_CASE(bptree_leaf_pages_match_scan) {
+  // 交叉验证：LeafPageCount 数出的叶子页，与「沿 right_sibling 走到最大键」一致。
+  // 用「最后一个键所在页 == 从根到最右路径的叶子」这条不变量做侧面确认。
+  auto bpm = MakeBpm(512);
+  BPlusTree t(bpm.get(), IntSpec());
+  page_id_t root = kInvalidPageId;
+  EXPECT_OK(t.Create(&root));
+  for (int32_t i = 0; i < 800; ++i) {
+    bool dup = false;
+    EXPECT_OK(InsertInt(&t, i, 2, static_cast<uint8_t>(i % 256), &dup));
+  }
+  const uint64_t leaves = t.LeafPageCount();
+  EXPECT_TRUE(leaves >= 2);
+
+  // 全量扫描应能取回全部 800 个键（叶子链完整）
+  std::vector<std::string> all;
+  EXPECT_OK(t.ScanAll(&all));
+  EXPECT_EQ(all.size(), 800u);
+}

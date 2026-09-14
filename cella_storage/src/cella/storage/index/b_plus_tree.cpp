@@ -504,4 +504,72 @@ Status BPlusTree::ScanAll(std::vector<std::string>* out) {
   });
 }
 
+// ── 统计信息（P1.6 代价模型用）─────────────────────────────
+//
+// Height：一直往「最左子指针」走，数到叶子为止。根是叶子时高度 = 1。
+// 不走 LowerBound 是因为不需要键 —— 只要骨架层数，第 0 个子指针恒存在
+// （内部节点至少有 1 个子指针，分裂逻辑保证）。
+uint16_t BPlusTree::Height() const {
+  if (!valid()) {
+    return 0;
+  }
+  uint16_t h = 0;
+  page_id_t cur = root_;
+  for (;;) {
+    PageGuard g(bpm_, bpm_->get_page(cur));
+    if (!g.valid()) {
+      return 0;  // 页缺失 → 拿不到可信高度
+    }
+    ++h;
+    IndexNode node(g.get());
+    if (node.type() == IndexNodeType::kLeaf) {
+      return h;
+    }
+    const page_id_t next = node.Child(0);
+    if (next == kInvalidPageId) {
+      return 0;
+    }
+    cur = next;
+    // 防御：结构异常时不要死循环（正常 B+ 树高度远小于此）
+    if (h > 64) {
+      return 0;
+    }
+  }
+}
+
+// LeafPageCount：从最左叶子沿 right_sibling 链表数一遍。
+uint64_t BPlusTree::LeafPageCount() const {
+  if (!valid()) {
+    return 0;
+  }
+  // 先降到最左叶子（与 Height 同一段路径）
+  page_id_t cur = root_;
+  for (;;) {
+    PageGuard g(bpm_, bpm_->get_page(cur));
+    if (!g.valid()) {
+      return 0;
+    }
+    IndexNode node(g.get());
+    if (node.type() == IndexNodeType::kLeaf) {
+      break;
+    }
+    const page_id_t next = node.Child(0);
+    if (next == kInvalidPageId) {
+      return 0;
+    }
+    cur = next;
+  }
+  uint64_t n = 0;
+  while (cur != kInvalidPageId) {
+    ++n;
+    PageGuard g(bpm_, bpm_->get_page(cur));
+    if (!g.valid()) {
+      return n;  // 走到坏页就停在已数到的部分
+    }
+    IndexNode node(g.get());
+    cur = node.right_sibling();
+  }
+  return n;
+}
+
 }  // namespace cella::storage

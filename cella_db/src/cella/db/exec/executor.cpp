@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -248,6 +250,72 @@ namespace cella::db
       std::lock_guard<std::recursive_mutex> lk_;
     };
 
+    // 两个值在索引语义下是否算「同一列值」。
+    // NULL 与任何值都不相等（SQL 的 UNIQUE 语义：多个 NULL 允许共存），
+    // 非 NULL 时用类型感知比较，避免 "1" 与 1 误判为相同。
+    bool IndexValuesEqual(const storage::Value &a, const storage::Value &b)
+    {
+      if (a.IsNull() || b.IsNull())
+      {
+        return a.IsNull() && b.IsNull();
+      }
+      return ValueEquals(a, b);
+    }
+
+    // 标识符大小写不敏感比较（表名/列名在目录与计划里拼写可能不一致）
+    bool SameIdent(const std::string &a, const std::string &b)
+    {
+      return cella::cella_toUpper(a) == cella::cella_toUpper(b);
+    }
+
+    // 把字面量表达式转成存储值。只接受能安全用于索引边界的类型：
+    // 数值 / 字符串 / 布尔 / 日期文本。NULL 由调用方提前挡掉（区间边界不含 NULL）。
+    bool LiteralToValue(const cella::CELLA_Expr &e, storage::Value *out)
+    {
+      using LK = cella::CELLA_LiteralKind;
+      switch (e.lit)
+      {
+      case LK::NUMBER:
+      {
+        // 整数文本 → INT64，否则 → DOUBLE（与执行层既有的数值规约一致）。
+        // 索引区间边界必须类型精确：把 20 编成 DOUBLE 会让「INT 列 = 20」
+        // 的区间与叶子键的 INT 编码对不上，从而扫出空区间。
+        if (e.text.find('.') == std::string::npos && e.text.find('e') == std::string::npos &&
+            e.text.find('E') == std::string::npos)
+        {
+          errno = 0;
+          const long long iv = std::strtoll(e.text.c_str(), nullptr, 10);
+          if (errno == 0)
+          {
+            *out = storage::Value::BigInt(iv);
+            return true;
+          }
+        }
+        *out = storage::Value::Double(e.num);
+        return true;
+      }
+      case LK::STRING:
+        *out = storage::Value::Varchar(e.text);
+        return true;
+      case LK::BOOL_LIT:
+        *out = storage::Value::Bool(e.boolVal);
+        return true;
+      case LK::DATE:
+        *out = storage::Value::Varchar(e.text);
+        return true;
+      default:
+        return false;
+      }
+    }
+
+    // 代价的展示格式（固定 1 位小数，便于 golden 与人工阅读稳定）
+    std::string FormatCost(double c)
+    {
+      char buf[32];
+      std::snprintf(buf, sizeof(buf), "%.1f", c);
+      return std::string(buf);
+    }
+
   } // namespace
 
   // 语句是否在任何位置引用了 rowid（投影 / 条件 / 分组 / 排序 / SET 表达式）
@@ -463,9 +531,129 @@ namespace cella::db
       }
     }
 
+    // ── P1.4：主键自动索引 ──────────────────────────────────────
+    // 主键列天然需要「唯一 + 高频等值查找」，是最值得建索引的列。建表时自动
+    // 建一棵唯一 B+ 树，名字固定为 <table>_pk（写入 cella_index 系统表），
+    // 因此元数据随目录一起持久化，重启后 Attach 到同一棵树上即可继续用。
+    {
+      const DbStatus ps = CreatePrimaryIndex(*registered);
+      if (!ps.ok())
+      {
+        // 主键索引失败 → 回滚整张表的建立，避免留下「有表无主键索引」的半成品
+        StorageGuard guard(storage_mutex_);
+        (void)catalog_->DeleteIndexesOfTable(entry.name);
+        (void)catalog_->RemoveTable(entry.name);
+        (void)catalog_->DeleteTableRow(entry.name);
+        (void)storage_->drop_table(entry.name);
+        return ps;
+      }
+    }
+
     out->tag = "CREATE TABLE " + entry.name;
     DbLogInfo(logcat::kCatalog, out->tag + "（" + std::to_string(entry.columns.size()) + " 列）");
     return DbStatus::Ok();
+  }
+
+  // ── P1.4：为表的主键列建立唯一索引 ──────────────────────────
+  // 表没有主键列时是空操作。索引名 = <table>_pk，业务语义上属于系统生成，
+  // 但为了不改变 cella_index 的行格式（保持既有 5 列布局与 golden 输出），
+  // 它作为一条**普通索引元数据**登记 —— 由此也自动获得：
+  //   * 重启后随 LoadIndexesFromStorage 恢复
+  //   * DROP TABLE 时被 DeleteIndexesOfTable 级联清理
+  //   * DML 时被 ExecInsert/ExecUpdate/ExecDelete 的索引维护统一覆盖
+  DbStatus Executor::CreatePrimaryIndex(const CatalogTable &table)
+  {
+    const int pk_idx = table.PrimaryKeyColumnIndex();
+    if (pk_idx < 0)
+    {
+      return DbStatus::Ok(); // 无主键 → 不建
+    }
+    if (storage_ == nullptr || catalog_ == nullptr)
+    {
+      return DbStatus::Error(DbCode::kInternal, "执行器未绑定存储/目录，无法建主键索引");
+    }
+    const CatalogColumn &col = table.columns[static_cast<size_t>(pk_idx)];
+
+    // 幂等：同一张表重复调用（重放/迁移）不应建出第二棵
+    const std::string index_name = PrimaryIndexName(table.name);
+    if (catalog_->FindIndex(index_name) != nullptr)
+    {
+      return DbStatus::Ok();
+    }
+
+    StorageGuard guard(storage_mutex_);
+    storage::BufferPoolManager *bpm = storage_->buffer_pool();
+    if (bpm == nullptr)
+    {
+      return DbStatus::Error(DbCode::kInternal, "存储引擎未暴露缓冲池，无法建主键索引");
+    }
+
+    storage::BPlusTree::KeySpec spec;
+    spec.type = ToStorageType(col.type);
+    spec.max_len = static_cast<uint16_t>(col.len);
+
+    storage::BPlusTree tree(bpm, spec);
+    storage::page_id_t root = storage::kInvalidPageId;
+    const storage::Status cs = tree.Create(&root);
+    if (!cs.ok())
+    {
+      return FromStorage(cs, "建主键索引 " + index_name);
+    }
+
+    // 建表时表是空的，无需回填；但为了对「已存在的表补建索引」也安全，
+    // 这里仍走一遍全表回填（空表时循环体不执行）。
+    std::shared_ptr<storage::TableHeap> heap;
+    const storage::Status os = storage_->open_table(table.name, &heap);
+    if (!os.ok())
+    {
+      return FromStorage(os, "回填主键索引时打开表 " + table.name);
+    }
+    size_t backfilled = 0;
+    for (auto it = heap->begin(); it != heap->end(); ++it)
+    {
+      const storage::Record &rec = *it;
+      if (static_cast<size_t>(pk_idx) >= rec.value_count())
+      {
+        continue;
+      }
+      const std::string leaf = storage::EncodeLeafKey(rec.value(static_cast<size_t>(pk_idx)),
+                                                      it.rid().page_id,
+                                                      static_cast<uint8_t>(it.rid().slot_id));
+      bool dup = false;
+      const storage::Status is = tree.Insert(leaf, &dup);
+      if (!is.ok())
+      {
+        return FromStorage(is, "回填主键索引 " + index_name);
+      }
+      ++backfilled;
+    }
+
+    CatalogIndex entry;
+    entry.name = index_name;
+    entry.table = table.name;
+    entry.column = col.name;
+    entry.unique = true; // 主键语义就是唯一
+    entry.root_page_id = root;
+    entry.created_at = static_cast<int64_t>(std::time(nullptr));
+    const DbStatus ws = catalog_->WriteIndexRow(entry);
+    if (!ws.ok())
+    {
+      return ws;
+    }
+    DbLogInfo(logcat::kCatalog, "已为主键列 " + table.name + "." + col.name + " 自动建索引 " +
+                                   index_name + "（回填 " + std::to_string(backfilled) + " 行）");
+    return DbStatus::Ok();
+  }
+
+  std::string Executor::PrimaryIndexName(const std::string &table)
+  {
+    return table + "_pk";
+  }
+
+  // 表的主键索引是否已存在（诊断/测试用）
+  bool Executor::HasPrimaryIndex(const std::string &table) const
+  {
+    return catalog_ != nullptr && catalog_->FindIndex(PrimaryIndexName(table)) != nullptr;
   }
 
   // ── DROP TABLE ──────────────────────────────────────────────
@@ -744,6 +932,16 @@ namespace cella::db
     const size_t ncol = meta->columns.size();
     size_t inserted = 0;
 
+    // ── P1.5：索引句柄一次性打开，循环内复用（每行都重建树句柄会重复 Attach）──
+    std::vector<IndexHandle> indexes;
+    {
+      const DbStatus os = OpenTableIndexes(*meta, &indexes);
+      if (!os.ok())
+      {
+        return os;
+      }
+    }
+
     // ── 主键唯一性：先一次性收集已有行的键，插入过程中累积比对 ──
     // 语句内累积（而不是逐行重扫）避免批量插入退化为 O(N²)；冲突即返回，
     // 语句级回滚会撤销本语句已插入的行。
@@ -829,6 +1027,10 @@ namespace cella::db
       {
         return FromStorage(s, "插入 " + name);
       }
+      // ── P1.5：索引与表数据保持一致 ──
+      // 顺序讲究：先登记 undo、再做索引维护。索引维护可能因为唯一冲突失败，
+      // 那时表行已经写进去了，只有 undo 里有记录，回滚路径才能把它撤掉 —— 否则
+      // 会留下「表里有行、索引里没有」的脏数据（正是修复前观察到的现象）。
       if (ctx.recording())
       {
         UndoRecord u;
@@ -836,6 +1038,13 @@ namespace cella::db
         u.table = name;
         u.rid = rid;
         ctx.txn->AddUndo(std::move(u));
+      }
+      {
+        const DbStatus is = IndexRowInsert(&indexes, *meta, rec.values(), rid);
+        if (!is.ok())
+        {
+          return is;
+        }
       }
       ++inserted;
     }
@@ -939,6 +1148,1183 @@ namespace cella::db
     return ScanMatching(table, pred, with_rowid, out);
   }
 
+  // ═════════════════════════════════════════════════════════════
+  // 索引维护（P1.5）
+  // ═════════════════════════════════════════════════════════════
+  //
+  // 设计要点：
+  //   * 索引是**派生数据**：表行是权威，索引只是加速结构。因此维护顺序固定为
+  //     「先改表、后改索引」——插入时若索引失败，表行已落盘，由语句级回滚撤销；
+  //     删除时先打墓碑再删索引项，避免「索引里有、表里没有」的悬空项。
+  //   * 唯一性检查必须在**插入索引项之前**做，否则重复值已经进树，再去查重会
+  //     把自己也算作冲突。
+  //   * 同一列值 → 同一条叶子键？不是：叶子键 = 列值编码 + 5B 行定位。因此
+  //     「列值相同、行不同」在树里是**两条键**，唯一索引查重必须按列值前缀比，
+  //     这正是 IndexValueFree 用 ScanRange 圈出等值区间再逐键解码的原因。
+  //   * UPDATE 的存储实现是「删旧 + 插新」：若被索引列的值变了，索引项必须
+  //     先删旧键、再插新键（DELETE_INSERT）；值没变则只换行定位，做原地替换。
+
+  DbStatus Executor::OpenTableIndexes(const CatalogTable &table, std::vector<IndexHandle> *out)
+  {
+    out->clear();
+    if (storage_ == nullptr || catalog_ == nullptr)
+    {
+      return DbStatus::Error(DbCode::kInternal, "执行器未绑定存储/目录，无法维护索引");
+    }
+    const std::vector<const CatalogIndex *> metas = catalog_->IndexesOfTable(table.name);
+    if (metas.empty())
+    {
+      return DbStatus::Ok();
+    }
+    storage::BufferPoolManager *bpm = storage_->buffer_pool();
+    if (bpm == nullptr)
+    {
+      return DbStatus::Error(DbCode::kInternal, "存储引擎未暴露缓冲池，无法维护索引");
+    }
+    out->reserve(metas.size());
+    for (const CatalogIndex *m : metas)
+    {
+      if (m == nullptr || !m->valid())
+      {
+        continue;
+      }
+      const int col = table.ColumnIndex(m->column);
+      if (col < 0)
+      {
+        // 索引列已不在表里（陈旧元数据）→ 跳过维护，而不是报错：
+        // 报错会让整张表彻底无法写，代价远大于一条陈旧索引。
+        DbLogWarn(logcat::kExec, "索引 " + m->name + " 的列 " + m->column +
+                                     " 不在表 " + table.name + " 上，已跳过维护");
+        continue;
+      }
+      const CatalogColumn &cc = table.columns[static_cast<size_t>(col)];
+      storage::BPlusTree::KeySpec spec;
+      spec.type = ToStorageType(cc.type);
+      spec.max_len = static_cast<uint16_t>(cc.len);
+
+      IndexHandle h;
+      h.meta = m;
+      h.column = col;
+      h.tree = std::make_unique<storage::BPlusTree>(bpm, spec);
+      h.tree->Attach(static_cast<storage::page_id_t>(m->root_page_id));
+      out->push_back(std::move(h));
+    }
+    // 保持稳定顺序，让多索引维护与诊断输出可复现
+    std::sort(out->begin(), out->end(),
+              [](const IndexHandle &a, const IndexHandle &b)
+              {
+                if (a.column != b.column)
+                {
+                  return a.column < b.column;
+                }
+                return a.meta->name < b.meta->name;
+              });
+    return DbStatus::Ok();
+  }
+
+  bool Executor::IndexKeyOf(const IndexHandle &ix, const std::vector<storage::Value> &row_values,
+                            const storage::Rid &rid, std::string *leaf_key)
+  {
+    if (ix.column < 0 || static_cast<size_t>(ix.column) >= row_values.size())
+    {
+      return false;
+    }
+    // NULL 也进索引（与编码约定一致：NULL 排在最前）。
+    // 唯一性由 IndexValueFree 单独判定（多个 NULL 允许共存）。
+    *leaf_key = storage::EncodeLeafKey(row_values[static_cast<size_t>(ix.column)], rid.page_id,
+                                       static_cast<uint8_t>(rid.slot_id));
+    return true;
+  }
+
+  DbStatus Executor::IndexValueFree(const IndexHandle &ix, const storage::Value &v,
+                                    const storage::Rid &rid, bool *busy)
+  {
+    *busy = false;
+    if (!ix.meta->unique || v.IsNull())
+    {
+      return DbStatus::Ok();  // 非唯一索引 / NULL 一律放行
+    }
+    // 圈出「列值 == v」的等值区间：叶子键按列值编码排序，同一列值的所有行
+    // 在树上连续。边界用只含列值部分的键（hi 不包含 → include_hi=false 会同时
+    // 排除 hi，所以 hi 用 v 本身、include_hi=true 才是「含 v 的全部行」）。
+    const std::string probe = storage::EncodeLeafKey(v, 0, 0);
+    const std::string col_key = storage::StripLeafRowId(probe);
+    std::vector<std::string> hits;
+    const storage::Status ss = ix.tree->ScanRange(
+        &col_key, &col_key, /*include_hi=*/true,
+        [&](const std::string &leaf) -> bool
+        {
+          hits.push_back(leaf);
+          return true;
+        });
+    if (!ss.ok())
+    {
+      return FromStorage(ss, "唯一索引查重 " + ix.meta->name);
+    }
+    for (const std::string &leaf : hits)
+    {
+      // 同一个 Rid 是自己 → 不算冲突（UPDATE 原地不动时应允许）
+      storage::page_id_t p = 0;
+      uint8_t s = 0;
+      if (storage::DecodeLeafKeyRid(leaf, &p, &s) && p == rid.page_id && s == rid.slot_id)
+      {
+        continue;
+      }
+      storage::Value got;
+      if (!storage::DecodeLeafKeyColumn(leaf, ix.tree->key_spec().type, &got))
+      {
+        return DbStatus::Error(DbCode::kInternal,
+                               "唯一索引 " + ix.meta->name + " 中存在无法解码的键");
+      }
+      if (IndexValuesEqual(got, v))
+      {
+        *busy = true;
+        return DbStatus::Ok();
+      }
+    }
+    return DbStatus::Ok();
+  }
+
+  DbStatus Executor::IndexRowInsert(std::vector<IndexHandle> *indexes, const CatalogTable &table,
+                                    const std::vector<storage::Value> &row_values,
+                                    const storage::Rid &rid)
+  {
+    for (IndexHandle &ix : *indexes)
+    {
+      std::string leaf;
+      if (!IndexKeyOf(ix, row_values, rid, &leaf))
+      {
+        continue;
+      }
+      const storage::Value &v = row_values[static_cast<size_t>(ix.column)];
+      bool busy = false;
+      const DbStatus vs = IndexValueFree(ix, v, rid, &busy);
+      if (!vs.ok())
+      {
+        return vs;
+      }
+      if (busy)
+      {
+        ++index_stats_.violations;
+        const bool is_pk = (table.PrimaryKeyColumnIndex() == ix.column);
+        return DbStatus::Error(
+            is_pk ? DbCode::kPrimaryKeyViolation : DbCode::kUniqueViolation,
+            std::string(is_pk ? "主键冲突: 列 " : "唯一索引冲突: 列 ") + table.columns[
+                static_cast<size_t>(ix.column)].name + " 的值已存在（表 " + table.name +
+                (is_pk ? "）" : "，索引 " + ix.meta->name + "）"));
+      }
+      bool dup = false;
+      const storage::Status is = ix.tree->Insert(leaf, &dup);
+      if (!is.ok())
+      {
+        return FromStorage(is, "插入索引项 " + ix.meta->name);
+      }
+      ++index_stats_.inserts;
+    }
+    return DbStatus::Ok();
+  }
+
+  DbStatus Executor::IndexRowDelete(std::vector<IndexHandle> *indexes, const CatalogTable &table,
+                                    const std::vector<storage::Value> &row_values,
+                                    const storage::Rid &rid)
+  {
+    (void)table;
+    for (IndexHandle &ix : *indexes)
+    {
+      std::string leaf;
+      if (!IndexKeyOf(ix, row_values, rid, &leaf))
+      {
+        continue;
+      }
+      bool removed = false;
+      const storage::Status s = ix.tree->Remove(leaf, &removed);
+      if (!s.ok())
+      {
+        return FromStorage(s, "删除索引项 " + ix.meta->name);
+      }
+      if (removed)
+      {
+        ++index_stats_.deletes;
+      }
+    }
+    return DbStatus::Ok();
+  }
+
+  DbStatus Executor::IndexRowUpdate(std::vector<IndexHandle> *indexes, const CatalogTable &table,
+                                    const std::vector<storage::Value> &before,
+                                    const std::vector<storage::Value> &after,
+                                    const storage::Rid &old_rid, const storage::Rid &new_rid)
+  {
+    (void)table; // 表信息仅在预检阶段（IndexRowCheckUpdate）用于生成诊断文本
+    // 唯一性预检已在 IndexRowCheckUpdate 中完成；这里只做树上的实际操作。
+    for (IndexHandle &ix : *indexes)
+    {
+      std::string old_leaf;
+      std::string new_leaf;
+      if (!IndexKeyOf(ix, before, old_rid, &old_leaf) ||
+          !IndexKeyOf(ix, after, new_rid, &new_leaf))
+      {
+        continue;
+      }
+      const size_t ci = static_cast<size_t>(ix.column);
+      const bool value_changed =
+          ci < before.size() && ci < after.size() && !IndexValuesEqual(before[ci], after[ci]);
+      const bool rid_changed =
+          old_rid.page_id != new_rid.page_id || old_rid.slot_id != new_rid.slot_id;
+      if (!value_changed && !rid_changed)
+      {
+        continue; // 键完全没变 → 无需触碰索引
+      }
+      bool removed = false;
+      const storage::Status ds = ix.tree->Remove(old_leaf, &removed);
+      if (!ds.ok())
+      {
+        return FromStorage(ds, "更新索引(删旧) " + ix.meta->name);
+      }
+      if (removed)
+      {
+        ++index_stats_.deletes;
+      }
+      bool dup = false;
+      const storage::Status is = ix.tree->Insert(new_leaf, &dup);
+      if (!is.ok())
+      {
+        return FromStorage(is, "更新索引(插新) " + ix.meta->name);
+      }
+      ++index_stats_.inserts;
+      ++index_stats_.updates;
+    }
+    return DbStatus::Ok();
+  }
+
+  DbStatus Executor::IndexRowCheckUpdate(const std::vector<IndexHandle> &indexes,
+                                         const CatalogTable &table,
+                                         const std::vector<storage::Value> &before,
+                                         const std::vector<storage::Value> &after,
+                                         const storage::Rid &old_rid)
+  {
+    for (const IndexHandle &ix : indexes)
+    {
+      const size_t ci = static_cast<size_t>(ix.column);
+      if (ci >= before.size() || ci >= after.size())
+      {
+        continue;
+      }
+      if (IndexValuesEqual(before[ci], after[ci]))
+      {
+        continue; // 该列值没变 → 不可能产生新冲突
+      }
+      bool busy = false;
+      const DbStatus vs = IndexValueFree(ix, after[ci], old_rid, &busy);
+      if (!vs.ok())
+      {
+        return vs;
+      }
+      if (busy)
+      {
+        ++index_stats_.violations;
+        const bool is_pk = (table.PrimaryKeyColumnIndex() == ix.column);
+        return DbStatus::Error(
+            is_pk ? DbCode::kPrimaryKeyViolation : DbCode::kUniqueViolation,
+            std::string(is_pk ? "主键冲突: 更新后的 " : "唯一索引冲突: 更新后的 ") +
+                table.columns[ci].name + " 值与其它行重复（表 " + table.name +
+                (is_pk ? "）" : "，索引 " + ix.meta->name + "）"));
+      }
+    }
+    return DbStatus::Ok();
+  }
+
+  DbStatus Executor::IndexVerifyRow(const std::vector<IndexHandle> &indexes, const CatalogTable &table,
+                                    const std::vector<storage::Value> &row_values,
+                                    const storage::Rid &rid, bool *present)
+  {
+    (void)table;  // 索引句柄已自带列定义，表仅用于调用方可读性
+    *present = true;
+    for (const IndexHandle &ix : indexes)
+    {
+      std::string leaf;
+      if (!IndexKeyOf(ix, row_values, rid, &leaf))
+      {
+        continue;
+      }
+      bool found = false;
+      const storage::Status s = ix.tree->Contains(leaf, &found);
+      if (!s.ok())
+      {
+        return FromStorage(s, "校验索引项 " + ix.meta->name);
+      }
+      if (!found)
+      {
+        *present = false;
+        return DbStatus::Ok();
+      }
+    }
+    return DbStatus::Ok();
+  }
+
+  // ── undo 补偿期间的索引维护（P1.5）──────────────────────────
+  //
+  // 回滚路径与执行路径的关键差异：回滚时**没有**调用方持有的 IndexHandle 列表，
+  // 而且 undo 日志里只有表名。因此这里每次按表名重新打开索引句柄 —— 代价是
+  // 回滚比正常执行慢（每步一次目录查找 + N 个 B+ 树 Attach），但回滚本身是
+  // 异常路径，正确性优先。钩子失败只记警告，不改变回滚的成败判定：
+  // 回滚失败会让事务进入 kRollbackFailed，比「索引暂时不一致」严重得多。
+
+  void Executor::UndoIndexDropRow(const std::string &table_name, const storage::Rid &rid)
+  {
+    const CatalogTable *meta = catalog_ == nullptr ? nullptr : catalog_->FindTable(table_name);
+    if (meta == nullptr)
+    {
+      return; // 表都没了（DROP TABLE 后回滚）→ 索引元数据也已级联清理
+    }
+    std::vector<IndexHandle> indexes;
+    if (!OpenTableIndexes(*meta, &indexes).ok() || indexes.empty())
+    {
+      return;
+    }
+    // 行已从表里删掉，但索引键需要行值才能重建 → 用「按列值前缀 + Rid 尾」的做法
+    // 无法还原（列值未知）。改为：把该行在每个索引里的**旧键**按 Rid 定位删除。
+    // 由于叶子键 = 列值编码 + Rid，仅凭 Rid 无法直接定位；但被撤销的插入在
+    // 索引里恰好有一条以该 Rid 结尾的键。遍历一次等值区间代价高，这里改用
+    // 全树扫描匹配 Rid 尾部 —— 只在回滚路径发生，可接受。
+    for (IndexHandle &ix : indexes)
+    {
+      std::vector<std::string> victims;
+      const storage::Status ss = ix.tree->ScanAll(&victims);
+      if (!ss.ok())
+      {
+        DbLogWarn(logcat::kExec, "回滚清理索引 " + ix.meta->name + " 扫描失败: " + ss.ToString());
+        continue;
+      }
+      for (const std::string &leaf : victims)
+      {
+        storage::page_id_t p = 0;
+        uint8_t s = 0;
+        if (!storage::DecodeLeafKeyRid(leaf, &p, &s))
+        {
+          continue;
+        }
+        if (p != rid.page_id || s != rid.slot_id)
+        {
+          continue;
+        }
+        bool removed = false;
+        const storage::Status ds = ix.tree->Remove(leaf, &removed);
+        if (!ds.ok())
+        {
+          DbLogWarn(logcat::kExec, "回滚清理索引 " + ix.meta->name + " 失败: " + ds.ToString());
+          continue;
+        }
+        if (removed)
+        {
+          ++index_stats_.deletes;
+        }
+      }
+    }
+  }
+
+  void Executor::UndoIndexRebuildRow(const std::string &table_name, const storage::Rid &rid,
+                                     const storage::Record &record)
+  {
+    const CatalogTable *meta = catalog_ == nullptr ? nullptr : catalog_->FindTable(table_name);
+    if (meta == nullptr)
+    {
+      return;
+    }
+    std::vector<IndexHandle> indexes;
+    if (!OpenTableIndexes(*meta, &indexes).ok() || indexes.empty())
+    {
+      return;
+    }
+    // 先清掉可能残留的同 Rid 旧键（UPDATE 的旧版本键用的是旧 Rid，通常不冲突；
+    // 但 DELETE 回滚时槽位可能被复用），再按恢复的内容重插。
+    for (IndexHandle &ix : indexes)
+    {
+      std::string leaf;
+      if (!IndexKeyOf(ix, record.values(), rid, &leaf))
+      {
+        continue;
+      }
+      bool found = false;
+      if (ix.tree->Contains(leaf, &found).ok() && !found)
+      {
+        bool dup = false;
+        const storage::Status is = ix.tree->Insert(leaf, &dup);
+        if (!is.ok())
+        {
+          DbLogWarn(logcat::kExec, "回滚重建索引 " + ix.meta->name + " 失败: " + is.ToString());
+          continue;
+        }
+        ++index_stats_.inserts;
+      }
+    }
+  }
+
+  void Executor::IndexUndoAdapter::OnUndoInsertDeleted(const std::string &table,
+                                                       const storage::Rid &rid)
+  {
+    owner_->UndoIndexDropRow(table, rid);
+  }
+
+  void Executor::IndexUndoAdapter::OnUndoRowRestored(const std::string &table,
+                                                     const storage::Rid &rid,
+                                                     const storage::Record &record)
+  {
+    owner_->UndoIndexRebuildRow(table, rid, record);
+  }
+
+  // ═════════════════════════════════════════════════════════════
+  // 访问路径选择（P1.3）
+  //
+  // 设计要点：
+  //   * 计划树里表访问节点**始终**是 SeqScan —— 这是编译器的 golden 契约。
+  //     索引下推是执行器的**运行时决策**：只有执行层拿得到索引元数据（cella_index）、
+  //     表的列类型与真实行数，编译器看不到这些。
+  //   * 下推谓词的来源：Filter 节点正下方的表访问节点。`Filter(pred) -> Scan` 是编译器
+  //     固定的形状，因此「把谓词交给下方扫描」不会漏掉过滤条件 —— Filter 仍然照常执行，
+  //     索引只负责把候选集缩小。**正确性由 Filter 兜底**（这也是 C3 的语义保证），
+  //     所以我们只需保证索引区间「不漏行」。
+  //   * 只识别能安全下推的形状（`列 op 常量`、`常量 op 列`、及其 AND 组合）。
+  //     OR / 函数 / 列与列比较一律不下推 → 全表扫描，绝不冒漏行的风险。
+  // ═════════════════════════════════════════════════════════════
+
+  std::string AccessPathChoice::Describe() const
+  {
+    switch (path)
+    {
+    case AccessPath::kRowidLookup:
+      return "RowidLookup (rowid = " + reason + ")";
+    case AccessPath::kIndexOnlyScan:
+    case AccessPath::kIndexScan:
+    {
+      std::string how;
+      if (equality)
+      {
+        how = "= " + RenderValue(lower);
+      }
+      else if (has_lower || has_upper)
+      {
+        how = (has_lower ? (lower_inclusive ? ">= " : "> ") + RenderValue(lower) : std::string()) +
+              (has_lower && has_upper ? " AND " : "") +
+              (has_upper ? (upper_inclusive ? "<= " : "< ") + RenderValue(upper) : std::string());
+      }
+      else
+      {
+        how = "全区间";
+      }
+      const std::string kind =
+          (path == AccessPath::kIndexOnlyScan) ? "IndexOnlyScan" : "IndexScan";
+      return kind + " using " + index_name + " (" + index_column + " " + how + ")";
+    }
+    case AccessPath::kSeqScan:
+    default:
+      return "SeqScan";
+    }
+  }
+
+  void Executor::CollectScanPredicates(const cella::CELLA_PlanNode &node,
+                                       const cella::CELLA_Expr *pred, bool with_rowid,
+                                       std::vector<ScanPredicate> *out)
+  {
+    // Filter 是唯一携带谓词的节点；一路往下继承，直到遇到真正的表访问节点。
+    const cella::CELLA_Expr *carried = pred;
+    if (node.op == "Filter" && node.pred != nullptr)
+    {
+      carried = node.pred.get();
+    }
+    if (node.op == "SeqScan" || node.op == "IndexScan")
+    {
+      ScanPredicate sp;
+      sp.scan = &node;
+      sp.pred = carried;
+      sp.need_rowid = with_rowid;
+      out->push_back(sp);
+      return;  // 表访问节点没有子节点
+    }
+    // Join 之下不再继承外层谓词：Join 的 ON 条件属于 Join 自己，把外层条件
+    // 错算到某一张表上会导致区间失真；靠子树的 Filter 各自下推即可。
+    const cella::CELLA_Expr *child_pred = (node.op == "Join") ? nullptr : carried;
+    for (const auto &c : node.children)
+    {
+      CollectScanPredicates(*c, child_pred, with_rowid, out);
+    }
+  }
+
+  bool Executor::PredRefsColumn(const cella::CELLA_Expr *e, const std::string &column)
+  {
+    if (e == nullptr)
+    {
+      return false;
+    }
+    if (e->kind == cella::CELLA_Expr::Kind::COLUMN_REF)
+    {
+      return SameIdent(e->column, column);
+    }
+    return PredRefsColumn(e->left.get(), column) || PredRefsColumn(e->right.get(), column) ||
+           PredRefsColumn(e->child.get(), column);
+  }
+
+  // 把一个「比较条件」尝试折算成索引区间的一侧。
+  // 返回 true 表示识别成功且已更新 choice 的某一侧边界。
+  namespace
+  {
+    // 比较运算符取反（`5 < x` 等价于 `x > 5`）：把「常量在左」翻成「列在左」
+    cella::CELLA_Expr::BinOp FlipCompare(cella::CELLA_Expr::BinOp op)
+    {
+      using B = cella::CELLA_Expr::BinOp;
+      switch (op)
+      {
+      case B::LT: return B::GT;
+      case B::LE: return B::GE;
+      case B::GT: return B::LT;
+      case B::GE: return B::LE;
+      default: return op;  // EQ / NE 对称
+      }
+    }
+  }  // namespace
+
+  bool Executor::TryIndexRange(const CatalogTable &table, const CatalogIndex &index, int column,
+                               const cella::CELLA_Expr *pred, AccessPathChoice *choice) const
+  {
+    if (pred == nullptr || column < 0)
+    {
+      return false;
+    }
+    using Kind = cella::CELLA_Expr::Kind;
+    using B = cella::CELLA_Expr::BinOp;
+
+    // AND：两侧分别尝试，区间自然取交集（因为是就地收紧边界）
+    if (pred->kind == Kind::BINARY && pred->bop == B::AND)
+    {
+      const bool l = TryIndexRange(table, index, column, pred->left.get(), choice);
+      const bool r = TryIndexRange(table, index, column, pred->right.get(), choice);
+      return l || r;
+    }
+    // OR / 其它逻辑一律不下推
+    if (pred->kind != Kind::BINARY || pred->bop == B::OR)
+    {
+      return false;
+    }
+
+    const std::string target = table.columns[static_cast<size_t>(column)].name;
+    const B op = pred->bop;
+    if (op != B::EQ && op != B::LT && op != B::LE && op != B::GT && op != B::GE)
+    {
+      return false;  // 算术运算不是过滤条件
+    }
+
+    // 识别 `列 op 常量` 与 `常量 op 列`
+    const cella::CELLA_Expr *col_side = nullptr;
+    const cella::CELLA_Expr *lit_side = nullptr;
+    B eff = op;
+    if (pred->left && pred->left->kind == Kind::COLUMN_REF)
+    {
+      col_side = pred->left.get();
+      lit_side = pred->right.get();
+    }
+    else if (pred->right && pred->right->kind == Kind::COLUMN_REF)
+    {
+      col_side = pred->right.get();
+      lit_side = pred->left.get();
+      eff = FlipCompare(op);
+    }
+    if (col_side == nullptr || lit_side == nullptr)
+    {
+      return false;
+    }
+    // 索引列必须正是被比较的那一列（可带表限定符）
+    if (!SameIdent(col_side->column, target))
+    {
+      return false;
+    }
+    // 右侧必须是字面量（常量折叠后计划里就是字面量）；NULL 不可下推
+    if (lit_side->kind != Kind::LITERAL || lit_side->lit == cella::CELLA_LiteralKind::NULL_LIT)
+    {
+      return false;
+    }
+    storage::Value lit;
+    if (!LiteralToValue(*lit_side, &lit))
+    {
+      return false;
+    }
+    // 关键：区间边界必须换算成**索引列的声明类型**再编码。
+    // 叶子键里的列值是按列类型编码的（INT 列 → kInt32），而字面量 20 在
+    // LiteralToValue 里会变成 kInt64。两者编码出的字节不同，区间就会落空
+    // （表现为「索引扫描一行都扫不到」）。用 CoerceValue 归一到列类型。
+    {
+      const CatalogColumn &cc = table.columns[static_cast<size_t>(column)];
+      storage::Value coerced;
+      const DbStatus cs2 = CoerceValue(lit, cc.type, static_cast<uint16_t>(cc.len),
+                                      /*not_null=*/false, &coerced);
+      if (cs2.ok())
+      {
+        lit = coerced;
+      }
+      // 归一失败（类型确实不兼容，如字符串与数值比较）→ 不下推，交给 Filter
+      else
+      {
+        return false;
+      }
+    }
+
+    // 收紧边界。等值同时压两侧，并把 equality 标上（描述与代价都用得到）。
+    if (eff == B::EQ)
+    {
+      choice->equality = true;
+      choice->has_lower = true;
+      choice->lower = lit;
+      choice->lower_inclusive = true;
+      choice->has_upper = true;
+      choice->upper = lit;
+      choice->upper_inclusive = true;
+      return true;
+    }
+    if (eff == B::GT || eff == B::GE)
+    {
+      // 已有更紧的下界就不替换（区间取交集）
+      bool known = false;
+      const int cmp = CompareValues(lit, choice->lower, &known);
+      if (!choice->has_lower || !known || cmp > 0 || (cmp == 0 && eff == B::GT))
+      {
+        choice->has_lower = true;
+        choice->lower = lit;
+        choice->lower_inclusive = (eff == B::GE);
+      }
+      return true;
+    }
+    if (eff == B::LT || eff == B::LE)
+    {
+      bool known2 = false;
+      const int cmp2 = CompareValues(lit, choice->upper, &known2);
+      if (!choice->has_upper || !known2 || cmp2 < 0 || (cmp2 == 0 && eff == B::LT))
+      {
+        choice->has_upper = true;
+        choice->upper = lit;
+        choice->upper_inclusive = (eff == B::LE);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  // 用索引的 min/max 估算范围选择率 = 区间宽度 / 值域宽度。
+  //
+  // 为什么可以这么做：B+ 树的叶子按列值编码有序，因此**第一个叶子键**就是
+  // 该列最小值、**最后一个叶子键**就是最大值 —— 一份几乎免费的一维统计，
+  // 不需要额外的统计表（P1.6 的统计信息就建立在这个观察上）。
+  //
+  // 只在数值列上做（字符串/日期的「宽度」没有直观含义，直接返回 0 走经验值）。
+  double Executor::ComputeRangeSpan(storage::BPlusTree *tree,
+                                    const AccessPathChoice &choice) const
+  {
+    if (tree == nullptr)
+    {
+      return 0.0;
+    }
+    const storage::ValueType vt = tree->key_spec().type;
+    const bool numeric = (vt == storage::ValueType::kInt32 || vt == storage::ValueType::kInt64 ||
+                          vt == storage::ValueType::kFloat || vt == storage::ValueType::kDouble);
+    if (!numeric)
+    {
+      return 0.0;
+    }
+    // 取首末键：ScanRange(nullptr, nullptr, true, cb) 顺序遍历，只留第一个；
+    // 末位用一个「到最大」的扫描，只留最后一个。
+    storage::Value lo_v;
+    storage::Value hi_v;
+    bool have_lo = false;
+    bool have_hi = false;
+    {
+      const storage::Status ss =
+          tree->ScanRange(nullptr, nullptr, true,
+                         [&](const std::string &leaf) -> bool
+                         {
+                           if (!have_lo)
+                           {
+                             have_lo = storage::DecodeLeafKeyColumn(leaf, vt, &lo_v);
+                           }
+                           have_hi = storage::DecodeLeafKeyColumn(leaf, vt, &hi_v);
+                           return true;  // 需要拿到最后一个，故不能提前终止
+                         });
+      if (!ss.ok() || !have_lo || !have_hi)
+      {
+        return 0.0;
+      }
+      if (lo_v.IsNull() || hi_v.IsNull())
+      {
+        return 0.0;  // NULL 参与值域会让占比失真 → 退回经验值
+      }
+    }
+    auto as_double = [](const storage::Value &v, double *out) -> bool
+    {
+      switch (v.type)
+      {
+      case storage::ValueType::kInt32:
+        *out = static_cast<double>(v.int32_val);
+        return true;
+      case storage::ValueType::kInt64:
+        *out = static_cast<double>(v.int64_val);
+        return true;
+      case storage::ValueType::kFloat:
+        *out = static_cast<double>(v.float_val);
+        return true;
+      case storage::ValueType::kDouble:
+        *out = v.double_val;
+        return true;
+      default:
+        return false;
+      }
+    };
+    double lo = 0.0;
+    double hi = 0.0;
+    if (!as_double(lo_v, &lo) || !as_double(hi_v, &hi))
+    {
+      return 0.0;
+    }
+    if (hi <= lo)
+    {
+      return 0.0;  // 值域退化（全表同值）→ 经验值
+    }
+    // 谓词区间的两端：缺省时用值域端点补全
+    double plo = lo;
+    double phi = hi;
+    if (choice.has_lower && !as_double(choice.lower, &plo))
+    {
+      return 0.0;
+    }
+    if (choice.has_upper && !as_double(choice.upper, &phi))
+    {
+      return 0.0;
+    }
+    if (phi < plo)
+    {
+      return 0.0;
+    }
+    const double span = (phi - plo) / (hi - lo);
+    return span;
+  }
+
+  DbStatus Executor::UsableIndexes(const CatalogTable &table, std::vector<IndexHandle> *out)
+  {
+    // 与 OpenTableIndexes 同源，但语义更严：这里只挑「列下标有效」的索引，
+    // 因为访问路径选择必须精确知道索引建在哪一列上。
+    return OpenTableIndexes(table, out);
+  }
+
+  DbStatus Executor::ChooseAccessPath(const CatalogTable &table, const cella::CELLA_Expr *pred,
+                                      bool with_rowid, AccessPathChoice *out)
+  {
+    *out = AccessPathChoice{};
+
+    // ① rowid 等值 → 直接物理定位，永远最省
+    int64_t rowid = 0;
+    if (TryRowidEqLiteral(pred, &rowid))
+    {
+      out->path = AccessPath::kRowidLookup;
+      out->reason = std::to_string(rowid);
+      out->est_rows = 1.0;
+      out->est_cost = 1.0;
+      return DbStatus::Ok();
+    }
+
+    // ② 找出所有可用于下推的索引候选
+    std::vector<IndexHandle> indexes;
+    const DbStatus os = UsableIndexes(table, &indexes);
+    if (!os.ok())
+    {
+      return os;
+    }
+
+    size_t row_count = 0;
+    if (!indexes.empty())
+    {
+      // 行数是代价模型的输入。这里仍要走一遍表（存储层没有行数统计），
+      // 但在「有索引且谓词可下推」的前提下这笔开销是划算的；P1.6 会缓存它。
+      row_count = CountTableRows(table);
+      if (row_count == 0)
+      {
+        indexes.clear();  // 空表：索引也省了，直接全表扫描（反正没有行）
+      }
+    }
+
+    AccessPathChoice best;
+    bool has_best = false;
+    for (const IndexHandle &ix : indexes)
+    {
+      AccessPathChoice cand;
+      cand.index_name = ix.meta->name;
+      cand.index_column = ix.meta->column;
+      if (!TryIndexRange(table, *ix.meta, ix.column, pred, &cand))
+      {
+        continue;  // 该索引下推不了这个谓词
+      }
+      // 覆盖扫描（index-only）：只读索引就能满足查询，不必回表。
+      // 本项目索引键**只存被索引列的值**，所以 index-only 的前提是：
+      //   ① 查询不需要 rowid；
+      //   ② 谓词引用的列只有索引列本身；
+      //   ③ 投影/排序/分组引用的列也只有索引列。
+      // 条件 ③ 无法在表访问节点处可靠判断（上方算子的列需求在这里看不到），
+      // 因此这里**只允许覆盖条件成立时使用 index-only**，其余一律回表 ——
+      // 「多回一次表」只是慢一点，而「漏列」是错的。
+      const bool covering = !with_rowid && !PredRefsColumnOutside(pred, table, ix.column) &&
+                            !StmtNeedsOtherColumn(table.name, ix.column);
+      cand.path = covering ? AccessPath::kIndexOnlyScan : AccessPath::kIndexScan;
+
+      // 范围选择率：拿索引首末叶子键当该列的 min/max（索引有序 → 免费统计）。
+      // 只在「非等值且有至少一侧边界」时才有意义。
+      if (!cand.equality && (cand.has_lower || cand.has_upper))
+      {
+        cand.range_span = ComputeRangeSpan(ix.tree.get(), cand);
+      }
+
+      // 索引的实测几何（高度、叶子页数）—— P1.6 的关键输入。
+      // 早期版本把树高写成常数 2.0，代价是「小表上索引永远输」：
+      // 200 行表一次等值查找估成 (2+1)*2.0 = 6 的 I/O，比 5 页全表还贵。
+      // 取真实树高后，小索引高度 = 1（根即叶子），下降只需 1 页。
+      // BPlusTree::Height/LeafPageCount 都是 O(树高) / O(叶子数) 的轻量遍历。
+      IndexStats st;
+      if (ix.tree != nullptr)
+      {
+        st.height = static_cast<double>(ix.tree->Height());
+        st.leaf_pages = static_cast<double>(ix.tree->LeafPageCount());
+      }
+
+      double er = 0.0;
+      double ec = 0.0;
+      EstimateAccessPath(table, row_count, st, cand, &er, &ec);
+      cand.est_rows = er;
+      cand.est_cost = ec;
+
+      if (!has_best || cand.est_cost < best.est_cost)
+      {
+        best = cand;
+        has_best = true;
+      }
+    }
+
+    // ③ 与全表扫描比代价（走索引几何无关，传默认 Stats 即可）
+    AccessPathChoice seq;
+    seq.path = AccessPath::kSeqScan;
+    double seq_rows = 0.0;
+    EstimateAccessPath(table, row_count, IndexStats{}, seq, &seq_rows, &seq.est_cost);
+    seq.est_rows = seq_rows;
+
+    if (has_best && best.est_cost < seq.est_cost)
+    {
+      best.reason = "索引代价 " + FormatCost(best.est_cost) + " < 全表 " + FormatCost(seq.est_cost);
+      *out = best;
+      return DbStatus::Ok();
+    }
+
+    seq.reason = has_best
+                     ? ("索引代价 " + FormatCost(best.est_cost) + " >= 全表 " + FormatCost(seq.est_cost))
+                     : (indexes.empty() ? "表上无可用索引" : "谓词无法下推到任何索引");
+    *out = seq;
+    return DbStatus::Ok();
+  }
+
+  // 谓词是否引用了「该索引列之外」的列（决定能否 index-only scan）
+  bool Executor::PredRefsColumnOutside(const cella::CELLA_Expr *pred, const CatalogTable &table,
+                                       int index_column)
+  {
+    if (pred == nullptr)
+    {
+      return false;
+    }
+    if (pred->kind == cella::CELLA_Expr::Kind::COLUMN_REF)
+    {
+      const int ci = table.ColumnIndex(pred->column);
+      return ci >= 0 && ci != index_column;  // 引用别的表列 → 必须回表
+    }
+    return PredRefsColumnOutside(pred->left.get(), table, index_column) ||
+           PredRefsColumnOutside(pred->right.get(), table, index_column) ||
+           PredRefsColumnOutside(pred->child.get(), table, index_column);
+  }
+
+  size_t Executor::CountTableRows(const CatalogTable &table)
+  {
+    StorageGuard guard(storage_mutex_);
+    std::shared_ptr<storage::TableHeap> heap;
+    if (!storage_->open_table(table.name, &heap).ok() || heap == nullptr)
+    {
+      return 0;
+    }
+    size_t n = 0;
+    for (auto it = heap->begin(); it != heap->end(); ++it)
+    {
+      ++n;
+    }
+    return n;
+  }
+
+  // ── 代价估算 ────────────────────────────────────────────────
+  //
+  // P1.3 先用一个「能做出正确方向性决策」的简化模型，P1.6 会替换成基于
+  // 表行数 / 索引高度 / 选择率 / I/O-CPU 因子的完整代价模型。这里刻意把
+  // 结构写成「每页 I/O 的成本 + 每行的 CPU 成本」的形状，便于 P1.6 直接
+  // 调参而不改调用点。
+  //
+  //   SeqScan      : cost = ceil(R / rows_per_page) * IO + R * CPU
+  //   IndexScan    : cost = (索引高度 + 命中叶子数) * IO_INDEX
+  //                        + 命中行数 * (CPU + 回表 IO)
+  //   IndexOnlyScan: 与 IndexScan 同，但省掉回表 I/O
+  //
+  // 默认参数（可测、可解释，不追求和真实硬件成比例）：
+  //   kRandomIo    = 2.0   随机页 I/O（索引下降与回表都算随机）
+  //   kSeqIo       = 1.0   顺序页 I/O（全表扫描按顺序，显著更便宜）
+  //   kCpuPerRow   = 0.10  处理一行的 CPU
+  //   kRowsPerPage = 40    一页能放的行数（用于估算 SeqScan/叶子的页数）
+  //   kIndexHeight = 2.0   索引高度（叶子 + 根；P1.6 会从 B+ 树实际高度取）
+  //
+  // 常数取值的依据（P1.3 收尾时按「让模型给出物理上正确的答案」反推）：
+  //
+  //   ① 随机 I/O / 顺序 I/O = 2 : 1。真实磁盘上这个比值通常是 5~50，
+  //      但教学库的表都很小（几十页），比值取太大会让**任何**索引都因
+  //      「一次随机读 = 十次顺序读」而输给全表扫描 —— 这不符合事实：
+  //      小表上主键等值查 1 行，物理上一定比扫全表快。
+  //      2 : 1 保留了「随机比顺序贵」的定性，又不会淹没 CPU 项。
+  //   ② 每行 CPU = 0.10。这一项必须**真实存在**且量级可观：全表扫描的
+  //      代价主体是「逐行解析/过滤」，而非「读页」。200 行 × 0.10 = 20，
+  //      远大于 5 页的顺序 I/O —— 这正是索引能赢的原因。
+  //      反过来，若把它调成 0.05，200 行的 CPU 只有 10，就会被
+  //      「索引下降 3 页 × 4 = 12 的 I/O」翻盘（P1.3 重启用例失败的根因）。
+  //
+  // 关键约束（两个都不能违反，否则索引形同虚设）：
+  //   ① 索引定位只花「树高」页 I/O，不能按命中行数重复计树高；
+  //   ② 全表扫描的**每行 CPU 成本必须真实存在**（kCpuPerRow > 0），
+  //      否则「行数少 ⇒ 全表几乎免费」会让任何索引都赢不了。
+  // 有 ② 之后，只要命中行数 < 全表行数，索引的 CPU 节省就能盖过
+  // 「随机 I/O 比顺序 I/O 贵」的劣势 —— 这正是现实里索引生效的原因。
+  namespace
+  {
+    constexpr double kRandomIo = 2.0;
+    constexpr double kSeqIo = 1.0;
+    constexpr double kCpuPerRow = 0.10;
+    constexpr double kRowsPerPage = 40.0;
+    // 树高未知时的兜底值（正常情况都由 BPlusTree::Height 给出实测值）
+    constexpr double kIndexHeightFallback = 1.0;
+  }  // namespace
+
+  void Executor::EstimateAccessPath(const CatalogTable &table, size_t row_count,
+                                    const IndexStats &ix, const AccessPathChoice &choice,
+                                    double *est_rows, double *est_cost) const
+  {
+    (void)table;
+    const double r = static_cast<double>(row_count);
+    switch (choice.path)
+    {
+    case AccessPath::kRowidLookup:
+      *est_rows = 1.0;
+      *est_cost = kRandomIo + kCpuPerRow;
+      return;
+
+    case AccessPath::kIndexOnlyScan:
+    case AccessPath::kIndexScan:
+    {
+      // 选择率估算：
+      //   * 等值：1/R（唯一索引下至多 1 行；非唯一按均匀分布估）
+      //   * 范围：用索引的 min/max 做「区间占比」—— 索引本身按列值有序，
+      //     首末叶子键就是该列的最小/最大值，等价于一份免费的一维直方图
+      //     （P1.6 统计信息的基础）。拿不到 min/max 时退回 1/3 的经验值。
+      //     没有这一步，`v > 990` 与 `v > 2` 会被估成同一个选择率，
+      //     索引在「窄范围」上就永远赢不了全表扫描。
+      double sel = 1.0 / 3.0;
+      if (choice.equality)
+      {
+        sel = r > 0.0 ? 1.0 / r : 1.0;
+      }
+      else if (choice.range_span > 0.0)
+      {
+        // choice.range_span = 谓词区间宽度 / 列值域宽度（在 ChooseAccessPath
+        // 里由索引 min/max 算出；无统计时为 0 → 用经验值）
+        sel = choice.range_span;
+        if (sel > 1.0)
+        {
+          sel = 1.0;
+        }
+      }
+      double hits = r * sel;
+      if (hits < 1.0)
+      {
+        hits = 1.0;
+      }
+      if (hits > r)
+      {
+        hits = r;
+      }
+
+      // ② 下降代价 = 树高页随机 I/O。用**实测树高**（P1.6），未知才退回默认值。
+      // 这一点对结果的正确性很关键：小表上树高就是 1（根即叶子），
+      // 若仍按常数 2.0 计，等值查找会被估成 3 页随机 I/O，
+      // 反而输给「1 页顺序 I/O + CPU」的全表扫描。
+      const double height = ix.known() ? ix.height : kIndexHeightFallback;
+
+      // ③ 叶子代价：等值只落 1 页；范围按命中行铺满的页数估，
+      // 上限是索引自身的叶子页数（不可能读超过整个叶子链）。
+      double leaves = choice.equality ? 1.0 : std::ceil(hits / kRowsPerPage);
+      if (leaves < 1.0)
+      {
+        leaves = 1.0;
+      }
+      if (ix.leaf_pages > 0.0 && leaves > ix.leaf_pages)
+      {
+        leaves = ix.leaf_pages;
+      }
+
+      double cost = (height + leaves) * kRandomIo + hits * kCpuPerRow;
+      if (choice.path == AccessPath::kIndexScan)
+      {
+        // ④ 回表：按「命中行落在多少个不同的表页」计费，而不是每行一次 I/O。
+        //
+        // 命中行数不能直接当页数用：索引扫描取的是**一个区间**，区间内的行在
+        // 物理上往往相邻（尤其主键/自增列），10 行很可能只落在 1~2 个页里。
+        // 因此按「命中行自身铺满多少页」估，即 ceil(hits / 每页行数)，
+        // 再与表的总页数取小（不可能读超过整表）。
+        //
+        // 这个修正是必要的：早先按 min(hits, 表页数) 计费时，
+        // `v >= 100 AND v <= 120`（命中 10 行）被估成 10 次随机 I/O = 40，
+        // 总代价 56.6 > 全表 38.0，索引永远赢不了 —— 这正是 P1.3 里
+        // 「AND 区间」用例失败的根因。
+        const double table_pages = std::max(1.0, std::ceil(r / kRowsPerPage));
+        const double hit_pages = std::max(1.0, std::ceil(hits / kRowsPerPage));
+        const double heap_pages = std::min(hit_pages, table_pages);
+        cost += heap_pages * kRandomIo;
+      }
+      *est_rows = hits;
+      *est_cost = cost;
+      return;
+    }
+
+    case AccessPath::kSeqScan:
+    default:
+      *est_rows = r;
+      // 顺序读所有页（一页至少算一次，空表也要读首页）
+      *est_cost = std::max(1.0, std::ceil(r / kRowsPerPage)) * kSeqIo + r * kCpuPerRow;
+      return;
+    }
+  }
+
+  // ── EXPLAIN ────────────────────────────────────────────────
+
+  DbStatus Executor::Explain(const cella::CELLA_PlanNode &plan, std::vector<AccessPathRecord> *out)
+  {
+    out->clear();
+    // 收集 (表访问节点, 其上方谓词)，然后逐个做访问路径选择。
+    // 只解析不执行：不申请表锁、不取数据行，因此 EXPLAIN 是**只读且廉价**的。
+    std::vector<ScanPredicate> scans;
+    CollectScanPredicates(plan, nullptr, /*with_rowid=*/false, &scans);
+    for (const ScanPredicate &sp : scans)
+    {
+      std::string name;
+      std::string alias;
+      if (sp.scan->tableRef != nullptr)
+      {
+        name = sp.scan->tableRef->name;
+        alias = sp.scan->tableRef->alias;
+      }
+      else if (!ParseTableDisplay(sp.scan->detail, &name, &alias))
+      {
+        continue;
+      }
+      const CatalogTable *meta = catalog_->FindTable(name);
+      if (meta == nullptr)
+      {
+        return DbStatus::Error(DbCode::kTableNotFound, "表不存在: " + name);
+      }
+      AccessPathRecord rec;
+      rec.table = meta->name;
+      const DbStatus cs = ChooseAccessPath(*meta, sp.pred, sp.need_rowid, &rec.choice);
+      if (!cs.ok())
+      {
+        return cs;
+      }
+      out->push_back(std::move(rec));
+    }
+    return DbStatus::Ok();
+  }
+
+  std::string Executor::ExplainText(const cella::CELLA_PlanNode &plan)
+  {
+    // 与 ExecGet 完全一致地登记列需求 —— 这是「EXPLAIN 展示的路径 == 实跑路径」
+    // 的前提。否则 index-only scan 会被保守降级，两边给出不同答案。
+    RegisterNeededColumns(plan);
+    return ExplainTextNoRegister(plan);
+  }
+
+  std::string Executor::ExplainTextNoRegister(const cella::CELLA_PlanNode &plan) const
+  {
+    std::string out;
+    ExplainNode(plan, nullptr, 0, &out);
+    return out;
+  }
+
+  void Executor::ExplainNode(const cella::CELLA_PlanNode &node, const cella::CELLA_Expr *pred,
+                             int depth, std::string *out) const
+  {
+    const std::string indent(static_cast<size_t>(depth) * 2, ' ');
+    // Filter 的谓词要下传给下方的表访问节点，这样才能展示真实的选择结果
+    const cella::CELLA_Expr *carried = pred;
+    if (node.op == "Filter" && node.pred != nullptr)
+    {
+      carried = node.pred.get();
+    }
+
+    if (node.op == "SeqScan" || node.op == "IndexScan")
+    {
+      std::string name;
+      std::string alias;
+      if (node.tableRef != nullptr)
+      {
+        name = node.tableRef->name;
+        alias = node.tableRef->alias;
+      }
+      else
+      {
+        ParseTableDisplay(node.detail, &name, &alias);
+      }
+      // EXPLAIN 必须保持 const：用 const_cast 走同一条选择逻辑（不修改任何状态）
+      Executor *self = const_cast<Executor *>(this);
+      const CatalogTable *meta = catalog_->FindTable(name);
+      if (meta == nullptr)
+      {
+        *out += indent + node.op + " " + node.detail + "  [表不存在]\n";
+        return;
+      }
+      AccessPathChoice choice;
+      const DbStatus cs = self->ChooseAccessPath(*meta, carried, /*with_rowid=*/false, &choice);
+      if (!cs.ok())
+      {
+        *out += indent + node.op + " " + node.detail + "  [路径选择失败]\n";
+        return;
+      }
+      *out += indent + choice.Describe() + " [" + (alias.empty() ? name : name + " " + alias) + "]";
+      *out += "  rows≈" + std::to_string(static_cast<long long>(choice.est_rows));
+      *out += " cost≈" + FormatCost(choice.est_cost);
+      if (node.op == "IndexScan" && !choice.uses_index())
+      {
+        *out += "  (显式 IndexScan 节点，但未选中索引)";
+      }
+      *out += "\n";
+      return;
+    }
+
+    // 非表访问节点：照原样打印算子树，谓词继续向下传递
+    *out += indent + node.op;
+    if (!node.detail.empty())
+    {
+      *out += " " + node.detail;
+    }
+    *out += "\n";
+    const cella::CELLA_Expr *child_pred =
+        (node.op == "Join") ? nullptr : carried;
+    for (const auto &c : node.children)
+    {
+      ExplainNode(*c, child_pred, depth + 1, out);
+    }
+  }
+
+
+
   // ── DELETE ──────────────────────────────────────────────────
 
   DbStatus Executor::ExecDelete(const cella::CELLA_PlanNode &plan, const ExecContext &ctx,
@@ -974,6 +2360,15 @@ namespace cella::db
     }
 
     StorageGuard guard(storage_mutex_);
+    // ── P1.5：打开索引句柄（每行删除都要同步删索引项）──
+    std::vector<IndexHandle> indexes;
+    {
+      const DbStatus os = OpenTableIndexes(*meta, &indexes);
+      if (!os.ok())
+      {
+        return os;
+      }
+    }
     size_t removed = 0;
     for (const auto &h : hits)
     {
@@ -981,6 +2376,14 @@ namespace cella::db
       if (!s.ok())
       {
         return FromStorage(s, "删除 " + name);
+      }
+      // 表行已打墓碑 → 索引项必须同步删除，否则会出现「索引指向已删行」的悬空项
+      {
+        const DbStatus is = IndexRowDelete(&indexes, *meta, h.second.values(), h.first);
+        if (!is.ok())
+        {
+          return is;
+        }
       }
       if (ctx.recording())
       {
@@ -1055,6 +2458,16 @@ namespace cella::db
     const std::vector<FieldRef> fields = MakeFields(*meta, name, ctx.with_rowid);
     StorageGuard guard(storage_mutex_);
     size_t updated = 0;
+
+    // ── P1.5：打开索引句柄（UPDATE = 删旧 + 插新 → 索引做 DELETE_INSERT）──
+    std::vector<IndexHandle> indexes;
+    {
+      const DbStatus os = OpenTableIndexes(*meta, &indexes);
+      if (!os.ok())
+      {
+        return os;
+      }
+    }
 
     // ── 主键唯一性（仅当更新涉及主键列时检查）──
     // 语义是「把命中行的主键值改成新值」：新值不能与**未命中行**冲突，
@@ -1143,6 +2556,21 @@ namespace cella::db
         }
       }
 
+      // ── P1.5：唯一索引预检，必须发生在「删旧行」之前 ──
+      // 索引维护分两步：删除旧版本键、插入新版本键。若把唯一性检查推后到
+      // 第二步，删除已经发生 → 回滚要同时还原「旧行」并清理「新行」，
+      // 而新行的 undo 记录此时还没写（要等 insert_record 拿到 Rid）。
+      // 因此这里先只做检查（不动树），确认无冲突后再生效，保证冲突时
+      // 表与索引都处于「什么都没改」的状态。
+      {
+        const DbStatus cs = IndexRowCheckUpdate(indexes, *meta, h.second.values(), fresh.values(),
+                                                h.first);
+        if (!cs.ok())
+        {
+          return cs;
+        }
+      }
+
       const storage::Status ds = storage_->delete_record(name, h.first);
       if (!ds.ok())
       {
@@ -1166,9 +2594,21 @@ namespace cella::db
       {
         return FromStorage(is, "更新(插新) " + name);
       }
+      // 立刻回填新版本位置：此后任何失败，回滚都能先删新版本再重插旧内容。
+      // （不能等索引维护成功再填 —— 索引维护失败时新行已经落库了。）
       if (update_undo != nullptr)
       {
-        update_undo->rid = new_rid; // 回滚时先删新版本，再重插旧内容
+        update_undo->rid = new_rid;
+      }
+      // ── P1.5：索引同步。行定位变了（删旧+插新），所以即便列值没变，
+      //           叶子键也必须换成新 Rid；唯一性已在上面预检过。
+      {
+        const DbStatus xs =
+            IndexRowUpdate(&indexes, *meta, h.second.values(), fresh.values(), h.first, new_rid);
+        if (!xs.ok())
+        {
+          return xs;
+        }
       }
       ++updated;
     }
@@ -1184,6 +2624,11 @@ namespace cella::db
   DbStatus Executor::ExecGet(const cella::CELLA_PlanNode &plan, const ExecContext &ctx,
                              QueryResult *out)
   {
+    // 登记「本语句每张表需要哪些列」——判定 index-only scan 用（见头文件说明）。
+    // 收集范围：投影表达式、谓词、排序键、分组键、聚合参数，以及聚合/排序节点
+    // 自身引用的列。取并集并**宁多勿少**：多登记一列只会让计划退回回表扫描，
+    // 少登记一列会导致索引覆盖扫描漏列 —— 后者是错误，前者只是慢。
+    RegisterNeededColumns(plan);
     RowSet rs;
     const DbStatus s = Run(plan, ctx, &rs);
     if (!s.ok())
@@ -1219,6 +2664,8 @@ namespace cella::db
     const std::string &op = node.op;
     if (op == "SeqScan")
       return OpSeqScan(node, ctx, out);
+    if (op == "IndexScan")
+      return OpIndexScan(node, ctx, out);
     if (op == "Filter")
       return OpFilter(node, ctx, out);
     if (op == "Project")
@@ -1261,8 +2708,18 @@ namespace cella::db
     return true;
   }
 
-  DbStatus Executor::OpSeqScan(const cella::CELLA_PlanNode &node, const ExecContext &ctx,
-                               RowSet *out)
+  // ── 表访问算子的公共实现 ──────────────────────────────────────
+  //
+  // 计划里表访问节点恒为 SeqScan，但**实际走哪条路径由这里决定**（见文件上方
+  // 「访问路径选择」的说明）。这是 P1.3 的核心：把「计划文本」与「执行决策」
+  // 解耦 —— 计划文本保持 golden 契约不变，执行期却能吃到索引加速。
+  //
+  // 谓词从哪来？OpSeqScan 是 Run() 递归下到叶子时被调用的，它看不到上层的
+  // Filter。因此调用方（OpFilter）在进入子算子前会把谓词登记到 scan_pred_，
+  // 由这里取用。契约：登记/取用严格配对（Filter 进 → Scan 取），失败路径也要
+  // 清理，否则会污染后续语句（见 ScanPredScope 的 RAII）。
+  DbStatus Executor::OpTableAccess(const cella::CELLA_PlanNode &node, const ExecContext &ctx,
+                                   RowSet *out, bool explicit_index_scan)
   {
     std::string name;
     std::string alias;
@@ -1273,7 +2730,7 @@ namespace cella::db
     }
     else if (!ParseTableDisplay(node.detail, &name, &alias))
     {
-      return DbStatus::Error(DbCode::kInternal, "SeqScan 缺少表信息: " + node.detail);
+      return DbStatus::Error(DbCode::kInternal, "表访问缺少表信息: " + node.detail);
     }
 
     const CatalogTable *meta = catalog_->FindTable(name);
@@ -1288,6 +2745,32 @@ namespace cella::db
       return ls;
     }
 
+    // 取出预登记的谓词（消费式：取一次就清掉）
+    const cella::CELLA_Expr *pred = TakeScanPredicate(real);
+
+    AccessPathChoice choice;
+    const DbStatus cs = ChooseAccessPath(*meta, pred, ctx.with_rowid, &choice);
+    if (!cs.ok())
+    {
+      return cs;
+    }
+    if (explicit_index_scan && !choice.uses_index())
+    {
+      // 显式构造的 IndexScan 计划节点（单测/EXPLAIN 用）：强制走索引扫描框架，
+      // 没有可用区间时就退化成「整索引扫 + 回表」，语义仍与全表扫描等价。
+      choice.path = AccessPath::kIndexScan;
+      if (!choice.has_lower && !choice.has_upper)
+      {
+        choice.index_name = FirstIndexName(*meta);
+      }
+    }
+
+    const std::string qualifier = alias.empty() ? real : alias;
+
+    AccessPathRecord rec;
+    rec.table = real;
+    rec.choice = choice;
+
     StorageGuard guard(storage_mutex_);
     std::shared_ptr<storage::TableHeap> heap;
     const storage::Status os = storage_->open_table(real, &heap);
@@ -1295,16 +2778,367 @@ namespace cella::db
     {
       return FromStorage(os, "打开表 " + real);
     }
-    const std::string qualifier = alias.empty() ? real : alias;
     out->fields = MakeFields(*meta, qualifier, ctx.with_rowid);
+
+    if (choice.uses_index())
+    {
+      // 索引扫描：先在索引上定位候选 Rid，再回表取整行。
+      std::vector<IndexHandle> indexes;
+      const DbStatus is = OpenTableIndexes(*meta, &indexes);
+      if (!is.ok())
+      {
+        return is;
+      }
+      const IndexHandle *ix = nullptr;
+      for (const IndexHandle &h : indexes)
+      {
+        if (SameIdent(h.meta->name, choice.index_name))
+        {
+          ix = &h;
+          break;
+        }
+      }
+      if (ix == nullptr)
+      {
+        // 索引在计划与执行之间被删掉了 → 退回全表扫描（不报错：
+        // 「索引消失」不是查询的错，静默退化成正确的慢路径即可）
+        rec.choice = AccessPathChoice{};
+        rec.choice.path = AccessPath::kSeqScan;
+        rec.choice.reason = "索引已不存在，退回全表扫描";
+      }
+      else
+      {
+        std::vector<storage::Rid> rids;
+        const DbStatus rs = ScanIndexRids(*meta, *ix, choice, &rids);
+        if (!rs.ok())
+        {
+          return rs;
+        }
+        // 回表：按 Rid 取整行（保持索引顺序 —— 等值/范围查询的有序输出）
+        for (const storage::Rid &rid : rids)
+        {
+          storage::Record record;
+          const storage::Status gs = heap->GetRecord(rid, &record);
+          if (!gs.ok())
+          {
+            continue;  // 悬空索引项（理论上不该有）：跳过而不是让查询失败
+          }
+          out->rows.push_back(ValuesWithRowid(record.values(), rid, ctx.with_rowid));
+        }
+        rec.rows_out = out->rows.size();
+        rec.pages_read = rids.size();
+        access_paths_.push_back(rec);
+        return DbStatus::Ok();
+      }
+    }
+
     for (auto it = heap->begin(); it != heap->end(); ++it)
     {
       // 只有语句引用了 rowid 时才在末尾补上（与 MakeFields 的伪列对齐）
       out->rows.push_back(ValuesWithRowid(it->values(), it.rid(), ctx.with_rowid));
     }
+    rec.rows_out = out->rows.size();
+    access_paths_.push_back(rec);
     return DbStatus::Ok();
   }
 
+  // 在索引上按区间定位候选 Rid（等值 / 范围 / 全索引）。
+  // 边界用「列值键」：lo = 下界列值，hi = 上界列值。
+  //   * 等值：lo=hi=值，include_hi=true（含该列值全部行）
+  //   * 范围：上界不包含时（< 或 <= 的严格侧），用 include_hi 控制
+  //   * 无界：nullptr 表示从最小 / 到最大
+  DbStatus Executor::ScanIndexRids(const CatalogTable &table, const IndexHandle &ix,
+                                   const AccessPathChoice &choice,
+                                   std::vector<storage::Rid> *out)
+  {
+    (void)table;
+    out->clear();
+    if (ix.meta == nullptr || ix.tree == nullptr)
+    {
+      return DbStatus::Error(DbCode::kInternal, "索引句柄无效");
+    }
+    std::string lo;
+    std::string hi;
+    const std::string *lo_p = nullptr;
+    const std::string *hi_p = nullptr;
+    if (choice.has_lower)
+    {
+      lo = storage::StripLeafRowId(storage::EncodeLeafKey(choice.lower, 0, 0));
+      lo_p = &lo;
+    }
+    if (choice.has_upper)
+    {
+      hi = storage::StripLeafRowId(storage::EncodeLeafKey(choice.upper, 0, 0));
+      hi_p = &hi;
+    }
+    // include_hi：等值时含边界；范围按边界开闭。
+    // 注意 ScanRange 的 include_hi=false 会排除「列值 == hi」的全部行，
+    // 正好对应 SQL 的严格 `<`；true 对应 `<=` 与等值。
+    const bool include_hi = choice.equality ? true : choice.upper_inclusive;
+    std::vector<storage::Rid> rids;
+    const storage::Status ss = ix.tree->ScanRange(
+        lo_p, hi_p, include_hi,
+        [&](const std::string &leaf) -> bool
+        {
+          storage::page_id_t p = 0;
+          uint8_t s = 0;
+          if (storage::DecodeLeafKeyRid(leaf, &p, &s))
+          {
+            storage::Rid rid;
+            rid.page_id = p;
+            rid.slot_id = s;
+            rids.push_back(rid);
+          }
+          return true;
+        });
+    if (!ss.ok())
+    {
+      return FromStorage(ss, "索引扫描 " + ix.meta->name);
+    }
+    *out = std::move(rids);
+    return DbStatus::Ok();
+  }
+
+  std::string Executor::FirstIndexName(const CatalogTable &table) const
+  {
+    const std::vector<const CatalogIndex *> metas = catalog_->IndexesOfTable(table.name);
+    for (const CatalogIndex *m : metas)
+    {
+      if (m != nullptr && m->valid())
+      {
+        return m->name;
+      }
+    }
+    return std::string();
+  }
+
+  // 谓词登记表：Filter(进) → Scan(取)。用表名（大写）做键。
+  const cella::CELLA_Expr *Executor::TakeScanPredicate(const std::string &table)
+  {
+    const auto it = scan_pred_.find(cella::cella_toUpper(table));
+    if (it == scan_pred_.end())
+    {
+      return nullptr;
+    }
+    const cella::CELLA_Expr *p = it->second;
+    scan_pred_.erase(it);
+    return p;
+  }
+
+  // 把谓词登记到一棵子树里的所有表访问节点上。
+  // 遇到 Join 就停止下推：Join 的 ON 条件与外层谓词都不能简单地归给某一张表，
+  // 强行登记会让区间失真。Join 之下各表若无谓词 → 各自全表扫描（正确且安全）。
+  void Executor::PushPredicateToScans(const cella::CELLA_PlanNode &node,
+                                      const cella::CELLA_Expr *pred)
+  {
+    if (pred == nullptr)
+    {
+      return;
+    }
+    if (node.op == "SeqScan" || node.op == "IndexScan")
+    {
+      std::string name;
+      std::string alias;
+      if (node.tableRef != nullptr)
+      {
+        name = node.tableRef->name;
+      }
+      else
+      {
+        ParseTableDisplay(node.detail, &name, &alias);
+      }
+      if (!name.empty())
+      {
+        PushScanPredicate(name, pred);
+      }
+      return;
+    }
+    if (node.op == "Join")
+    {
+      return;  // 不下推（见上）
+    }
+    for (const auto &c : node.children)
+    {
+      PushPredicateToScans(*c, pred);
+    }
+  }
+
+  void Executor::PushScanPredicate(const std::string &table, const cella::CELLA_Expr *pred)
+  {
+    if (pred != nullptr)
+    {
+      scan_pred_[cella::cella_toUpper(table)] = pred;
+    }
+  }
+
+  // 递归收集表达式里引用的列名（去重，保留原拼写）
+  namespace
+  {
+    void CollectExprColumns(const cella::CELLA_Expr *e, std::vector<std::string> *out)
+    {
+      if (e == nullptr)
+      {
+        return;
+      }
+      if (e->kind == cella::CELLA_Expr::Kind::COLUMN_REF)
+      {
+        bool seen = false;
+        for (const std::string &c : *out)
+        {
+          if (cella::cella_toUpper(c) == cella::cella_toUpper(e->column))
+          {
+            seen = true;
+            break;
+          }
+        }
+        if (!seen)
+        {
+          out->push_back(e->column);
+        }
+      }
+      CollectExprColumns(e->left.get(), out);
+      CollectExprColumns(e->right.get(), out);
+      CollectExprColumns(e->child.get(), out);
+    }
+  }  // namespace
+
+  void Executor::RegisterNeededColumns(const cella::CELLA_PlanNode &plan)
+  {
+    needed_cols_.clear();
+    CollectNeededColumns(plan, this);
+  }
+
+  void Executor::CollectNeededColumns(const cella::CELLA_PlanNode &node, Executor *self)
+  {
+    (void)self;
+    // 表访问节点：自身不带列引用，交给上层算子收集（见下）
+    if (node.op == "SeqScan" || node.op == "IndexScan")
+    {
+      return;
+    }
+    // 只在「单表」语句里做精确登记 —— 多表 Join 时列归属无法从名称可靠判断
+    // （同名列会串表），此时把全部列登记给每张表（保守回表，绝不漏列）。
+    std::vector<std::string> cols;
+    if (node.pred != nullptr)
+    {
+      CollectExprColumns(node.pred.get(), &cols);
+    }
+    if (node.onExpr != nullptr)
+    {
+      CollectExprColumns(node.onExpr.get(), &cols);
+    }
+    for (const auto &e : node.exprs)
+    {
+      CollectExprColumns(e.get(), &cols);
+    }
+    for (const auto &e : node.aggExprs)
+    {
+      CollectExprColumns(e.get(), &cols);
+    }
+    for (const cella::CELLA_ColName &k : node.sortKeys)
+    {
+      cols.push_back(k.column);
+    }
+    for (const cella::CELLA_ColName &k : node.groupKeys)
+    {
+      cols.push_back(k.column);
+    }
+    // 把收集到的列登记到本子树里的每一张表上（单表语句就是那一张表；
+    // 多表 Join 时保守地给所有表都登记 —— 宁可多登记导致回表，不可漏列）。
+    for (const auto &c : node.children)
+    {
+      CollectNeededColumns(*c, self);
+    }
+    if (!cols.empty())
+    {
+      RegisterColumnsForSubtree(node, cols);
+    }
+  }
+
+  void Executor::RegisterColumnsForSubtree(const cella::CELLA_PlanNode &node,
+                                           const std::vector<std::string> &cols)
+  {
+    if (node.op == "SeqScan" || node.op == "IndexScan")
+    {
+      std::string name;
+      std::string alias;
+      if (node.tableRef != nullptr)
+      {
+        name = node.tableRef->name;
+      }
+      else
+      {
+        ParseTableDisplay(node.detail, &name, &alias);
+      }
+      if (!name.empty())
+      {
+        const std::string key = cella::cella_toUpper(name);
+        std::vector<std::string> &dst = needed_cols_[key];
+        for (const std::string &c : cols)
+        {
+          bool seen = false;
+          for (const std::string &d : dst)
+          {
+            if (cella::cella_toUpper(d) == cella::cella_toUpper(c))
+            {
+              seen = true;
+              break;
+            }
+          }
+          if (!seen)
+          {
+            dst.push_back(c);
+          }
+        }
+      }
+      return;
+    }
+    for (const auto &c : node.children)
+    {
+      RegisterColumnsForSubtree(*c, cols);
+    }
+  }
+
+  void Executor::SetNeededColumns(const std::string &table, std::vector<std::string> columns)
+  {
+    needed_cols_[cella::cella_toUpper(table)] = std::move(columns);
+  }
+
+  bool Executor::StmtNeedsOtherColumn(const std::string &table, int index_column) const
+  {
+    const auto it = needed_cols_.find(cella::cella_toUpper(table));
+    if (it == needed_cols_.end())
+    {
+      // 没有登记（例如直接构造计划驱动算子，不经过 ExecGet）→ 保守回表。
+      return true;
+    }
+    const CatalogTable *meta = catalog_->FindTable(table);
+    if (meta == nullptr)
+    {
+      return true;
+    }
+    for (const std::string &col : it->second)
+    {
+      const int ci = meta->ColumnIndex(col);
+      if (ci >= 0 && ci != index_column)
+      {
+        return true;  // 用到了索引列之外的列 → 必须回表
+      }
+    }
+    return false;
+  }
+
+  DbStatus Executor::OpSeqScan(const cella::CELLA_PlanNode &node, const ExecContext &ctx,
+                               RowSet *out)
+  {
+    return OpTableAccess(node, ctx, out, /*explicit_index_scan=*/false);
+  }
+
+  DbStatus Executor::OpIndexScan(const cella::CELLA_PlanNode &node, const ExecContext &ctx,
+                                 RowSet *out)
+  {
+    return OpTableAccess(node, ctx, out, /*explicit_index_scan=*/true);
+  }
   DbStatus Executor::RunSingleChild(const cella::CELLA_PlanNode &node, const ExecContext &ctx,
                                     RowSet *out)
   {
@@ -1320,8 +3154,18 @@ namespace cella::db
   DbStatus Executor::OpFilter(const cella::CELLA_PlanNode &node, const ExecContext &ctx,
                               RowSet *out)
   {
+    // 索引下推的「交接点」：Filter 在驱动子算子之前，把自己的谓词登记到
+    // 下方每个表访问节点上。这样叶子处的 Scan 就能据谓词选索引区间。
+    // 正确性不依赖这里的判断是否精准 —— Filter 本身仍会完整求值一遍，
+    // 索引只负责缩小候选集，绝不可能漏行。
+    if (node.pred != nullptr && !node.children.empty())
+    {
+      PushPredicateToScans(*node.children[0], node.pred.get());
+    }
     RowSet in;
     const DbStatus s = RunSingleChild(node, ctx, &in);
+    // 无论成功与否都清掉登记：失败路径若残留，会污染后续语句的选择
+    ResetScanPredicates();
     if (!s.ok())
     {
       return s;

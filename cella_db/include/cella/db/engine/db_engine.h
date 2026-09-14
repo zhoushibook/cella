@@ -165,6 +165,11 @@ class DbEngine {
   // table 为空表示列出全部；指定的表不存在时报 DB-502。
   DbStatus ShowIndexes(const std::string& table, QueryResult* out);
 
+  // EXPLAIN <语句>：只编译不执行，展示每个表访问节点最终选中的访问路径（P1.3）。
+  // 输入是 EXPLAIN 之后的**原始 SQL 文本**（由会话层切出）。
+  // 输出是单列查询结果（列名 "plan"），每行一行文本 —— 复用既有结果渲染通道。
+  DbStatus Explain(const std::string& sql_after_explain, QueryResult* out);
+
   // 诊断文本
   std::string StatsText();
   std::string LockText() const;

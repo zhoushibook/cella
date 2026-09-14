@@ -428,6 +428,9 @@ namespace cella::db
     executor_ = std::make_unique<Executor>(storage_.get(), &catalog_, txn_manager_.get(), locks_.get(),
                                            &storage_mutex_);
     executor_->AttachAuth(&auth_); // 表级权限判定要用（身份库按需打开，指针本身恒定）
+    // P1.5：把执行器侧的索引维护挂到事务回滚路径上。回滚只补偿表行，
+    // 若不挂钩子，索引会与表数据分叉（重启后仍是脏的）。
+    txn_manager_->SetUndoIndexHooks(executor_->undo_adapter());
 
     // ⑧ 默认会话
     default_session_ = std::make_unique<Session>(this, "main");
@@ -861,6 +864,67 @@ namespace cella::db
       out->rows.push_back(std::move(row));
     }
     out->tag = "SHOW INDEXES " + std::to_string(out->rows.size());
+    return DbStatus::Ok();
+  }
+
+  DbStatus DbEngine::Explain(const std::string &sql, QueryResult *out)
+  {
+    if (out == nullptr)
+    {
+      return DbStatus::Error(DbCode::kInternal, "Explain: 输出为空");
+    }
+    out->Clear();
+    if (executor_ == nullptr)
+    {
+      return DbStatus::Error(DbCode::kInternal, "引擎未打开");
+    }
+
+    // 编译（与 CompileOnly 同一条链路，且用目录副本，绝不改动会话目录）
+    std::vector<cella::CELLA_Error> errors;
+    const auto tokens = cella::cella_tokenize(sql, errors);
+    auto program = cella::cella_parse(tokens, errors);
+    if (!program || program->statements.empty() || !errors.empty())
+    {
+      return DbStatus::Error(DbCode::kSqlError, CompileErrorsText(errors));
+    }
+    cella::CELLA_Catalog scratch = catalog_.ToCompilerCatalog();
+    const auto sem = cella::cella_analyze(*program, scratch);
+    errors.insert(errors.end(), sem.errors.begin(), sem.errors.end());
+    if (!errors.empty())
+    {
+      return DbStatus::Error(DbCode::kSqlError, CompileErrorsText(errors));
+    }
+    std::vector<cella::CELLA_Error> plan_errors;
+    auto plans = cella::cella_plan(*program, sem.stmtOk, sem.insertColumns, plan_errors);
+    errors.insert(errors.end(), plan_errors.begin(), plan_errors.end());
+    if (!errors.empty() || plans.empty())
+    {
+      return DbStatus::Error(DbCode::kSqlError, CompileErrorsText(errors));
+    }
+    const auto opt = cella::cella_optimizePlans(plans);
+    if (opt.plans.empty())
+    {
+      return DbStatus::Error(DbCode::kInternal, "Explain: 优化后计划为空");
+    }
+
+    std::lock_guard<std::recursive_mutex> guard(storage_mutex_);
+    // 输出用单列结果，复用既有的表格渲染通道（客户端据「有列名」判定为查询）
+    out->columns.clear();
+    ResultColumn col;
+    col.name = "plan";
+    out->columns.push_back(std::move(col));
+
+    // ① 计划骨架：与 `-p` 走同一条打印路径，因此这一段与 golden 完全同源
+    {
+      std::ostringstream os;
+      cella::cella_printPlan(opt.plans, os);
+      out->rows.push_back({storage::Value::Varchar(os.str())});
+    }
+    // ② 访问路径选择树：表访问节点显示真正选中的路径（索引/全表/rowid 直达）
+    for (const auto &plan : opt.plans)
+    {
+      out->rows.push_back({storage::Value::Varchar(executor_->ExplainText(*plan))});
+    }
     return DbStatus::Ok();
   }
 
@@ -1467,7 +1531,8 @@ namespace cella::db
       std::string note;
       // SHOW DATABASES / SHOW INDEXES 是只读的，事务中放行；CREATE/DROP/USE
       // 会换库或动文件系统，事务中一律拒绝（undo 记的是旧库表名，跨库切换会悬空）。
-      const bool readonly_show = (db_kind == "SHOW DATABASES" || db_kind == "SHOW INDEXES");
+      const bool readonly_show = (db_kind == "SHOW DATABASES" || db_kind == "SHOW INDEXES" ||
+                                  db_kind == "EXPLAIN");
       if (!readonly_show && in_transaction())
       {
         st = DbStatus::Error(DbCode::kDatabaseTxnActive,
@@ -1505,6 +1570,11 @@ namespace cella::db
       else if (db_kind == "SHOW INDEXES")
       { // SHOW INDEXES [IN table]
         st = engine_->ShowIndexes(db_arg, &out->result);
+        note = out->result.tag;
+      }
+      else if (db_kind == "EXPLAIN")
+      { // EXPLAIN <语句>：只编译 + 选访问路径，不取数据
+        st = engine_->Explain(db_arg, &out->result);
         note = out->result.tag;
       }
       else

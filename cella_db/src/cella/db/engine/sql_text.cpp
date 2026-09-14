@@ -278,6 +278,7 @@ bool IsDatabaseControl(const std::string& stmt_text, std::string* kind, std::str
   if (!TakeWord(stmt_text, &i, &w1)) {
     return false;
   }
+  const size_t after_w1 = i;  // 第一个词之后的位置（EXPLAIN 取尾串要用）
   const std::string u1 = Upper(w1);
   std::string w2;
   const bool has_w2 = TakeWord(stmt_text, &i, &w2);
@@ -323,6 +324,27 @@ bool IsDatabaseControl(const std::string& stmt_text, std::string* kind, std::str
     }
     if (kind != nullptr) *kind = "SHOW INDEXES";
     if (arg != nullptr) *arg = w3;
+    return true;
+  }
+  // EXPLAIN <任意语句>：arg 返回 EXPLAIN 之后的**原始尾串**（保留原拼写，
+  // 由会话层送进编译器），用于展示访问路径选择结果。空尾串 → 交给编译器报错。
+  if (u1 == "EXPLAIN") {
+    // 注意：i 此时已越过第二个词（上面的 TakeWord(w2) 有无条件推进），
+    // 所以尾串必须从 after_w1 重新开始，否则会把 "get" 吃掉。
+    size_t b = after_w1;
+    size_t e = stmt_text.size();
+    while (b < e && IsSpace(stmt_text[b])) {
+      ++b;
+    }
+    while (e > b && IsSpace(stmt_text[e - 1])) {
+      --e;
+    }
+    const std::string rest = stmt_text.substr(b, e - b);
+    if (rest.empty()) {
+      return false;
+    }
+    if (kind != nullptr) *kind = "EXPLAIN";
+    if (arg != nullptr) *arg = rest;
     return true;
   }
   return false;

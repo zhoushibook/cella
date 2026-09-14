@@ -23,6 +23,7 @@ const char* ToString(DbCode c) {
     case DbCode::kPrimaryKeyViolation: return "DB-516";
     case DbCode::kIndexExists:         return "DB-517";
     case DbCode::kIndexNotFound:       return "DB-518";
+    case DbCode::kUniqueViolation:     return "DB-519";
     case DbCode::kStorageError:       return "DB-520";
     case DbCode::kNoActiveTxn:        return "DB-601";
     case DbCode::kTxnAlreadyActive:   return "DB-602";

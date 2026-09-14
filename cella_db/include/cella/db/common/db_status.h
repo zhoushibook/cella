@@ -34,6 +34,7 @@ enum class DbCode {
   kPrimaryKeyViolation, // DB-516 主键冲突（唯一性被破坏）
   kIndexExists,         // DB-517 索引已存在
   kIndexNotFound,       // DB-518 索引不存在
+  kUniqueViolation,     // DB-519 唯一索引冲突（DML 写入重复值）
 
   // —— 存储层透传（DB-5xx）——
   kStorageError,        // DB-520 存储引擎返回失败（message 携带原始码）

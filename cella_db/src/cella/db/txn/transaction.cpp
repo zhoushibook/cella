@@ -236,6 +236,11 @@ namespace cella::db
       {
       case UndoRecord::Kind::kInsert:
         st = storage_->delete_record(u.table, u.rid);
+        if (st.ok() && undo_hooks_ != nullptr)
+        {
+          // 新插入的行被撤销 → 它的索引项也必须撤掉，否则索引里留下指向空洞的键
+          undo_hooks_->OnUndoInsertDeleted(u.table, u.rid);
+        }
         break;
       case UndoRecord::Kind::kDelete:
       case UndoRecord::Kind::kUpdate:
@@ -250,6 +255,11 @@ namespace cella::db
         }
         storage::Rid ignored;
         st = storage_->insert_record(u.table, u.before, &ignored);
+        if (st.ok() && undo_hooks_ != nullptr)
+        {
+          // 旧内容按**新**物理位置复插：索引项必须按新 Rid 重建（旧键已随新版本删除）
+          undo_hooks_->OnUndoRowRestored(u.table, ignored, u.before);
+        }
         break;
       }
       }
