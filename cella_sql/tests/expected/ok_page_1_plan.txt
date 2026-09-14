@@ -20,3 +20,7 @@ Page (page 2, size 5, offset 5)
   Limit (10)
     Project [name]
       SeqScan [student]
+
+Page (page 1, size 2, offset 0)
+  Project [name]
+    SeqScan [student]
