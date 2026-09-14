@@ -226,6 +226,12 @@ html[data-theme="dark"] .tok-num { color: #fac775; }
 .grid.with-ck th.rownum, .grid.with-ck td.rownum { left: 30px; }
 .grid th.rownum { cursor: pointer; }
 .grid td.rownum.sel, .grid td.ck.sel { background: var(--accent-soft); }
+/* 单元格交界悬停高亮：把可拖的边画出来（box-shadow 不参与布局，不影响行高/列宽） */
+.grid td.edge-r { box-shadow: inset -2px 0 0 0 var(--accent); }
+.grid td.edge-l { box-shadow: inset 2px 0 0 0 var(--accent); }
+.grid td.edge-b { box-shadow: inset 0 -2px 0 0 var(--accent); }
+.grid td.edge-r.edge-b { box-shadow: inset -2px 0 0 0 var(--accent), inset 0 -2px 0 0 var(--accent); }
+.grid td.edge-l.edge-b { box-shadow: inset 2px 0 0 0 var(--accent), inset 0 -2px 0 0 var(--accent); }
 
 /* ── 底部面板（消息/计划/诊断）─────────────── */
 .bottompanel {
@@ -346,6 +352,21 @@ table.grid.diag code { font-family: var(--mono); }
   background: var(--bg); color: var(--text);
 }
 .editing-hint { color: var(--warn); }
+
+/* ── 暂存编辑（Navicat 式）──────────────────── */
+.editbar {
+  display: flex; align-items: center; gap: 8px; padding: 5px 12px;
+  border-top: 1px solid var(--border); flex: none; font-size: 12px;
+  color: var(--text-dim); background: var(--bg-sub);
+}
+.editbar .pendstat.has, .editbar [data-act="pstat"].has { color: var(--warn); }
+.editbar .hint { color: var(--text-dim); }
+.grid td.dirty { color: var(--accent); font-weight: 500; background-image: linear-gradient(135deg, var(--accent-soft) 0 7px, transparent 7px); }
+.grid td.inserted { color: var(--ok); }
+.grid td.deleted { color: var(--err); text-decoration: line-through; opacity: 0.8; }
+.grid td.rownum.dirty { box-shadow: inset 3px 0 0 var(--warn); }
+.grid td.rownum.inserted { box-shadow: inset 3px 0 0 var(--ok); }
+.grid td.rownum.deleted { box-shadow: inset 3px 0 0 var(--err); }
 
 /* ── 空态 / 加载态 ─────────────────────────── */
 .empty { padding: 40px; text-align: center; color: var(--text-dim); line-height: 2; }

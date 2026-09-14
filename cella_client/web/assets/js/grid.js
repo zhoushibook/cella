@@ -44,17 +44,24 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
   let checked = new Set();  // 勾选的行（视图坐标）
   let firstVisible = 0;
   let dragMode = null;      // 'cell' | 'row'
-  let resizeState = null;   // {kind:'col'|'rownum', x, w}
+  let resizeState = null;   // {kind:'col'|'rownum', x, w} | {kind:'row', y, h}
+  let suppressClick = false; // 拖拽列宽/行高后浏览器会补一个 click，不能当成排序/全选
+  let dirtyFn = null;       // (r, c) => bool：c=-1 表示「整行有未提交修改」（画在行号格上）
+  let hiddenSet = new Set(); // 不展示但保留在数据里的列名（如数据浏览的 rowid：定位键，不该亮给用户）
+  let visList = [];          // 可见列的**数据索引**；td 的 data-c 恒为数据索引，选区/编辑/拖拽无需换算
   let rowH = loadNum('rowH', ROW_H_DEF, ROW_H_MIN, ROW_H_MAX);          // 行高（可拖）
   let rownumW = loadNum('rownumW', ROWNUM_W_DEF, 34, 160);              // 「#」列宽（可拖）
 
-  // colgroup 索引：checkable 时 [ck][rownum][数据列...]
+  // colgroup 索引：checkable 时 [ck][rownum][可见数据列...]（隐藏列不占位）
   const CK_COL = 0;
   const ROWNUM_COL = checkable ? 1 : 0;
-  const dataColIndex = (c) => ROWNUM_COL + 1 + c;
 
   // 有 onSort（服务端/受控排序）时不自排；否则本地排序（查询结果用）
   const localSort = !onSort;
+
+  // 列宽备忘：key = 列名|类型。手动拖过的宽度跨 setData 记住（翻页/排序/换查询都不丢）
+  const widthMemo = new Map();
+  const colKey = (c) => c.name + '|' + c.type;
 
   function fitWidth(ci) {
     const c = cols[ci];
@@ -91,7 +98,7 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
     let h = '<colgroup>';
     if (checkable) h += `<col style="width:${CK_W}px">`;
     h += `<col style="width:${rownumW}px">`;
-    for (let c = 0; c < cols.length; c++) h += `<col style="width:${widths[c]}px">`;
+    for (const di of visList) h += `<col style="width:${widths[di]}px">`;
     return h + '</colgroup>';
   }
 
@@ -115,12 +122,12 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
     html += `<th class="rownum" title="点选整行；点表头选全部；拖右边缘调列宽，拖下边缘调行高">#` +
       `<span class="resize size-rownum" data-ci="-1"></span>` +
       `<span class="rowresize" title="拖动调整行高（双击复位）"></span></th>`;
-    for (let c = 0; c < cols.length; c++) {
-      const col = cols[c];
+    for (const di of visList) {
+      const col = cols[di];
       const arrow = sortKey && sortKey.col === col.name ? (sortKey.dir === 'asc' ? ' ▲' : ' ▼') : '';
-      html += `<th data-col="${esc(col.name)}" data-ci="${c}" class="${isNumCol(col) ? 'num' : ''}"` +
+      html += `<th data-col="${esc(col.name)}" data-ci="${di}" class="${isNumCol(col) ? 'num' : ''}"` +
         ` title="${esc(col.name)}${localSort ? '（点击排序，三次取消）' : '（点击排序，三次恢复默认序）'}">` +
-        `${esc(col.name)}${arrow}<span class="resize" data-ci="${c}"></span></th>`;
+        `${esc(col.name)}${arrow}<span class="resize" data-ci="${di}"></span></th>`;
     }
     html += '</tr></thead><tbody>';
 
@@ -128,16 +135,21 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
     if (start > 0) {
       html += `<tr class="pad"><td colspan="${span}" style="height:${start * rowH}px"></td></tr>`;
     }
+    const kindTitle = { dirty: '该行有未提交的修改', deleted: '该行已标记删除（提交时生效）', inserted: '新行（提交时写入）' };
     for (let r = start; r < end; r++) {
       const row = view[r];
       const rs = isRowSel(r) ? ' sel' : '';
+      const rowKind = dirtyFn ? (dirtyFn(r, -1) || '') : '';
+      const rowTip = rowKind ? ` title="${kindTitle[rowKind] || ''}"` : '';
       html += `<tr data-r="${r}">`;
       if (checkable) html += `<td class="ck${rs}"><input type="checkbox" data-ck="${r}"${checked.has(r) ? ' checked' : ''}></td>`;
-      html += `<td class="rownum${rs}">${r + 1}</td>`;
-      for (let c = 0; c < cols.length; c++) {
-        const v = row[c];
-        const cls = (isNumCol(cols[c]) ? 'num ' : '') + (inSel(r, c) ? 'sel ' : '') + (v === null || v === undefined ? 'nullv' : '');
-        html += `<td data-c="${c}" class="${cls.trim()}" title="${esc(cellText(v))}">${esc(cellText(v))}</td>`;
+      html += `<td class="rownum${rs}${rowKind ? ' ' + rowKind : ''}"${rowTip}>${r + 1}</td>`;
+      for (const di of visList) {
+        const v = row[di];
+        const kind = dirtyFn ? (dirtyFn(r, di) || '') : '';
+        const cls = (isNumCol(cols[di]) ? 'num ' : '') + (inSel(r, di) ? 'sel ' : '') +
+          (v === null || v === undefined ? 'nullv ' : '') + (kind ? kind + ' ' : '');
+        html += `<td data-c="${di}" class="${cls.trim()}" title="${esc(cellText(v))}">${esc(cellText(v))}</td>`;
       }
       html += '</tr>';
     }
@@ -146,22 +158,24 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
     }
     html += '</tbody>';
     table.innerHTML = html;
+    lastEdgeTd = null;   // DOM 已重建，旧高亮引用失效
     applyColWidths();
   }
 
   // 拖拽列宽/行高时只改 colgroup 与 CSS 变量，不重排整表
   function applyColWidths() {
     let sum = rownumW + (checkable ? CK_W : 0);
-    for (const w of widths) sum += w;
+    for (const di of visList) sum += widths[di];   // 只算可见列（隐藏列不占 col）
     table.style.tableLayout = 'fixed';
     table.style.width = sum + 'px';
     table.style.setProperty('--row-h', rowH + 'px');
     const els = table.querySelectorAll('colgroup col');
     if (checkable && els[CK_COL]) els[CK_COL].style.width = CK_W + 'px';
     if (els[ROWNUM_COL]) els[ROWNUM_COL].style.width = rownumW + 'px';
-    for (let c = 0; c < widths.length; c++) {
-      if (els[dataColIndex(c)]) els[dataColIndex(c)].style.width = widths[c] + 'px';
-    }
+    visList.forEach((di, pos) => {
+      const el = els[ROWNUM_COL + 1 + pos];
+      if (el) el.style.width = widths[di] + 'px';
+    });
   }
 
   function syncCkAll() {
@@ -176,11 +190,75 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
     if (onCheckChange) onCheckChange(checked.size);
   }
 
+  // 只改选区高亮的类名，**不重建 DOM**。mousedown 里整表重建会打断浏览器的双击计数
+  // （第二次点击落在新建的 td 实例上，click detail 永远到不了 2 → dblclick 不触发 → 单元格编辑失灵）
+  function paintSelection() {
+    table.querySelectorAll('.sel').forEach((el) => el.classList.remove('sel'));
+    if (!sel || !cols.length) return;
+    const r1 = Math.min(sel.r1, sel.r2), r2 = Math.max(sel.r1, sel.r2);
+    const c1 = Math.min(sel.c1, sel.c2), c2 = Math.max(sel.c1, sel.c2);
+    const rowSel = sel.c1 === 0 && sel.c2 === cols.length - 1;
+    table.querySelectorAll('tbody tr[data-r]').forEach((tr) => {
+      const r = +tr.getAttribute('data-r');
+      if (r < r1 || r > r2) return;
+      if (rowSel) {
+        const rn = tr.querySelector('td.rownum');
+        if (rn) rn.classList.add('sel');
+        const ck = tr.querySelector('td.ck');
+        if (ck) ck.classList.add('sel');
+      }
+      for (let c = c1; c <= c2; c++) {
+        const td = tr.querySelector('td[data-c="' + c + '"]');
+        if (td) td.classList.add('sel');
+      }
+    });
+  }
+
   // ── 列宽 / 行高拖拽（双击自适应、复位）──────────────────
+  // 任意单元格交界都能拖：数据格/行号格右缘 = 列宽，任意格下缘 = 行高（Excel 式）。
+  // 用事件坐标判定，不给每个 td 挂手柄元素（虚拟滚动下 DOM 频繁重建，挂不住也不划算）。
+  // 命中带要够宽（8px），且边界两侧都算（右缘 + 下一列左缘，等效 16px），否则鼠标很难对准。
+  const EDGE = 8;
+  let lastEdgeTd = null;   // 悬停高亮：把可拖的交界画出来（box-shadow，不参与布局）
+  function clearEdgeHint() {
+    if (lastEdgeTd) {
+      lastEdgeTd.classList.remove('edge-r', 'edge-l', 'edge-b');
+      lastEdgeTd = null;
+    }
+  }
+  function edgeZone(e) {
+    const td = e.target.closest('td');
+    if (!td || !td.isConnected || td.classList.contains('empty')) return null;
+    const tr = td.closest('tr');
+    if (!tr || tr.classList.contains('pad')) return null;
+    const rect = td.getBoundingClientRect();
+    const fromR = rect.right - e.clientX;
+    const fromL = e.clientX - rect.left;
+    const fromB = rect.bottom - e.clientY;
+    if (fromR <= EDGE && fromR >= -1) {
+      if (td.hasAttribute('data-c')) return { kind: 'col', ci: +td.getAttribute('data-c'), side: 'r' };
+      if (td.classList.contains('rownum')) return { kind: 'rownum', side: 'r' };
+      return null;   // 复选框列宽固定，不给拖
+    }
+    if (fromB <= EDGE && fromB >= -1) return { kind: 'row', side: 'b' };
+    // 边界的另一侧：下一列的左缘 = 上一列的右缘（首数据列左缘 = 行号列边界）。
+    // 放在下缘之后：左下角是「行交界」，不是列交界。
+    if (fromL <= EDGE && fromL >= -1) {
+      if (td.hasAttribute('data-c')) {
+        const ci = +td.getAttribute('data-c');
+        return ci > 0 ? { kind: 'col', ci: ci - 1, side: 'l' } : { kind: 'rownum', side: 'l' };
+      }
+      return null;
+    }
+    return null;
+  }
+  const EDGE_CLS = { r: 'edge-r', l: 'edge-l', b: 'edge-b' };
+
   table.addEventListener('mousedown', (e) => {
     const rowHandle = e.target.closest('.rowresize');
     if (rowHandle) {
       resizeState = { kind: 'row', y: e.clientY, h: rowH };
+      suppressClick = true;
       document.body.style.cursor = 'row-resize';
       e.preventDefault();
       return;
@@ -190,10 +268,30 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
       const ci = +handle.getAttribute('data-ci');
       if (ci === -1) resizeState = { kind: 'rownum', x: e.clientX, w: rownumW };
       else resizeState = { kind: 'col', ci, x: e.clientX, w: widths[ci] };
+      suppressClick = true;
       document.body.style.cursor = 'col-resize';
       e.preventDefault();
       return;
     }
+    // 单元格交界：右缘拖列宽 / 下缘拖行高（优先于选区）
+    const zone = edgeZone(e);
+    if (zone) {
+      if (zone.kind === 'row') {
+        resizeState = { kind: 'row', y: e.clientY, h: rowH };
+        document.body.style.cursor = 'row-resize';
+      } else if (zone.kind === 'rownum') {
+        resizeState = { kind: 'rownum', x: e.clientX, w: rownumW };
+        document.body.style.cursor = 'col-resize';
+      } else {
+        resizeState = { kind: 'col', ci: zone.ci, x: e.clientX, w: widths[zone.ci] };
+        document.body.style.cursor = 'col-resize';
+      }
+      suppressClick = true;
+      e.preventDefault();
+      return;
+    }
+    suppressClick = false;   // 普通按下：清掉可能残留的标记（上次拖拽没跟来 click 时）
+    clearEdgeHint();
     if (e.target.closest('input')) return;   // 复选框自己处理
     if (e.target.closest('thead')) return;   // 表头交给 click
 
@@ -204,12 +302,35 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
     if (td.classList.contains('rownum') || td.classList.contains('ck')) {
       sel = { r1: r, c1: 0, r2: r, c2: cols.length - 1 };
       dragMode = 'row';
-      render();
+      paintSelection();
       return;
     }
     sel = { r1: r, c1: +td.getAttribute('data-c'), r2: r, c2: +td.getAttribute('data-c') };
     dragMode = 'cell';
-    render();
+    paintSelection();
+  });
+
+  // 悬停在交界上时：光标提示 + 把交界画出来（拖拽进行中交给 body 级光标）
+  table.addEventListener('mousemove', (e) => {
+    if (resizeState || dragMode) return;
+    const z = edgeZone(e);
+    table.style.cursor = z ? (z.kind === 'row' ? 'row-resize' : 'col-resize') : '';
+    const td = e.target.closest('td');
+    if (!z || !td) {
+      clearEdgeHint();
+      return;
+    }
+    if (td !== lastEdgeTd) {
+      clearEdgeHint();
+      td.classList.add(EDGE_CLS[z.side] || 'edge-r');
+      lastEdgeTd = td;
+    }
+  });
+  table.addEventListener('mouseleave', () => {
+    if (!resizeState && !dragMode) {
+      table.style.cursor = '';
+      clearEdgeHint();
+    }
   });
 
   table.addEventListener('mousemove', (e) => {
@@ -227,7 +348,7 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
       if (sel.c2 === +td.getAttribute('data-c') && !changed) return;
       sel.c2 = +td.getAttribute('data-c');
     }
-    render();
+    paintSelection();
   });
 
   // 双击边界 → 列自适应内容宽度 / 行高复位
@@ -283,6 +404,11 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
 
   // ── 排序（表头点击，三态） / 全选（# 表头） ──────────────
   table.addEventListener('click', (e) => {
+    // 拖完列宽/行高后浏览器补发的 click：既不能排序，也不能触发「点 # 表头全选」
+    if (suppressClick) {
+      suppressClick = false;
+      return;
+    }
     if (e.target.closest('.resize') || e.target.closest('.rowresize')) return;
     const thAll = e.target.closest('thead th.rownum');
     if (thAll) {
@@ -359,7 +485,10 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
     const lines = [];
     for (let r = r1; r <= r2 && r < view.length; r++) {
       const cells = [];
-      for (let c = c1; c <= c2 && c < cols.length; c++) cells.push(cellText(view[r][c]));
+      for (let c = c1; c <= c2 && c < cols.length; c++) {
+        if (hiddenSet.has(cols[c].name)) continue;   // 隐藏列（如 rowid）不进复制内容
+        cells.push(cellText(view[r][c]));
+      }
       lines.push(cells.join('\t'));
     }
     e.clipboardData.setData('text/plain', lines.join('\n'));
@@ -367,16 +496,28 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
   });
 
   return {
-    setData(columns, dataRows) {
+    // opts.hidden：列名数组——这些列保留在数据与索引体系里（data-c 仍是数据索引），
+    // 但不出 colgroup/表头/单元格、不进复制内容（如数据浏览的 rowid 定位键）
+    setData(columns, dataRows, isDirty, opts) {
+      // 保留「同名同类型」列的宽度：翻页 / 排序 / 保存 / 重跑查询 / 换列集再换回来，都不冲掉用户调过的列宽
+      const prevCols = cols;
+      const prevWidths = widths;
+      prevCols.forEach((c, i) => widthMemo.set(colKey(c), prevWidths[i]));
       cols = columns || [];
       rows = dataRows || [];
+      dirtyFn = isDirty || null;
+      hiddenSet = new Set((opts && opts.hidden) || []);
+      visList = cols.map((_, i) => i).filter((i) => !hiddenSet.has(cols[i].name));
       checked = new Set();
       sel = null;
       firstVisible = 0;
       container.scrollTop = 0;
       view = rows;
       applySort();
-      widths = cols.map((_, c) => fitWidth(c));
+      widths = cols.map((c, i) => {
+        const remembered = widthMemo.get(colKey(c));
+        return remembered != null ? remembered : fitWidth(i);
+      });
       render();
       afterCheck();
     },
@@ -391,6 +532,8 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
       render();
       afterCheck();
     },
+    // 数据没换、只是暂存集变化时，重新应用脏标记
+    setDirtyFn(fn) { dirtyFn = fn || null; render(); },
     setSort(k) { sortKey = k; },
     // 行高 / 行号列宽复位（供自测与「恢复默认」用）
     resetLayout() {
@@ -401,7 +544,7 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
       render();
     },
     rowHeight: () => rowH,
-    clear() { cols = []; rows = []; view = []; widths = []; sel = null; checked = new Set(); render(); },
+    clear() { cols = []; rows = []; view = []; widths = []; sel = null; checked = new Set(); dirtyFn = null; hiddenSet = new Set(); visList = []; render(); },
     rowAt(i) { return view[i]; },
     rowCount: () => view.length,
     getChecked: () => [...checked].sort((a, b) => a - b),

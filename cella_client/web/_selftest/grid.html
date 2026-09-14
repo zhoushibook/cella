@@ -117,6 +117,157 @@ ok('行高已写入 CSS 变量', host3.querySelector('table').style.getPropertyV
 g3.resetLayout();
 ok('resetLayout 复位行高 26', g3.rowHeight() === 26);
 
+// ⑩ 回归：拖列宽/行高后浏览器补发的 click，不能当成「点列头排序」或「点 # 全选」
+const sortsBefore = sorts.length;
+host.querySelector('th[data-col="score"] .resize').dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: 100, clientY: 0 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 130, clientY: 0, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+host.querySelector('th[data-col="score"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+ok('拖列宽后的尾随 click 不触发排序（sorts=' + sorts.length + '）', sorts.length === sortsBefore);
+ok('拖列宽后的尾随 click 不清掉列宽 ' + colEl(2).style.width, parseInt(colEl(2).style.width, 10) === 96);
+g.clearSelection();
+host.querySelector('th.rownum .rowresize').dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: 0, clientY: 0 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 0, clientY: 10, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+host.querySelector('th.rownum').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+ok('拖行高后的尾随 click 不触发全选', host.querySelectorAll('td[data-c].sel').length === 0);
+ok('行高保持拖后的值 ' + g.rowHeight(), g.rowHeight() === 36);
+
+// ⑪ setData（翻页 / 排序 / 保存 / 重跑查询都会走这里）保留手动列宽
+const wName = colEl(1).style.width;
+g.setData(cols, rows);
+ok('setData 后手动列宽保留（' + wName + ' → ' + colEl(1).style.width + '）', colEl(1).style.width === wName);
+g.setData([{ name: 'other', type: 'INT' }], [[1]]);
+ok('换成别的列则重新自适应', colEl(0).style.width !== wName);
+g.setData(cols, rows);
+ok('换回来仍能按列名找回宽度 ' + colEl(1).style.width, colEl(1).style.width === wName);
+
+// ⑫ 回归：mousedown 选区只改类名、不重建表格 DOM。
+// 整表重建会让第二次点击落在新的 td 实例上，浏览器 dblclick 计数（detail）到不了 2，
+// 双击进入单元格编辑就永远不触发（真实浏览器才有的问题，直接派发 dblclick 测不出来）。
+g.clearSelection();
+const td0 = host.querySelector('tr[data-r="0"] td[data-c="0"]');
+td0.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+ok('mousedown 高亮选区', td0.classList.contains('sel'));
+ok('mousedown 不重建表格 DOM（元素身份不变）',
+  td0.isConnected && host.querySelector('tr[data-r="0"] td[data-c="0"]') === td0);
+// 完整两次点击序列后，dblclick 仍派发到同一个 td 上且能冒泡到容器
+td0.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+td0.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+td0.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+td0.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+td0.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+ok('两次点击后 td 实例仍未替换', host.querySelector('tr[data-r="0"] td[data-c="0"]') === td0);
+let dblSeen = false;
+host.addEventListener('dblclick', () => { dblSeen = true; }, { once: true });
+td0.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+ok('dblclick 冒泡到容器（编辑入口可达）', dblSeen);
+
+// ⑬ 脏标记（暂存编辑）：dirtyFn 返回 kind（dirty/deleted/inserted），c=-1 表示整行
+g.setData(cols, rows, (r, c) => (r === 1 && (c === -1 || c === 1) ? 'dirty' : null));
+ok('暂存格有 dirty 类', !!host.querySelector('tr[data-r="1"] td[data-c="1"].dirty'));
+ok('行号格有 dirty 类（左缘色条）', !!host.querySelector('tr[data-r="1"] td.rownum.dirty'));
+ok('未修改列无标记', !host.querySelector('tr[data-r="1"] td[data-c="0"].dirty'));
+g.setData(cols, rows, (r) => (r === 0 ? 'deleted' : null));
+ok('删除行样式（划线）', !!host.querySelector('tr[data-r="0"] td[data-c="1"].deleted'));
+g.setData(cols, rows, (r) => (r === 2 ? 'inserted' : null));
+ok('新增行样式', !!host.querySelector('tr[data-r="2"] td[data-c="0"].inserted'));
+g.setData(cols, rows);
+ok('清除后无标记', !host.querySelector('.grid .dirty, .grid .deleted, .grid .inserted'));
+
+// ⑭ 任意单元格交界可拖拽（Excel 式）：右缘 = 列宽，下缘 = 行高，行号格右缘 = 行号列宽
+g.clearSelection();
+const nearRect = (el, side, back = 2) => {
+  const r = el.getBoundingClientRect();
+  return side === 'r' ? { x: r.right - back, y: r.top + 3 } : { x: r.left + 5, y: r.bottom - back };
+};
+const tdA = host.querySelector('tr[data-r="0"] td[data-c="0"]');
+// 光标提示
+tdA.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: nearRect(tdA, 'r').x, clientY: nearRect(tdA, 'r').y }));
+ok('悬停单元格右缘出现 col-resize 光标', host.querySelector('table').style.cursor === 'col-resize');
+tdA.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: nearRect(tdA, 'r').x, clientY: nearRect(tdA, 'r').y }));
+ok('悬停交界出现高亮（edge-r）', !!host.querySelector('td.edge-r') && !host.querySelector('td.edge-b'));
+const ra = tdA.getBoundingClientRect();
+tdA.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: ra.left + ra.width / 2, clientY: ra.top + 3 }));
+ok('离开交界光标恢复且高亮消失（cursor=' + JSON.stringify(host.querySelector('table').style.cursor) + '）',
+  host.querySelector('table').style.cursor === '' && !host.querySelector('td.edge-r'));
+// 右缘拖列宽：只改 colgroup、不重建 DOM、不产生选区
+const wa0 = wOf(0);
+tdA.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: nearRect(tdA, 'r').x, clientY: nearRect(tdA, 'r').y, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: nearRect(tdA, 'r').x + 45, clientY: nearRect(tdA, 'r').y, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+ok('单元格右缘拖列宽 ' + wa0 + ' → ' + wOf(0), wOf(0) === wa0 + 45);
+// 左缘 = 上一列的右边界（等效命中带加倍）
+const wb0 = wOf(0);
+const tdB0 = host.querySelector('tr[data-r="0"] td[data-c="1"]');
+const lb = tdB0.getBoundingClientRect();
+tdB0.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: lb.left + 2, clientY: lb.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: lb.left + 2 + 20, clientY: lb.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+ok('下一列左缘拖同一交界 ' + wb0 + ' → ' + wOf(0), wOf(0) === wb0 + 20);
+// 首数据列左缘 = 行号列右边界
+const rnColL = host.querySelectorAll('colgroup col')[1];
+const rn0L = parseInt(rnColL.style.width, 10);
+const tdC0 = host.querySelector('tr[data-r="0"] td[data-c="0"]');
+const lc = tdC0.getBoundingClientRect();
+tdC0.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: lc.left + 2, clientY: lc.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: lc.left + 2 - 12, clientY: lc.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+ok('首数据列左缘拖行号列宽 ' + rn0L + ' → ' + parseInt(rnColL.style.width, 10), parseInt(rnColL.style.width, 10) === rn0L - 12);
+ok('交界拖拽不重建 DOM（td 实例不变）', host.querySelector('tr[data-r="0"] td[data-c="0"]') === tdA);
+ok('交界拖拽不产生选区', !host.querySelector('td.sel'));
+tdA.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+ok('交界拖拽的尾随 click 无副作用（仍无选区）', !host.querySelector('td.sel'));
+// 下缘拖行高（⑩ 后行高 = 36）
+const rh0 = g.rowHeight();
+const tdB = host.querySelector('tr[data-r="1"] td[data-c="1"]');
+tdB.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: nearRect(tdB, 'b').x, clientY: nearRect(tdB, 'b').y }));
+ok('悬停单元格下缘出现 row-resize 光标', host.querySelector('table').style.cursor === 'row-resize');
+tdB.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: nearRect(tdB, 'b').x, clientY: nearRect(tdB, 'b').y, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: nearRect(tdB, 'b').x, clientY: nearRect(tdB, 'b').y + 8, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+ok('单元格下缘拖行高 ' + rh0 + ' → ' + g.rowHeight(), g.rowHeight() === rh0 + 8);
+// 行号格右缘 = 行号列宽
+const rnTd = host.querySelector('tr[data-r="0"] td.rownum');
+const rnCol = host.querySelectorAll('colgroup col')[1];
+const rn0 = parseInt(rnCol.style.width, 10);
+rnTd.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: nearRect(rnTd, 'r').x, clientY: nearRect(rnTd, 'r').y, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: nearRect(rnTd, 'r').x + 10, clientY: nearRect(rnTd, 'r').y, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+ok('行号格右缘拖行号列宽 ' + rn0 + ' → ' + parseInt(rnCol.style.width, 10), parseInt(rnCol.style.width, 10) === rn0 + 10);
+// 交界拖拽后双击仍能进编辑（dblclick 冒泡不被拖拽路径吞掉）。
+// 注意：行高拖拽会 render() 重建 DOM，须重新取节点（列宽拖拽只改 colgroup，不重建）。
+let dblCell = false;
+host.addEventListener('dblclick', () => { dblCell = true; }, { once: true });
+const tdA2 = host.querySelector('tr[data-r="0"] td[data-c="0"]');
+ok('行高拖拽后仍是同一网格内容（新 td 已就位）', !!tdA2 && tdA2 !== tdA);
+tdA2.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+ok('交界处双击仍冒泡（编辑入口可达）', dblCell);
+g.resetLayout();
+
+// ⑮ 隐藏列（数据浏览的 rowid）：定位键参与数据/索引体系，但不展示、不进复制
+const colsH = [{ name: 'rowid', type: 'INT64' }, { name: 'id', type: 'INT32' }, { name: 'v', type: 'VARCHAR' }];
+const rowsH = [[196608, 1, 'a'], [196609, 2, 'b']];
+g.setData(colsH, rowsH, null, { hidden: ['rowid'] });
+ok('隐藏列不出 colgroup/表头/单元格',
+  host.querySelectorAll('colgroup col').length === 4 &&          // ck + rownum + 2 个可见数据列
+  !host.querySelector('th[data-col="rowid"]') && !host.querySelector('td[data-c="0"]'));
+ok('其余列 data-c 仍是数据索引（v = data-c 2）',
+  !!host.querySelector('td[data-c="2"]') && host.querySelector('tr[data-r="0"] td[data-c="2"]').textContent === 'a');
+g.clearSelection();
+host.querySelector('tr[data-r="0"] td[data-c="2"]').dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+host.querySelector('tr[data-r="1"] td[data-c="2"]').dispatchEvent(new MouseEvent('mousemove', { bubbles: true, buttons: 1 }));
+const dtH = new DataTransfer();
+document.dispatchEvent(new ClipboardEvent('copy', { clipboardData: dtH, bubbles: true }));
+ok('复制不含隐藏列（' + JSON.stringify(dtH.getData('text/plain')) + '）', dtH.getData('text/plain') === 'a\nb');
+host.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true }));
+ok('Ctrl+A 只选中可见格（4 格）', host.querySelectorAll('td[data-c].sel').length === 4);
+g.setData(colsH, rowsH, (r, c) => (r === 1 && c === 2 ? 'dirty' : null), { hidden: ['rowid'] });
+ok('脏标记按数据索引命中隐藏列之外的列', !!host.querySelector('td[data-c="2"].dirty'));
+g.setData(cols, rows);
+ok('不带 hidden 恢复完整展示（id 列回来到 data-c 0）',
+  !!host.querySelector('th[data-col="id"]') && host.querySelectorAll('td[data-c="0"]').length === 3);
+
 document.getElementById('out').textContent = L.join('\n');
 </script>
 </body></html>
