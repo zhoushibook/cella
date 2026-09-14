@@ -125,12 +125,22 @@ uint16_t CatalogTable::MaxLenAt(size_t index) const {
 }
 
 int CatalogTable::PrimaryKeyColumnIndex() const {
+  // 仅在「单列主键」时返回下标；无主键或复合主键返回 -1 ——
+  // 所有单列主键索引（<table>_pk）相关路径据此自动跳过复合主键表。
+  const std::vector<int> cols = PrimaryKeyColumns();
+  return cols.size() == 1 ? cols[0] : -1;
+}
+
+std::vector<int> CatalogTable::PrimaryKeyColumns() const {
+  // 复合主键的列序 = 列声明序（本方言没有索引键序问题：唯一性是集合性质；
+  // 主键暂不建索引，见 PLAN_primary_key_rowid 的「约束不是加速器」取舍）
+  std::vector<int> out;
   for (size_t i = 0; i < columns.size(); ++i) {
     if (columns[i].primary_key) {
-      return static_cast<int>(i);
+      out.push_back(static_cast<int>(i));
     }
   }
-  return -1;
+  return out;
 }
 
 // ── CatalogManager：系统表 ─────────────────────────────────
@@ -870,8 +880,21 @@ std::string CatalogManager::DescribeTable(const std::string& name) const {
   }
   std::ostringstream os;
   os << t->name << " (表号 #" << t->table_id << ", 首数据页 " << t->first_page_id;
-  if (t->PrimaryKeyColumnIndex() >= 0) {
-    os << ", 主键 " << t->columns[static_cast<size_t>(t->PrimaryKeyColumnIndex())].name;
+  const std::vector<int> pk_cols = t->PrimaryKeyColumns();
+  if (!pk_cols.empty()) {
+    os << ", 主键 ";
+    if (pk_cols.size() == 1) {
+      os << t->columns[static_cast<size_t>(pk_cols[0])].name;
+    } else {
+      os << "(";
+      for (size_t i = 0; i < pk_cols.size(); ++i) {
+        if (i != 0) {
+          os << ", ";
+        }
+        os << t->columns[static_cast<size_t>(pk_cols[i])].name;
+      }
+      os << ")";
+    }
   }
   os << ")\n";
   for (size_t i = 0; i < t->columns.size(); ++i) {

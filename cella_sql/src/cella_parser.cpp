@@ -268,6 +268,44 @@ namespace cella
                     return nullptr;
                 for (;;)
                 {
+                    // 表级主键：PRIMARY KEY ( col { ',' col } )。只能出现在某个列定义之后
+                    //（首位出现会因零列在语义阶段报「主键列不存在」），且之后只允许收尾。
+                    if (peek().keyword == CELLA_Keyword::PRIMARY)
+                    {
+                        const CELLA_Token &pkTok = peek();
+                        if (!st->tablePrimaryKey.empty())
+                        {
+                            synError(pkTok, "表级主键重复定义");
+                            return nullptr;
+                        }
+                        advance(); // PRIMARY
+                        if (!expectKw(CELLA_Keyword::KEY))
+                            return nullptr;
+                        if (!expectDelim("("))
+                            return nullptr;
+                        st->tablePkLine = pkTok.line;
+                        st->tablePkCol = pkTok.col;
+                        do
+                        {
+                            std::string col;
+                            if (!expectIdent(col))
+                                return nullptr;
+                            st->tablePrimaryKey.push_back(std::move(col));
+                        } while (matchDelim(","));
+                        if (!expectDelim(")"))
+                            return nullptr;
+                        if (matchDelim(","))
+                        {
+                            synError(peek(), "表级主键之后不应再有列定义或约束");
+                            return nullptr;
+                        }
+                        if (!expectDelim(")"))
+                            return nullptr;
+                        if (!expectSemicolon())
+                            return nullptr;
+                        return st;
+                    }
+
                     CELLA_ColumnDef cd;
                     const CELLA_Token &idTok = peek();
                     if (!expectIdent(cd.name))

@@ -561,6 +561,9 @@ namespace cella::db
   //   * 重启后随 LoadIndexesFromStorage 恢复
   //   * DROP TABLE 时被 DeleteIndexesOfTable 级联清理
   //   * DML 时被 ExecInsert/ExecUpdate/ExecDelete 的索引维护统一覆盖
+  // 注意：**复合主键**（表级 PRIMARY KEY (a, b)）不在此建索引 —— B+ 树当前
+  // 只支持单列键（KeySpec 单列），复合主键的唯一性由 INSERT/UPDATE 的
+  // 扫描式查重保证（见 ExecInsert/ExecUpdate 的 pk_cols 路径）。
   DbStatus Executor::CreatePrimaryIndex(const CatalogTable &table)
   {
     const int pk_idx = table.PrimaryKeyColumnIndex();
@@ -945,9 +948,11 @@ namespace cella::db
     // ── 主键唯一性：先一次性收集已有行的键，插入过程中累积比对 ──
     // 语句内累积（而不是逐行重扫）避免批量插入退化为 O(N²)；冲突即返回，
     // 语句级回滚会撤销本语句已插入的行。
-    const int pk_idx = meta->PrimaryKeyColumnIndex();
+    // 复合主键（表级 PRIMARY KEY (a, b)）没有主键索引，走这里的扫描式查重；
+    // 单列主键另有 <table>_pk B+ 树做索引级唯一（见 P1.5），二者语义一致。
+    const std::vector<int> pk_cols = meta->PrimaryKeyColumns();
     std::set<std::string> pk_keys;
-    if (pk_idx >= 0)
+    if (!pk_cols.empty())
     {
       std::vector<std::pair<storage::Rid, storage::Record>> existing;
       const DbStatus ss = ScanMatching(*meta, nullptr, ctx.with_rowid, &existing);
@@ -957,7 +962,7 @@ namespace cella::db
       }
       for (const auto &er : existing)
       {
-        pk_keys.insert(KeyOfRow(er.second.values(), std::vector<int>{pk_idx}));
+        pk_keys.insert(KeyOfRow(er.second.values(), pk_cols));
       }
     }
 
@@ -1010,14 +1015,30 @@ namespace cella::db
         rec.AddValue(std::move(coerced));
       }
 
-      if (pk_idx >= 0)
+      if (!pk_cols.empty())
       {
-        const std::string key = KeyOfRow(rec.values(), std::vector<int>{pk_idx});
+        const std::string key = KeyOfRow(rec.values(), pk_cols);
         if (!pk_keys.insert(key).second)
         {
+          if (pk_cols.size() == 1)
+          {
+            return DbStatus::Error(DbCode::kPrimaryKeyViolation,
+                                   "主键冲突: 列 " +
+                                       meta->columns[static_cast<size_t>(pk_cols[0])].name +
+                                       " 的值已存在（表 " + name + "）");
+          }
+          std::string cols_text;
+          for (size_t i = 0; i < pk_cols.size(); ++i)
+          {
+            if (i != 0)
+            {
+              cols_text += ", ";
+            }
+            cols_text += meta->columns[static_cast<size_t>(pk_cols[i])].name;
+          }
           return DbStatus::Error(DbCode::kPrimaryKeyViolation,
-                                 "主键冲突: 列 " + meta->columns[static_cast<size_t>(pk_idx)].name +
-                                     " 的值已存在（表 " + name + "）");
+                                 "主键冲突: 列组 (" + cols_text +
+                                     ") 的组合值已存在（表 " + name + "）");
         }
       }
 
@@ -2472,11 +2493,14 @@ namespace cella::db
     // ── 主键唯一性（仅当更新涉及主键列时检查）──
     // 语义是「把命中行的主键值改成新值」：新值不能与**未命中行**冲突，
     // 命中行之间也不能改成同一个新值；「排除自身」用命中 Rid 集合实现。
-    const int pk_idx = meta->PrimaryKeyColumnIndex();
+    // 复合主键（表级 PRIMARY KEY (a, b)，无主键索引）与单列主键走同一条扫描查重，
+    // 差别仅在「涉及主键列」的判定是集合包含而非相等。
+    const std::vector<int> pk_cols = meta->PrimaryKeyColumns();
     bool pk_assigned = false;
     for (const auto &a : assigns)
     {
-      if (a.index == pk_idx && pk_idx >= 0)
+      if (!pk_cols.empty() &&
+          std::find(pk_cols.begin(), pk_cols.end(), a.index) != pk_cols.end())
       {
         pk_assigned = true;
       }
@@ -2502,7 +2526,7 @@ namespace cella::db
         {
           continue;
         }
-        pk_taken.insert(KeyOfRow(row.second.values(), std::vector<int>{pk_idx}));
+        pk_taken.insert(KeyOfRow(row.second.values(), pk_cols));
       }
     }
 
@@ -2546,13 +2570,11 @@ namespace cella::db
 
       if (pk_assigned)
       {
-        const std::string key = KeyOfRow(fresh.values(), std::vector<int>{pk_idx});
+        const std::string key = KeyOfRow(fresh.values(), pk_cols);
         if (!pk_taken.insert(key).second)
         {
           return DbStatus::Error(DbCode::kPrimaryKeyViolation,
-                                 "主键冲突: 更新后的 " +
-                                     meta->columns[static_cast<size_t>(pk_idx)].name +
-                                     " 值与其它行重复（表 " + name + "）");
+                                 "主键冲突: 更新后的主键值与其它行重复（表 " + name + "）");
         }
       }
 

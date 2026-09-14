@@ -557,14 +557,71 @@ namespace cella
                         "rowid 是每张表都有的只读伪列，不能用作列名（表 \"" + st.tableName + "\"）"));
                     return false;
                 }
-                if (cd.primaryKey && ++primary_key_count > 1)
+                if (cd.primaryKey)
                 {
-                    res.errors.push_back(cella_makeError(
-                        CELLA_Phase::SEM, "SEM-313", cd.line, cd.col,
-                        "表 \"" + st.tableName + "\" 定义了多个主键（本方言只支持列级单列主键）"));
-                    return false;
+                    ++primary_key_count;
                 }
             }
+
+            // ── 主键仲裁：列级与表级互斥，二选一 ──────────────────
+            if (!st.tablePrimaryKey.empty())
+            {
+                if (primary_key_count > 0)
+                {
+                    res.errors.push_back(cella_makeError(
+                        CELLA_Phase::SEM, "SEM-313", st.tablePkLine, st.tablePkCol,
+                        "表 \"" + st.tableName + "\" 同时定义了列级主键与表级主键（二选一）"));
+                    return false;
+                }
+                std::set<std::string> pk_seen;
+                // st 是解析器为本语句新建的 AST（编译期独享、无共享），标记表级主键需要
+                // 回写列旗标 —— const 收敛在这一处。标记后，NOT NULL 隐含、目录编码、
+                // 计划/语句打印全部复用列级主键的既有路径，无需任何特判。
+                auto &mutable_st = const_cast<CELLA_Stmt &>(st);
+                for (const auto &pkName : st.tablePrimaryKey)
+                {
+                    const std::string pkKey = cella_toUpper(pkName);
+                    CELLA_ColumnDef *target = nullptr;
+                    for (auto &cd : mutable_st.columns)
+                    {
+                        if (cella_toUpper(cd.name) == pkKey)
+                        {
+                            target = &cd;
+                            break;
+                        }
+                    }
+                    if (target == nullptr)
+                    {
+                        res.errors.push_back(cella_makeError(
+                            CELLA_Phase::SEM, "SEM-303", st.tablePkLine, st.tablePkCol,
+                            "主键列 \"" + pkName + "\" 在表 \"" + st.tableName + "\" 中不存在"));
+                        return false;
+                    }
+                    if (!pk_seen.insert(pkKey).second)
+                    {
+                        res.errors.push_back(cella_makeError(
+                            CELLA_Phase::SEM, "SEM-304", st.tablePkLine, st.tablePkCol,
+                            "主键列 \"" + pkName + "\" 在 PRIMARY KEY 列表中重复"));
+                        return false;
+                    }
+                    target->primaryKey = true; // 复合主键 = 多列被标记；隐含 NOT NULL 走既有路径
+                }
+            }
+            else if (primary_key_count > 1)
+            {
+                // 多个列级 PRIMARY KEY：旧规则保留（复合主键请改用表级 PRIMARY KEY (a, b)）
+                for (const auto &cd : st.columns)
+                {
+                    if (cd.primaryKey && primary_key_count > 1)
+                    {
+                        res.errors.push_back(cella_makeError(
+                            CELLA_Phase::SEM, "SEM-313", cd.line, cd.col,
+                            "表 \"" + st.tableName + "\" 定义了多个列级主键（复合主键请用表级 PRIMARY KEY (a, b)）"));
+                        return false;
+                    }
+                }
+            }
+
             CELLA_Table table;
             table.name = st.tableName;
             for (const auto &cd : st.columns)

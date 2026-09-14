@@ -60,7 +60,9 @@ struct CatalogTable {
   const CatalogColumn* FindColumn(const std::string& column) const;
   // 存储层最大长度（CHAR/VARCHAR 截断用；TEXT/定长返回 0）
   uint16_t MaxLenAt(size_t index) const;
-  // 主键列下标；无主键返回 -1
+  // 主键列下标序列（按列声明序）；空 = 无主键。复合主键 = 多个下标。
+  std::vector<int> PrimaryKeyColumns() const;
+  // 单列主键下标；无主键**或复合主键**返回 -1（主键索引等单列路径据此跳过复合表）
   int PrimaryKeyColumnIndex() const;
 };
 

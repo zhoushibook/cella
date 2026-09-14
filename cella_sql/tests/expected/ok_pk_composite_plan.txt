@@ -1,0 +1,29 @@
+CreateTable
+  table: enroll
+  columns: sid INT NOT NULL PRIMARY KEY, cid INT NOT NULL PRIMARY KEY, grade FLOAT
+
+CreateTable
+  table: pair
+  columns: k VARCHAR(8) PRIMARY KEY, n INT PRIMARY KEY
+
+Insert
+  table: enroll
+  columns: sid, cid, grade
+  rows: [1, 10, 88.5]
+
+Insert
+  table: enroll
+  columns: sid, cid, grade
+  rows: [1, 11, 90.0], [2, 10, 75.0]
+
+Sort (sid ASC, cid ASC)
+  Project [sid, cid]
+    SeqScan [enroll]
+
+Update
+  table: enroll
+  sets: grade = 95.0
+  SeqScan [enroll]
+
+Delete (filter: sid = 2 AND cid = 10)
+  SeqScan [enroll]

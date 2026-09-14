@@ -113,7 +113,11 @@ powershell -ExecutionPolicy Bypass -File run_all.ps1
 ```sql
 CREATE TABLE s(id INT PRIMARY KEY, name VARCHAR(16) NOT NULL);
 CREATE TABLE c(code VARCHAR(8) NOT NULL PRIMARY KEY, title TEXT);  -- 约束顺序任意
+CREATE TABLE enroll(sid INT, cid INT, grade FLOAT, PRIMARY KEY (sid, cid));  -- 表级复合主键
 ```
+
+复合主键（表级）与列级主键互斥（`SEM-313`）；各主键列隐含 `NOT NULL`，组合值唯一
+（`DB-516`）。单列主键自动建唯一索引 `<表名>_pk`；复合主键暂不建索引，查重为扫描。
 
 每张表还有一个**只读伪列 `rowid`**（物理行标识，不透明整数），可用于投影 / 条件 / 排序：
 
@@ -248,7 +252,7 @@ engine.Close();
 .\build\cella_db\cella_db_tests.exe --log .\build\test_report.log
 ```
 
-当前：**108 用例 / 989 断言 / 0 失败**，明细见 [docs/TEST_REPORT.md](docs/TEST_REPORT.md)。
+当前：**194 用例 / 1525 断言 / 0 失败**，明细见 [docs/TEST_REPORT.md](docs/TEST_REPORT.md)。
 
 ---
 

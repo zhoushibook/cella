@@ -39,8 +39,11 @@ program          := { statement } EOF ;
 statement        := create_table_stmt | insert_stmt | get_stmt
                   | delete_stmt | update_stmt | drop_table_stmt ;
 
-create_table_stmt := CREATE TABLE table_name '(' column_def { ',' column_def } ')' ';' ;
+create_table_stmt := CREATE TABLE table_name '(' column_def { ',' column_def }
+                     [ table_primary_key ] ')' ';' ;
 column_def        := column_name data_type { NOT NULL | PRIMARY KEY } ;   % 两个约束可任意顺序
+table_primary_key := PRIMARY KEY '(' column_name { ',' column_name } ')' ;
+                     % 表级复合主键；与列级主键互斥（SEM-313），且只能紧跟列定义列表之后
 data_type         := INT | INTEGER | FLOAT | DOUBLE
                    | CHAR [ '(' uint ')' ] | VARCHAR [ '(' uint ')' ] | TEXT
                    | DATE | TIME | DATETIME ;       % CHAR/VARCHAR 省略长度默认 255
@@ -122,11 +125,14 @@ const_expr  := NUMBER | STRING | DATE | NULL | TRUE | FALSE ;
 
 **主键（PRIMARY KEY）语义**：
 
-+ 只支持**列级单列主键**；一张表至多一个，重复声明报 `SEM-313`。
-+ 主键**隐含 NOT NULL**（写入 NULL 由 `SEM-307` 拦在编译期）。
++ 两种写法：**列级** `id INT PRIMARY KEY`（单列，至多一个），**表级** `PRIMARY KEY (a, b [, ...])`
+  （可复合；与列级互斥，同时定义报 `SEM-313`）。表级主键的列序 = 列声明序。
++ 主键各列**隐含 NOT NULL**（写入 NULL 由 `SEM-307` 拦在编译期）；表级主键引用不存在的列
+  报 `SEM-303`，列表内重复报 `SEM-304`。
 + 唯一性由执行层在 INSERT/UPDATE 时校验，冲突报 `DB-516`；未命中行不受影响，
-+  更新主键列时「排除自身」（允许把主键改回自己原值）。
-+ 主键**不建索引**：查重是 O(n) 扫描（教学规模可接受），因此它是「约束」不是「加速器」。
+  更新主键列时「排除自身」（允许把主键改回自己原值）。
++ 索引支撑：**单列主键**自动建唯一索引 `<table>_pk`（B+ 树）；**复合主键**暂不建索引，
+  查重是 O(n) 扫描（教学规模可接受）—— 它是「约束」，加速另立项。
 
 **优先级与结合性（实现为准）**：
 

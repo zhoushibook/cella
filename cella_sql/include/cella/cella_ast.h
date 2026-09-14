@@ -185,6 +185,10 @@ namespace cella
 
         // CREATE TABLE
         std::vector<CELLA_ColumnDef> columns;
+        // 表级主键：PRIMARY KEY (a, b [, ...])。与列级主键互斥（SEM-313）；
+        // 语义阶段把命中的列标记 primaryKey，后续流程（目录/执行/打印）复用列级机制。
+        std::vector<std::string> tablePrimaryKey;
+        int tablePkLine = 0, tablePkCol = 0;
 
         // INSERT
         std::vector<std::string> insertColumns; // 空 = 省略列清单
