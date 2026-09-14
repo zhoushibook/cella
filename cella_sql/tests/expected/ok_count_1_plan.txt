@@ -1,0 +1,32 @@
+CreateTable
+  table: sale
+  columns: id INT, region VARCHAR(255), amount INT
+
+Insert
+  table: sale
+  columns: id, region, amount
+  rows: [1, 'East', 100], [2, 'East', NULL], [3, 'West', 200], [4, 'West', 300], [5, 'North', NULL]
+
+Project [COUNT(*)]
+  Aggregate (no group key) aggs: COUNT(*)
+    SeqScan [sale]
+
+Project [COUNT(amount)]
+  Aggregate (no group key) aggs: COUNT(amount)
+    SeqScan [sale]
+
+Sort (region ASC)
+  Project [region, COUNT(*)]
+    Aggregate (grouped: region) aggs: COUNT(*)
+      SeqScan [sale]
+
+Sort (region ASC)
+  Project [region, COUNT(amount)]
+    Aggregate (grouped: region) aggs: COUNT(amount)
+      SeqScan [sale]
+
+Limit (2)
+  Sort (region ASC)
+    Project [region, COUNT(*), COUNT(amount)]
+      Aggregate (grouped: region) aggs: COUNT(*), COUNT(amount)
+        SeqScan [sale]

@@ -976,6 +976,10 @@ namespace cella
                 {
                     return parseLiteral();
                 }
+                if (t.type == CELLA_TokenType::KEYWORD && t.keyword == CELLA_Keyword::COUNT)
+                {
+                    return parseAggregate();
+                }
                 if (t.type == CELLA_TokenType::IDENTIFIER)
                 {
                     auto e = std::make_unique<CELLA_Expr>();
@@ -1004,6 +1008,38 @@ namespace cella
                 }
                 synError(t, "表达式");
                 return nullptr;
+            }
+
+            // 聚合函数调用：COUNT ( * ) | COUNT ( [表.]列 )
+            std::unique_ptr<CELLA_Expr> parseAggregate()
+            {
+                const CELLA_Token &fn = peek();
+                auto e = std::make_unique<CELLA_Expr>();
+                e->kind = CELLA_Expr::Kind::AGGREGATE;
+                e->line = fn.line;
+                e->col = fn.col;
+                e->aggFunc = "COUNT";
+                advance(); // 吃掉函数名
+                if (!expectDelim("("))
+                    return nullptr;
+                if (matchOp("*"))
+                {
+                    e->aggStar = true;
+                    if (!expectDelim(")"))
+                        return nullptr;
+                    return e;
+                }
+                if (!expectIdent(e->column))
+                    return nullptr;
+                if (matchOp("."))
+                {
+                    e->table = e->column;
+                    if (!expectIdent(e->column))
+                        return nullptr;
+                }
+                if (!expectDelim(")"))
+                    return nullptr;
+                return e;
             }
 
             // 常量：NUMBER | STRING | DATE | NULL | TRUE | FALSE

@@ -21,8 +21,14 @@ get s.name, c.title in student s right join course c on s.cid = c.id ordered c.t
 -- 去重
 get distinct cid in student ordered cid asc;
 
--- 分组（本方言无聚合函数，GROUP BY 即按分组键去重）+ having
+-- 分组 + having（真 GROUP BY：投影只能是分组键或聚合函数）
 get cid in student grouped cid having cid = 1;
+
+-- 聚合：COUNT(*) 全表行数 / COUNT(col) 非 NULL 行数
+get count(*) in student;
+
+-- 分组聚合：每个分组的行数
+get cid, count(*) in student grouped cid ordered cid asc;
 
 -- 并集
 get name in student limit cid = 1 union get name in student limit cid = 2;

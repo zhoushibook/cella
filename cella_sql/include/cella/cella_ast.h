@@ -30,7 +30,8 @@ namespace cella
             LITERAL,
             COLUMN_REF,
             UNARY,
-            BINARY
+            BINARY,
+            AGGREGATE // COUNT(*) / COUNT(col)（P4；暂只此一种）
         };
         enum class UnOp
         {
@@ -74,6 +75,11 @@ namespace cella
         std::unique_ptr<CELLA_Expr> left;  // BINARY 左子树
         std::unique_ptr<CELLA_Expr> right; // BINARY 右子树
         std::unique_ptr<CELLA_Expr> child; // UNARY 子树
+
+        // AGGREGATE（COUNT）
+        bool aggStar = false;              // COUNT(*) → true；COUNT(col) → false
+        std::string aggFunc;               // 函数名原文，大写（目前恒为 "COUNT"）
+        // 复用 column/table 字段承载 COUNT(col) 的列引用
     };
 
     // ---------------- 结构 ----------------
@@ -144,6 +150,8 @@ namespace cella
         n->column = e.column;
         n->uop = e.uop;
         n->bop = e.bop;
+        n->aggStar = e.aggStar;
+        n->aggFunc = e.aggFunc;
         if (e.left)
             n->left = cella_cloneExpr(*e.left);
         if (e.right)

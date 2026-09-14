@@ -93,9 +93,22 @@ comparison  := add [ ( '=' | '==' | '!=' | '<>' | '<' | '<=' | '>' | '>=' ) add 
 add         := mul { ( '+' | '-' ) mul } ;
 mul         := unary { ( '*' | '/' ) unary } ;
 unary       := '-' unary | primary ;
-primary     := const_expr | col_name | '(' expr ')' ;
+primary     := const_expr | col_name | aggregate | '(' expr ')' ;
+aggregate   := COUNT '(' ( '*' | col_name ) ')' ;        % P4；目前仅 COUNT
 const_expr  := NUMBER | STRING | DATE | NULL | TRUE | FALSE ;
 ```
+
+**聚合与分组（P4）**：
+
++ 目前唯一支持的聚合函数是 `COUNT(*)` / `COUNT(col)`（`COUNT` 已进保留字表）。
++ `COUNT(*)` 计全部行（含 NULL 列）；`COUNT(col)` **只计非 NULL 值**（SQL 标准语义）。
++ 出现聚合或 `grouped` 时，`select_list` 的每一项**要么是聚合函数、要么是分组键**：
+  - 违反者报 `SEM-322`（列既不在 GROUP BY 也不是聚合函数）；
+  - SELECT 项是复杂表达式（非纯列引用）且非聚合 → 报 `SEM-321`。
++ 无 `grouped` 但含聚合 → **全表聚合为单行**；空表 `COUNT(*)` 返回 `0`（结果集非空）。
++ `HAVING` 中**暂不支持**聚合函数，出现即报 `SEM-320`（P4 范围外，留待后续）。
++ `get id, grp in t grouped grp;` 这类"投影非分组列"的写法在旧实现里是
+  「去重保留首行」，现按标准 SQL 语义**拒绝**；只投影分组键即可得到每组一行。
 
 **rowid 伪列（只读）**：
 
@@ -154,14 +167,17 @@ const_expr  := NUMBER | STRING | DATE | NULL | TRUE | FALSE ;
   `CELLA_OrderItem{col,asc}`。
 - 表达式 `CELLA_Expr`（tagged struct，含 `line/col`）：
   `LiteralExpr{lit,text,num,boolVal}`、`ColumnRefExpr{table?,column}`、
-  `UnaryExpr{uop∈{NEG,NOT},child}`、`BinaryExpr{bop∈{EQ,NE,LT,LE,GT,GE,PLUS,MINUS,MUL,DIV,AND,OR},left,right}`。
+  `UnaryExpr{uop∈{NEG,NOT},child}`、`BinaryExpr{bop∈{EQ,NE,LT,LE,GT,GE,PLUS,MINUS,MUL,DIV,AND,OR},left,right}`、
+  `AggregateExpr{aggFunc,aggStar,table?,column?}`（P4；`aggStar=true` 表示 `COUNT(*)`）。
 - 每个节点携带源位置（行:列，1 起），供语义错误与诊断定位。
 
 ## 7. Plan 节点结构
 
 - `CELLA_PlanNode{op, detail, extra[], line, col, pred?, onExpr?, joinKind?, children[]}`。
 - 算子：`CreateTable` `Insert` `Delete(filter)` `SeqScan` `Filter(pred)` `Project` `Sort` `Limit`
-  `Page(page,size,offset)` `Aggregate(grouped)` `Join(kind,on)` `Union` `Distinct` `Update` `DropTable`。
+  `Page(page,size,offset)` `Aggregate(grouped, aggs)` `Join(kind,on)` `Union` `Distinct` `Update` `DropTable`。
+  `Aggregate` 的 `detail` 形如 `(grouped: region) aggs: COUNT(*), COUNT(amount)`；
+  无分组键时 `detail` 为 `(no group key)`。
 - 转换规则：`get ... in t limit c` → `Project → Filter(c) → SeqScan(t)`；
   无条件 `delete` → `Delete → SeqScan`；`get *` 省略 Project；
   查询自下而上：SeqScan → Join → Filter(limit) → Aggregate → Filter(having) → Project → Distinct → Sort → Limit(among) → Union。

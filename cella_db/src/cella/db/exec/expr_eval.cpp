@@ -144,6 +144,31 @@ DbStatus ExprEval::Eval(const cella::CELLA_Expr& expr, const EvalRow& row, stora
       return DbStatus::Ok();
     }
 
+    case cella::CELLA_Expr::Kind::AGGREGATE: {
+      // 聚合函数在 OpAggregate 里已经算完，并作为一列出现在输入行中；
+      // 这里只需按「与 OpAggregate 完全一致的列名」取回该列的值。
+      if (row.fields == nullptr || row.values == nullptr) {
+        return DbStatus::Error(DbCode::kInternal, "聚合求值缺少行上下文");
+      }
+      const std::string fn = expr.aggFunc.empty() ? "COUNT" : expr.aggFunc;
+      const std::string want =
+          expr.aggStar
+              ? fn + "(*)"
+              : fn + "(" + (expr.table.empty() ? expr.column : expr.table + "." + expr.column) + ")";
+      const std::string want_up = cella::cella_toUpper(want);
+      for (size_t i = 0; i < row.fields->size(); ++i) {
+        if (cella::cella_toUpper((*row.fields)[i].name) == want_up) {
+          if (i >= row.values->size()) {
+            return DbStatus::Error(DbCode::kInternal, "行值与字段数不一致");
+          }
+          *out = (*row.values)[i];
+          return DbStatus::Ok();
+        }
+      }
+      return DbStatus::Error(DbCode::kColumnNotFound,
+                             "聚合结果列不存在: " + want + "（OpAggregate 未产出该列）");
+    }
+
     case cella::CELLA_Expr::Kind::UNARY: {
       if (!expr.child) {
         return DbStatus::Error(DbCode::kInternal, "一元表达式缺少子节点");
@@ -342,6 +367,14 @@ std::string ExprEval::OutputName(const cella::CELLA_Expr& expr, const std::strin
   // 带限定符的引用（"s.name"）在排序/分组解析时会退化按列名匹配，见 Executor。
   if (expr.kind == cella::CELLA_Expr::Kind::COLUMN_REF) {
     return expr.column;
+  }
+  // 聚合列：与 OpAggregate 产出的列名保持一致，否则上层取不回该列
+  if (expr.kind == cella::CELLA_Expr::Kind::AGGREGATE) {
+    const std::string fn = expr.aggFunc.empty() ? "COUNT" : expr.aggFunc;
+    if (expr.aggStar) {
+      return fn + "(*)";
+    }
+    return fn + "(" + (expr.table.empty() ? expr.column : expr.table + "." + expr.column) + ")";
   }
   return cella::cella_exprToString(expr);
 }

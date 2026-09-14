@@ -215,7 +215,7 @@ MT_TEST(端到端_演示脚本_查询无失败) {
   MT_CHECK(!sql.empty());
   const ScriptReport r = e.Run(sql);
   MT_CHECK(r.all_ok());
-  MT_EQ(r.statements.size(), 19u);
+  MT_EQ(r.statements.size(), 21u);
   MT_EQ(r.statements[0].kind, std::string("CREATE TABLE"));
 #endif
 }

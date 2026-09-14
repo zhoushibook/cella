@@ -12,12 +12,13 @@
 
 | 套件 | 可执行文件 | 用例 | 断言 | 失败 | 退出码 |
 | --- | --- | --- | --- | --- | --- |
-| 编译器回归 | `cella_sql.exe` + `run_tests.ps1` | 33（正向 15 / 负向 18） | — （33 项文本比对） | 0 | 0 |
-| 存储层单元测试（原有） | `storage_tests.exe` | 30 | 4620 | 0 | 0 |
-| 整合层测试（新增） | `cella_db_tests.exe` | **108** | **989** | **0** | 0 |
-| 端到端脚本（新增） | `cella_db.exe` + `sql/*.sql` | 70 条语句 | — | 4（预期内） | — |
+| 编译器回归 | `cella_sql.exe` + `run_sql_tests.sh` | **42（正向 17 / 负向 25）** | — （42 项文本比对） | 0 | 0 |
+| 存储层单元测试（原有） | `storage_tests.exe` | 48 | 6605 | 0 | 0 |
+| 整合层测试 | `cella_db_tests.exe` | **125** | **1104** | **0** | 0 |
+| 客户端测试 | `cella_client_tests.exe` | 30 | 212 | 0 | 0 |
+| 端到端脚本 | `cella_db.exe` + `sql/*.sql` | 72 条语句 | — | 4（预期内） | — |
 
-**合计：171 个用例、5609 次断言、0 失败。**
+**合计：245 个用例、7921 次断言、0 失败。**
 
 `cella_db_tests.exe` 会把完整日志写到 `<build>/test_report.log`，便于留档比对。
 
@@ -69,7 +70,8 @@
 | `执行_建表与目录` | 建表/删表、重复建表报 SEM-302、删不存在报 SEM-301、首数据页补齐 |
 | `执行_插入与全表扫描` | 单行/多行插入、`get *` 全列输出 |
 | `执行_投影过滤排序与取前N` | 投影+过滤+排序、`among`、**ORDER BY 未投影列**、存储顺序 |
-| `执行_去重与分组` | `distinct`、`grouped`（分组去重）、`having` |
+| `执行_去重与分组` | `distinct`、真 `GROUP BY`（投影只能分组键/聚合）、`having`、非分组列报 SEM-322 |
+| `执行_COUNT聚合` | `COUNT(*)` / `COUNT(col)`（不计 NULL）、分组计数、空表 COUNT=0 |
 | `执行_连接三种方向` | middle / left / right join，未匹配侧补 NULL |
 | `执行_并集` | `union` |
 | `执行_分页` | `page` 越界返回空、`among + page` 组合 |
@@ -185,9 +187,9 @@
 | 脚本 | 语句数 | 成功 | 预期失败 | 内容 |
 | --- | --- | --- | --- | --- |
 | `sql/demo_basic.sql` | 15 | 12 | 3 | DDL/INSERT/GET/UPDATE/DELETE 全链路 + NOT NULL/类型/超长约束 + 语句级原子性 |
-| `sql/demo_query.sql` | 19 | 19 | 0 | middle/left/right join、distinct、grouped+having、union、among、page、表达式、常量折叠 |
+| `sql/demo_query.sql` | 21 | 21 | 0 | middle/left/right join、distinct、grouped+having、COUNT(*) 聚合、union、among、page、表达式、常量折叠 |
 | `sql/demo_txn.sql` | 36 | 35 | 1 | 提交/回滚（插入/更新/删除三类）、语句级原子性、DDL 隐式提交 |
-| **合计** | **70** | **66** | **4** | 4 处失败均为脚本刻意演示的错误路径 |
+| **合计** | **72** | **68** | **4** | 4 处失败均为脚本刻意演示的错误路径 |
 
 典型输出（`demo_basic.sql` 片段，验证运行期错误触发的语句级回滚）：
 

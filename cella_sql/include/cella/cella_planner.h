@@ -52,9 +52,10 @@ namespace cella
         std::vector<CELLA_ColName> sortKeys;
         std::vector<bool> sortAsc;
 
-        // Aggregate：分组列（GROUP BY 键）。本方言未定义聚合函数（COUNT/SUM/...），
-        // 执行层据此做「分组去重」——每个分组输出该组第一行。
+        // Aggregate：分组列（GROUP BY 键）+ 聚合表达式（P4：COUNT(*) / COUNT(col)）。
+        // 二者都空 → 非聚合节点；groupKeys 空但 aggs 非空 → 全表聚合为单行。
         std::vector<CELLA_ColName> groupKeys;
+        std::vector<std::unique_ptr<CELLA_Expr>> aggExprs;
 
         // Limit / Page：行数上限与分页偏移（-1 = 未指定）
         long long rowLimit = -1;

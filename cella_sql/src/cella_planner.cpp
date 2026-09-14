@@ -49,6 +49,20 @@ namespace cella
             return r.alias.empty() ? r.name : r.name + " " + r.alias;
         }
 
+        // 按投影顺序收集表达式中的聚合调用（P4：COUNT）。深拷贝入 out。
+        void collectAggregateExprs(const CELLA_Expr &e,
+                                   std::vector<std::unique_ptr<CELLA_Expr>> &out)
+        {
+            if (e.kind == CELLA_Expr::Kind::AGGREGATE)
+                out.push_back(cella_cloneExpr(e));
+            if (e.left)
+                collectAggregateExprs(*e.left, out);
+            if (e.right)
+                collectAggregateExprs(*e.right, out);
+            if (e.child)
+                collectAggregateExprs(*e.child, out);
+        }
+
         std::string colNameDisplay(const CELLA_ColName &cn)
         {
             return cn.table.empty() ? cn.column : cn.table + "." + cn.column;
@@ -79,14 +93,31 @@ namespace cella
                 node = wrapNode("Filter", "", std::move(node), st.line, st.col);
                 node->pred = cella_cloneExpr(*st.limit);
             }
-            if (!st.grouped.empty())
+            // 聚合 / 分组：出现聚合函数（COUNT）或显式 GROUP BY 时挂 Aggregate 节点。
+            // 无 GROUP BY 但有聚合 → 全表聚合成单行（groupKeys 为空，aggExprs 非空）。
+            std::vector<std::unique_ptr<CELLA_Expr>> aggExprs;
+            if (!st.star)
+            {
+                for (const auto &si : st.selectItems)
+                    collectAggregateExprs(*si.expr, aggExprs);
+            }
+            if (!st.grouped.empty() || !aggExprs.empty())
             {
                 std::vector<std::string> cols;
                 for (const auto &cn : st.grouped)
                     cols.push_back(colNameDisplay(cn));
-                node = wrapNode("Aggregate", "(grouped: " + joinStrs(cols, ", ") + ")", std::move(node),
-                                st.line, st.col);
+                std::string detail = st.grouped.empty() ? "(no group key)" : ("(grouped: " + joinStrs(cols, ", ") + ")");
+                if (!aggExprs.empty())
+                {
+                    std::vector<std::string> aggs;
+                    for (const auto &a : aggExprs)
+                        aggs.push_back(cella_exprToString(*a));
+                    detail += " aggs: " + joinStrs(aggs, ", ");
+                }
+                node = wrapNode("Aggregate", detail, std::move(node), st.line, st.col);
                 node->groupKeys = st.grouped;   // 执行期：分组键（detail 文本无法还原结构）
+                for (const auto &a : aggExprs)
+                    node->aggExprs.push_back(cella_cloneExpr(*a));
             }
             if (st.having)
             {

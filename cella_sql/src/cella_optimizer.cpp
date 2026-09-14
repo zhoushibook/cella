@@ -110,8 +110,10 @@ namespace cella
         // 表达式优化：常量折叠 + 布尔化简；hits 累计规则触发次数
         std::unique_ptr<CELLA_Expr> optimizeExpr(const CELLA_Expr &e, int &hits)
         {
-            // 字面量与列引用为叶子节点，直接拷贝
-            if (e.kind == CELLA_Expr::Kind::LITERAL || e.kind == CELLA_Expr::Kind::COLUMN_REF)
+            // 字面量、列引用、聚合调用为叶子节点，直接拷贝
+            // （聚合调用不能在编译期折叠：结果依赖运行时行的分布）
+            if (e.kind == CELLA_Expr::Kind::LITERAL || e.kind == CELLA_Expr::Kind::COLUMN_REF ||
+                e.kind == CELLA_Expr::Kind::AGGREGATE)
                 return cella_cloneExpr(e);
 
             if (e.kind == CELLA_Expr::Kind::UNARY)
@@ -276,6 +278,8 @@ namespace cella
             out->sortKeys = n.sortKeys;
             out->sortAsc = n.sortAsc;
             out->groupKeys = n.groupKeys;
+            for (const auto &a : n.aggExprs)
+                out->aggExprs.push_back(cella_cloneExpr(*a));
             out->rowLimit = n.rowLimit;
             out->pageOffset = n.pageOffset;
             out->pageSize = n.pageSize;
