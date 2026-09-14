@@ -297,7 +297,10 @@ function mountDataTab(pane, tab) {
   const bar = document.createElement('div');
   bar.className = 'databar';
   const gridwrap = document.createElement('div');
-  pane.append(bar, gridwrap);
+  // 底部编辑栏（Navicat 式）：改动先暂存，这里统一 提交 / 回退
+  const editbar = document.createElement('div');
+  editbar.className = 'editbar';
+  pane.append(bar, gridwrap, editbar);
 
   const grid = createGrid(gridwrap, {
     checkable: true,
@@ -306,16 +309,11 @@ function mountDataTab(pane, tab) {
       if (k) { tab.sort = k.col; tab.order = k.dir; } else { tab.sort = null; tab.order = 'asc'; }
       loadRows(tab);
     },
-    onCheckChange: (n) => {
-      const b = bar.querySelector('[data-act="del"]');
-      b.disabled = n === 0;
-      b.textContent = n ? `删除选中 (${n})` : '删除选中';
-    },
+    onCheckChange: () => updateEditBar(tab),
   });
+  tab.pending = { ins: [], upd: new Map(), del: new Map() };
 
   bar.innerHTML = `
-    <button class="btn" data-act="add">+ 新增行</button>
-    <button class="btn danger" data-act="del" disabled>删除选中</button>
     <button class="btn" data-act="reload">刷新</button>
     <span class="spacer"></span>
     <span class="pager">
@@ -332,9 +330,26 @@ function mountDataTab(pane, tab) {
       </select>
       <span data-act="total">共 … 行</span>
     </span>`;
-  bar.querySelector('[data-act="add"]').addEventListener('click', () => openInsertModal(tab));
-  bar.querySelector('[data-act="del"]').addEventListener('click', () => deleteChecked(tab));
   bar.querySelector('[data-act="reload"]').addEventListener('click', () => loadRows(tab));
+
+  editbar.innerHTML = `
+    <button class="btn" data-act="ins" title="新增一行（先暂存，提交时写入库）">+ 新增行</button>
+    <button class="btn danger" data-act="delSel" disabled title="把勾选的行标记删除（提交时写入库）">− 删除选中</button>
+    <button class="btn primary" data-act="commit" disabled title="把全部暂存修改写入库（同一事务，任一行失败整体回滚）">✓ 提交</button>
+    <button class="btn" data-act="revert" disabled title="丢弃全部未提交修改">✕ 回退</button>
+    <span data-act="pstat">无未提交修改</span>
+    <span class="spacer"></span>
+    <span class="hint">双击单元格编辑（先暂存）</span>`;
+  editbar.querySelector('[data-act="ins"]').addEventListener('click', () => openInsertModal(tab));
+  editbar.querySelector('[data-act="delSel"]').addEventListener('click', () => {
+    const rows = tab.ui.grid.getChecked().map((i) => tab.ui.grid.rowAt(i)).filter(Boolean);
+    if (!rows.length) return;
+    stageDelete(tab, rows);
+    tab.ui.grid.clearChecked();
+  });
+  editbar.querySelector('[data-act="commit"]').addEventListener('click', () => commitEdits(tab));
+  editbar.querySelector('[data-act="revert"]').addEventListener('click', () => revertAll(tab));
+  tab.uiEditbar = editbar;
   const pageInput = bar.querySelector('[data-act="page"]');
   pageInput.addEventListener('change', () => {
     const p = Math.max(1, parseInt(pageInput.value, 10) || 1);
@@ -352,7 +367,7 @@ function mountDataTab(pane, tab) {
   bar.querySelector('[data-act="next"]').addEventListener('click', () => goPage(tab, (tab.page || 1) + 1));
   bar.querySelector('[data-act="last"]').addEventListener('click', () => goPage(tab, tab.totalPages || 1));
 
-  // 行右键：删除该行（乐观校验在服务端）
+  // 行右键：暂存删除 / 撤销暂存（提交时统一写库）
   gridwrap.addEventListener('contextmenu', (e) => {
     const tr = e.target.closest('tr[data-r]');
     if (!tr) return;
@@ -363,7 +378,7 @@ function mountDataTab(pane, tab) {
     showRowMenu(e.clientX, e.clientY, tab, row);
   });
 
-  // 双击单元格 → 内联编辑（rowid 列除外）
+  // 双击单元格 → 内联编辑（先暂存，提交时写库；rowid 列除外）
   gridwrap.addEventListener('dblclick', (e) => {
     const td = e.target.closest('td[data-c]');
     const tr = td && td.closest('tr[data-r]');
@@ -372,22 +387,22 @@ function mountDataTab(pane, tab) {
     const col = tab.columns[colIdx];
     if (!col || col.name === 'rowid') return;
     const r = +tr.getAttribute('data-r');
-    const original = grid.rowAt(r)[colIdx];
+    const shown0 = grid.rowAt(r)[colIdx];
     if (td.querySelector('input')) return;
-    const shown = original === null ? 'NULL' : String(original);
+    const shown = shown0 === null ? 'NULL' : String(shown0);
     td.innerHTML = `<input class="cellinput" value="${esc(shown)}">`;
     const input = td.querySelector('input');
     input.focus();
     input.select();
-    const commit = async () => {
+    const commit = () => {
       const text = input.value;
-      if (text === shown) { restore(); return; }
+      if (text === shown) { refreshDataGrid(tab); return; }
       let nv;
       try { nv = cellFromInput(text, col.type); }
-      catch (err) { toast(err.message, 'err'); restore(); return; }
-      await saveCell(tab, r, colIdx, original, nv);
+      catch (err) { toast(err.message, 'err'); refreshDataGrid(tab); return; }
+      stageCellEdit(tab, r, colIdx, nv, td);
     };
-    const restore = () => loadRows(tab); // 重绘（简单可靠）
+    const restore = () => refreshDataGrid(tab);
     input.addEventListener('keydown', (ev) => {
       if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
       if (ev.key === 'Escape') { ev.preventDefault(); restore(); }
@@ -405,21 +420,31 @@ function showRowMenu(x, y, tab, row) {
   const menu = document.createElement('div');
   menu.className = 'ctxmenu';
   rowMenuEl = menu;
-  const del = document.createElement('div');
-  del.textContent = '删除该行';
-  del.className = 'danger';
-  del.addEventListener('click', () => {
-    menu.remove();
-    if (!confirm('确认删除这一行？')) return;
-    deleteRow(tab, row);
-  });
-  const copy = document.createElement('div');
-  copy.textContent = '复制该行 (TSV)';
-  copy.addEventListener('click', () => {
-    menu.remove();
+  const p = pendingOf(tab);
+  const rid = rowidOf(tab, row);
+  const insIdx = (tab.insRows || []).indexOf(row);
+  const isDel = rid != null && p.del.has(rid);
+  const items = [];
+  items.push({ label: '复制该行 (TSV)', fn: () => {
     navigator.clipboard.writeText(row.map((v) => (v === null ? 'NULL' : String(v))).join('\t'));
-  });
-  menu.append(copy, del);
+  } });
+  if (insIdx >= 0) {
+    items.push({ label: '撤销新增该行', danger: true, fn: () => { p.ins.splice(insIdx, 1); refreshDataGrid(tab); } });
+  } else if (isDel) {
+    items.push({ label: '撤销删除该行', fn: () => unstageRow(tab, row) });
+  } else {
+    items.push({ label: '删除该行（暂存）', danger: true, fn: () => { stageDelete(tab, [row]); } });
+  }
+  if (p.upd.has(rid)) {
+    items.push({ label: '撤销该行修改', fn: () => { p.upd.delete(rid); refreshDataGrid(tab); } });
+  }
+  for (const it of items) {
+    const d = document.createElement('div');
+    d.textContent = it.label;
+    if (it.danger) d.className = 'danger';
+    d.addEventListener('click', () => it.fn());
+    menu.appendChild(d);
+  }
   document.body.appendChild(menu);
   const close = () => { menu.remove(); rowMenuEl = null; document.removeEventListener('click', close); };
   setTimeout(() => document.addEventListener('click', close), 0);
@@ -449,68 +474,193 @@ function expectForRow(tab, row) {
   return expect;
 }
 
-async function saveCell(tab, r, colIdx, original, newValue) {
+// ── Navicat 式暂存编辑：改动先暂存，左下角统一 提交 / 回退 ──────────
+function pendingOf(tab) {
+  if (!tab.pending) tab.pending = { ins: [], upd: new Map(), del: new Map() };
+  return tab.pending;
+}
+function rowidOf(tab, row) {
+  const i = tab.columns.findIndex((c) => c.name === 'rowid');
+  return i >= 0 ? row[i] : null;
+}
+function pendingCount(tab) {
+  const p = pendingOf(tab);
+  return p.ins.length + p.upd.size + p.del.size;
+}
+
+// 把暂存修改叠加到要显示的行上；末尾接上「新增行」的虚拟行（rowid 列留空）
+function buildDisplayRows(tab) {
+  const p = pendingOf(tab);
+  const ridIdx = tab.columns.findIndex((c) => c.name === 'rowid');
+  const out = [];
+  for (const row of (tab.pageRows || [])) {
+    const rid = ridIdx >= 0 ? row[ridIdx] : null;
+    const e = p.upd.get(rid);
+    if (!e || p.del.has(rid)) { out.push(row); continue; }
+    const copy = row.slice();
+    for (const [k, v] of Object.entries(e.values)) {
+      const i = tab.columns.findIndex((c) => c.name === k);
+      if (i >= 0) copy[i] = v;
+    }
+    out.push(copy);
+  }
+  tab.insRows = p.ins.map((entry) => tab.columns.map((c) => {
+    if (c.name === 'rowid') return '';
+    return Object.prototype.hasOwnProperty.call(entry.values, c.name) ? entry.values[c.name] : null;
+  }));
+  return out.concat(tab.insRows);
+}
+
+function makeDirtyFn(tab) {
+  const p = pendingOf(tab);
+  const insRows = tab.insRows || [];
+  const ridIdx = tab.columns.findIndex((c) => c.name === 'rowid');
+  return (r, c) => {
+    const row = tab.ui.grid.rowAt(r);
+    if (!row) return null;
+    if (insRows.includes(row)) return 'inserted';
+    const rid = ridIdx >= 0 ? row[ridIdx] : null;
+    if (rid != null && p.del.has(rid)) return 'deleted';
+    const e = p.upd.get(rid);
+    if (!e) return null;
+    if (c === -1) return 'dirty';
+    const name = tab.columns[c] && tab.columns[c].name;
+    return name && Object.prototype.hasOwnProperty.call(e.values, name) ? 'dirty' : null;
+  };
+}
+
+// 用当前 tab.pageRows + 暂存集重画网格（不请求服务端）
+function refreshDataGrid(tab) {
+  const display = buildDisplayRows(tab);
+  tab.ui.grid.setData(tab.columns, display, makeDirtyFn(tab));
+  updateEditBar(tab);
+}
+
+function updateEditBar(tab) {
+  const bar = tab.uiEditbar;
+  if (!bar || !tab.ui.grid) return;
+  const p = pendingOf(tab);
+  const n = pendingCount(tab);
+  const commitBtn = bar.querySelector('[data-act="commit"]');
+  const revertBtn = bar.querySelector('[data-act="revert"]');
+  const delBtn = bar.querySelector('[data-act="delSel"]');
+  const stat = bar.querySelector('[data-act="pstat"]');
+  commitBtn.disabled = revertBtn.disabled = n === 0;
+  commitBtn.textContent = n ? `✓ 提交 (${n})` : '✓ 提交';
+  delBtn.disabled = tab.ui.grid.getChecked().length === 0;
+  stat.textContent = n
+    ? `未提交：${p.ins.length} 增 / ${p.upd.size} 改 / ${p.del.size} 删`
+    : '无未提交修改';
+  stat.classList.toggle('has', n > 0);
+}
+
+// 暂存一次单元格编辑（就地更新该格显示，不整表重建、不请求服务端）
+function stageCellEdit(tab, r, colIdx, nv, td) {
   const row = tab.ui.grid.rowAt(r);
   if (!row) return;
   const col = tab.columns[colIdx];
-  const payload = {
-    key: keyForRow(tab, row),
-    expect: expectForRow(tab, row),
-    values: { [col.name]: newValue },
-  };
-  set({ busy: true });
-  try {
-    await Api.updateRow(tab.table, payload);
-    toast('已保存', 'ok');
-    await loadRows(tab); // §11.3：UPDATE 后行会物理移动，必须重取当前页
-  } catch (e) {
-    toast(e.message, 'err', e.detail);
-    await loadRows(tab);
-  } finally {
-    set({ busy: false });
+  const p = pendingOf(tab);
+  const rid = rowidOf(tab, row);
+  const insIdx = (tab.insRows || []).indexOf(row);
+  if (insIdx >= 0) {                       // 编辑「新增行」的虚拟格
+    p.ins[insIdx].values[col.name] = nv;
+    refreshDataGrid(tab);
+    return;
   }
+  const e = p.upd.get(rid);
+  const original = e ? e.original : row.slice();
+  if (p.del.has(rid)) { toast('该行已标记删除；先在右键菜单撤销删除再改', 'err'); refreshDataGrid(tab); return; }
+  const values = Object.assign({}, e ? e.values : {}, { [col.name]: nv });
+  // 改回原值的列剔除；全部改回 = 撤销该行暂存
+  const changed = {};
+  let any = false;
+  for (const [k, v] of Object.entries(values)) {
+    const i = tab.columns.findIndex((c) => c.name === k);
+    if (i >= 0 && v !== original[i]) { changed[k] = v; any = true; }
+  }
+  if (any) p.upd.set(rid, { original, values: changed });
+  else p.upd.delete(rid);
+  // 就地更新显示
+  if (td && td.isConnected) {
+    td.textContent = nv === null ? 'NULL' : String(nv);
+    td.classList.toggle('nullv', nv === null);
+    td.classList.toggle('dirty', any);
+    const rn = td.closest('tr') && td.closest('tr').querySelector('td.rownum');
+    if (rn) rn.classList.toggle('dirty', any);
+  }
+  updateEditBar(tab);
 }
 
-async function deleteRow(tab, row) {
-  const payload = { key: keyForRow(tab, row), expect: expectForRow(tab, row) };
-  set({ busy: true });
-  try {
-    await Api.deleteRow(tab.table, payload);
-    toast('已删除', 'ok');
-    await loadRows(tab);
-  } catch (e) {
-    toast(e.message, 'err', e.detail);
-    await loadRows(tab);
-  } finally {
-    set({ busy: false });
+// 暂存删除（对「新增行」= 撤销新增）；对库里已有行 = 标记删除（提交时生效）
+function stageDelete(tab, rows) {
+  const p = pendingOf(tab);
+  for (const row of rows) {
+    const insIdx = (tab.insRows || []).indexOf(row);
+    if (insIdx >= 0) { p.ins.splice(insIdx, 1); continue; }
+    const rid = rowidOf(tab, row);
+    const e = p.upd.get(rid);
+    const original = e ? e.original : row.slice();   // 删除校验要用库里的旧值
+    if (e) p.upd.delete(rid);
+    p.del.set(rid, { original });
   }
+  refreshDataGrid(tab);
 }
 
-// 批量删除勾选行：自动包一个事务，任一行失败整体回滚（避免删一半）
-async function deleteChecked(tab) {
-  const idx = tab.ui.grid.getChecked();
-  const rows = idx.map((i) => tab.ui.grid.rowAt(i)).filter(Boolean);
-  if (!rows.length) return;
-  if (!confirm(`确认删除选中的 ${rows.length} 行？\n（自动包在一个事务里，任一行失败则整体回滚）`)) return;
+function unstageRow(tab, row) {
+  const p = pendingOf(tab);
+  const rid = rowidOf(tab, row);
+  p.del.delete(rid);
+  p.upd.delete(rid);
+  refreshDataGrid(tab);
+}
+
+// 提交全部暂存修改：单事务内 增 → 改 → 删，任一行失败整体回滚（乐观校验在服务端）
+async function commitEdits(tab) {
+  const p = pendingOf(tab);
+  const n = pendingCount(tab);
+  if (!n) return;
+  const stat = `${p.ins.length} 行新增 / ${p.upd.size} 行修改 / ${p.del.size} 行删除`;
+  if (!confirm(`确认提交 ${stat}？\n（同一事务内执行；某行校验失败则整体回滚）`)) return;
   const autoTxn = !state$().inTxn;
   set({ busy: true });
   try {
     if (autoTxn) await Api.txn('begin');
-    for (const row of rows) {
-      await Api.deleteRow(tab.table, { key: keyForRow(tab, row), expect: expectForRow(tab, row) });
+    for (const entry of p.ins) await Api.insertRow(tab.table, entry.values);
+    for (const [, e] of p.upd) {
+      await Api.updateRow(tab.table, {
+        key: keyForRow(tab, e.original),
+        expect: expectForRow(tab, e.original),
+        values: e.values,
+      });
+    }
+    for (const [, e] of p.del) {
+      await Api.deleteRow(tab.table, {
+        key: keyForRow(tab, e.original),
+        expect: expectForRow(tab, e.original),
+      });
     }
     if (autoTxn) await Api.txn('commit');
-    toast(`已删除 ${rows.length} 行` + (autoTxn ? '' : '（外层事务未提交，记得 COMMIT）'), 'ok');
-  } catch (e) {
-    if (autoTxn) {
-      try { await Api.txn('rollback'); } catch (e2) { /* 回滚失败也继续刷新 */ }
-    }
-    toast(e.message, 'err', e.detail);
-  } finally {
-    set({ busy: false });
+    tab.pending = { ins: [], upd: new Map(), del: new Map() };
+    toast(`已提交：${stat}` + (autoTxn ? '' : '（外层事务未提交，记得 COMMIT）'), 'ok');
     await fullRefresh();
     await loadRows(tab);
+  } catch (err) {
+    if (autoTxn) { try { await Api.txn('rollback'); } catch (e2) { /* 继续提示 */ } }
+    toast(err.message, 'err', err.detail);
+  } finally {
+    set({ busy: false });
+    updateEditBar(tab);
   }
+}
+
+// 回退全部暂存修改（数据没动过，本地重画即可）
+function revertAll(tab) {
+  const n = pendingCount(tab);
+  if (!n) return;
+  if (!confirm(`确认丢弃全部 ${n} 条未提交修改？`)) return;
+  tab.pending = { ins: [], upd: new Map(), del: new Map() };
+  refreshDataGrid(tab);
+  toast('已回退全部未提交修改', 'ok');
 }
 
 function openInsertModal(tab) {
@@ -542,7 +692,7 @@ function openInsertModal(tab) {
   cancel.textContent = '取消';
   const ok = document.createElement('button');
   ok.className = 'btn primary';
-  ok.textContent = '插入';
+  ok.textContent = '暂存新行';
   btns.append(cancel, ok);
   modal.append(h, ...rows, btns);
   back.appendChild(modal);
@@ -559,14 +709,10 @@ function openInsertModal(tab) {
       toast(e2.message, 'err');
       return;
     }
-    try {
-      await Api.insertRow(tab.table, values);
-      back.remove();
-      toast('已插入', 'ok');
-      await loadRows(tab);
-    } catch (e2) {
-      toast(e2.message, 'err', e2.detail);
-    }
+    pendingOf(tab).ins.push({ values });
+    back.remove();
+    toast('已暂存新行（左下角「✓ 提交」时写入库）', 'ok');
+    refreshDataGrid(tab);
   });
 }
 
@@ -642,7 +788,7 @@ function renderLocal(tab) {
   tab.page = Math.min(Math.max(1, tab.page || 1), tab.totalPages);
   const start = (tab.page - 1) * tab.pageSize;
   tab.pageRows = sorted.slice(start, start + tab.pageSize);
-  tab.ui.grid.setData(tab.columns, tab.pageRows);
+  refreshDataGrid(tab);
   updateDataBar(tab, {
     page: tab.page,
     shown: tab.pageRows.length,
@@ -658,7 +804,8 @@ function renderLocal(tab) {
 
 function renderServer(tab, d) {
   tab.pageRows = d.rows;
-  tab.ui.grid.setData(d.columns, d.rows);
+  tab.columns = d.columns;
+  refreshDataGrid(tab);
   updateDataBar(tab, { page: d.page, shown: d.rows.length, totalKnown: d.totalKnown, total: d.total });
   set({ statusText: `第 ${d.page} 页 · ${d.rows.length} 行` + (d.totalKnown ? ` · 共 ${d.total} 行` : ' · 共 ≈? 行') });
 }

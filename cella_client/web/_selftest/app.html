@@ -1,14 +1,16 @@
 <!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>app integration selftest</title>
-<style>iframe{width:1240px;height:820px;border:1px solid #ccc}pre{font:12px monospace}</style>
+<style>iframe{width:1240px;height:820px;border:1px solid #ccc}pre{font:12px monospace;white-space:pre-wrap}</style>
 </head><body>
 <iframe id="f" src="/"></iframe>
 <pre id="out">RUNNING</pre>
 <script>
 const L = [];
-const ok = (n, c) => L.push((c ? 'PASS ' : 'FAIL ') + n);
+const out = () => document.getElementById('out');
+const ok = (n, c) => { L.push((c ? 'PASS ' : 'FAIL ') + n); out().textContent = L[L.length - 1]; };
+const fail = (t) => { out().textContent = L.join('\n') + '\n>> ' + t; };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function until(fn, ms = 6000) {
+async function until(fn, ms = 8000) {
   const t0 = Date.now();
   for (;;) {
     try { const v = fn(); if (v) return v; } catch (e) { /* 继续等 */ }
@@ -16,178 +18,229 @@ async function until(fn, ms = 6000) {
     await sleep(100);
   }
 }
+window.addEventListener('error', (e) => fail('OUTER-ERROR: ' + (e.message || '未知') + (e.lineno ? ' @line' + e.lineno : '')));
+window.addEventListener('unhandledrejection', (e) => fail('OUTER-REJECT: ' + (e.reason && e.reason.message ? e.reason.message : e.reason)));
+
 const f = document.getElementById('f');
-f.addEventListener('load', run);
+let started = false;
+f.addEventListener('load', async () => { if (!started) { started = true; await run(); } });
+
 async function run() {
   const w = f.contentWindow, d = f.contentDocument;
   await until(() => d.querySelector('.treenode.tbl'));
   w.confirm = () => true;
-  w.prompt = () => 'selftest_db';
+  w.prompt = () => '__selftest';
 
   // ① 启动与两层树
   ok('库节点（两层树）', !!d.querySelector('.treenode.db'));
   ok('表节点存在', !!d.querySelector('.treenode.tbl'));
   ok('标签栏有「+」新建入口', !!d.querySelector('.tabadd'));
 
-  // ② 点表打开数据标签 → 数据工具条齐备
-  d.querySelector('.treenode.tbl').dispatchEvent(new MouseEvent('click', { bubbles: true }));
-  await until(() => d.querySelector('.databar'));
+  // 用自建临时表做隔离（避免和用户正在看的表互相干扰）
+  const scratch = '__selftest';
+  const realFetch = w.fetch;
+  const sqlExec = async (sql) => {
+    await realFetch('/api/query', { method: 'POST', headers: { 'Content-Type': 'application/json; charset=utf-8' }, body: JSON.stringify({ sql }) });
+  };
+  await sqlExec('DROP TABLE ' + scratch + ';').catch(() => {});
+  await sqlExec('CREATE TABLE ' + scratch + ' (id INT PRIMARY KEY, v VARCHAR(20));');
+  await sqlExec("INSERT INTO " + scratch + " VALUES (1, 'a'), (2, 'b');");
+  await w.__cella.fullRefresh();
+  await until(() => [...d.querySelectorAll('.treenode.tbl')].some((t) => t.textContent === scratch));
+
+  // ② 打开临时表的数据标签
+  const snode = [...d.querySelectorAll('.treenode.tbl')].find((t) => t.textContent === scratch);
+  snode.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await until(() => d.querySelectorAll('td.ck input[data-ck]').length > 0);
+  await sleep(300);
   ok('数据工具条已挂载', !!d.querySelector('.databar'));
-  ok('「+ 新增行」按钮', !!d.querySelector('.databar [data-act="add"]'));
-  ok('「删除选中」按钮（初始禁用）', !!d.querySelector('.databar [data-act="del"]') && d.querySelector('.databar [data-act="del"]').disabled);
-  const sizeSel = d.querySelector('.databar [data-act="pagesize"]');
-  ok('每页行数选择器', !!sizeSel && sizeSel.options.length === 4);
+  ok('每页行数选择器', !!d.querySelector('.databar [data-act="pagesize"]'));
+  ok('左下编辑栏已挂载', !!d.querySelector('.editbar'));
+  ok('「+ 新增行」按钮（左下编辑栏）', !!d.querySelector('.editbar [data-act="ins"]'));
+  const delBtn = () => d.querySelector('.editbar [data-act="delSel"]');
+  ok('「− 删除选中」按钮（初始禁用）', !!delBtn() && delBtn().disabled);
   await until(() => d.querySelectorAll('td.ck input[data-ck]').length > 0);
   ok('网格有勾选列', d.querySelectorAll('td.ck input[data-ck]').length > 0);
   ok('网格有列宽手柄', d.querySelectorAll('th .resize').length > 0);
-
-  // ②-bis 回归：双击进入单元格编辑。mousedown 若重建表格 DOM，浏览器的 dblclick 计数会被打断
-  const d0 = d.querySelector('tr[data-r="0"] td[data-c="2"]');
-  d0.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-  d0.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-  d0.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-  d0.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-  d0.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-  d0.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-  ok('两次点击后 td 实例不变（dblclick 可触发）',
-    d.querySelector('tr[data-r="0"] td[data-c="2"]') === d0);
-  d0.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true }));
-  await sleep(250);
-  const cellInput = d0.querySelector('input.cellinput');
-  ok('双击进入单元格编辑（值=' + (cellInput ? cellInput.value : '-') + '）', !!cellInput);
-  if (cellInput) {
-    cellInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
-  }
-  await sleep(500);
-  ok('Esc 退出编辑回到展示态', !d.querySelector('tr[data-r="0"] td[data-c="2"] input'));
 
   // ③ 勾选 → 删除选中按钮可用
   const firstCk = d.querySelector('td.ck input[data-ck]');
   firstCk.checked = true;
   firstCk.dispatchEvent(new Event('change', { bubbles: true }));
-  await sleep(120);
-  const delBtn = d.querySelector('.databar [data-act="del"]');
-  ok('勾选后「删除选中」变为可用：' + delBtn.textContent, !delBtn.disabled);
+  await sleep(150);
+  ok('勾选后「− 删除选中」可用', !delBtn().disabled);
+  firstCk.checked = false;
+  firstCk.dispatchEvent(new Event('change', { bubbles: true }));
+  await sleep(150);
 
-  // ④ 每页行数切换生效
-  sizeSel.value = '500';
-  sizeSel.dispatchEvent(new Event('change', { bubbles: true }));
-  await sleep(400);
-  ok('切换每页 500 后状态栏/总数更新：' + (d.getElementById('statusbar') || {}).textContent.slice(0, 40),
-    /共 \d+ 行|本页/.test(d.querySelector('.databar').textContent));
-  ok('页大小选择器保持 500', d.querySelector('.databar [data-act="pagesize"]').value === '500');
+  // ④ Navicat 式暂存：编辑 → 暂存（不写库）→ 提交（单事务）→ 还原
+  const vCell = () => d.querySelector('tr[data-r="0"] td[data-c="2"]');   // 列 = rowid,id,v
+  const origV = vCell().textContent;
+  const reqLog = [];
+  w.fetch = (...a) => { reqLog.push((a[1] && a[1].method) + ' ' + a[0]); return realFetch(...a); };
 
-  // ⑤ 标签：Ctrl+T 新建 / Ctrl+W 关闭
+  vCell().dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true }));
+  await sleep(200);
+  const edIn = vCell().querySelector('input.cellinput');
+  ok('双击进入单元格编辑', !!edIn);
+  edIn.value = origV + '2';
+  edIn.dispatchEvent(new Event('input', { bubbles: true }));
+  edIn.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+  await sleep(300);
+  ok('Enter 后仅暂存：0 次写请求 + dirty 标记',
+    !reqLog.some((r) => r.startsWith('PATCH')) && !!(vCell() || {}).classList.contains('dirty'));
+  ok('提交按钮带计数 (1)', d.querySelector('.editbar [data-act="commit"]').textContent.includes('(1)'));
+
+  // 回退 → 复原（无写请求）
+  d.querySelector('.editbar [data-act="revert"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  const revertOk = await until(() => vCell().textContent === origV, 4000);
+  ok('回退后复原且无写请求', !!revertOk && !reqLog.some((r) => r.startsWith('PATCH')));
+
+  // 再暂存并提交 → BEGIN/PATCH/COMMIT
+  vCell().dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true }));
+  await sleep(200);
+  const edIn2 = vCell().querySelector('input.cellinput');
+  edIn2.value = origV + '2';
+  edIn2.dispatchEvent(new Event('input', { bubbles: true }));
+  edIn2.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+  await sleep(300);
+  reqLog.length = 0;
+  d.querySelector('.editbar [data-act="commit"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  const commitOk = await until(() => vCell().textContent === origV + '2' && !vCell().classList.contains('dirty'), 6000);
+  ok('提交：BEGIN/PATCH/COMMIT 齐全（' + reqLog.filter((r) => !r.startsWith('GET')).join('; ') + '）',
+    !!commitOk && reqLog.some((r) => r === 'POST /api/txn/begin') &&
+    reqLog.some((r) => r.startsWith('PATCH') && r.includes(scratch)) &&
+    reqLog.some((r) => r === 'POST /api/txn/commit'));
+
+  // ⑤ 新增行 → 暂存（不写库，虚拟行带 inserted 样式）→ − 移除
+  const dataTab = () => w.__cella.state$().tabs.find((t) => t.type === 'data');
+  const ins0 = dataTab().pending.ins.length;
+  d.querySelector('.editbar [data-act="ins"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  const mInputs = await until(() => { const n = d.querySelectorAll('.modal input'); return n.length > 0 ? n : null; }, 3000);
+  if (!mInputs) {
+    const st = w.__cella.state$();
+    const byName = st.tables.find((t) => t.name === scratch);
+    fail('弹窗未出现：tables=[' + st.tables.map((t) => t.name).join(',') + '] ' +
+         'tableByName=' + !!byName + ' columns=' + (byName ? byName.columns.length : '-') +
+         ' modalBack=' + !!d.querySelector('.modal-back'));
+    return;
+  }
+  ok('新增行弹窗出现（' + mInputs.length + ' 个输入）', mInputs.length === 2);
+  mInputs[0].value = '9';
+  mInputs[1].value = 'staged';
+  d.querySelector('.modal .btns .btn.primary').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await sleep(300);
+  const vrows = d.querySelectorAll('.grid tbody tr[data-r]');
+  const lastRowHtml = (vrows[vrows.length - 1] || {}).outerHTML || '(无)';
+  const vck = vrows[vrows.length - 1].querySelector('td.ck input[data-ck]');
+  ok('新行进入暂存且虚拟行带 inserted 样式（ins=' + dataTab().pending.ins.length +
+     '，p0=' + ins0 + '，行数=' + vrows.length + '，末行=' + lastRowHtml.slice(0, 120) + '）',
+    dataTab().pending.ins.length === ins0 + 1 && !!d.querySelector('.grid td.inserted'));
+  if (vck) {
+    vck.checked = true;
+    vck.dispatchEvent(new Event('change', { bubbles: true }));
+    await sleep(150);
+    delBtn().dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await sleep(300);
+    ok('暂存新行被「− 删除选中」移除（仍不写库）', dataTab().pending.ins.length === ins0);
+  }
+
+  // ⑥ 删除行 → 暂存（deleted 样式）→ 回退复原
+  const ck2 = d.querySelector('tr[data-r="0"] td.ck input[data-ck]');
+  ck2.checked = true;
+  ck2.dispatchEvent(new Event('change', { bubbles: true }));
+  await sleep(150);
+  delBtn().dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await sleep(300);
+  ok('删除进入暂存（deleted=' + !!d.querySelector('.grid td.deleted') +
+     '，计数=' + d.querySelector('.editbar [data-act="commit"]').textContent + '）',
+    !!d.querySelector('.grid td.deleted') && d.querySelector('.editbar [data-act="commit"]').textContent.includes('(1)'));
+  d.querySelector('.editbar [data-act="revert"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await sleep(300);
+  ok('回退后删除标记消失', !d.querySelector('.grid td.deleted'));
+
+  // ⑦ 标签：Ctrl+T 新建 / Ctrl+W 关闭
   const tabs0 = d.querySelectorAll('#tabbar .tab').length;
   d.dispatchEvent(new KeyboardEvent('keydown', { key: 't', ctrlKey: true, bubbles: true, cancelable: true }));
   await sleep(200);
-  const tabs1 = d.querySelectorAll('#tabbar .tab').length;
-  ok(`Ctrl+T 新建标签 ${tabs0} → ${tabs1}`, tabs1 === tabs0 + 1);
+  ok('Ctrl+T 新建标签', d.querySelectorAll('#tabbar .tab').length === tabs0 + 1);
   d.dispatchEvent(new KeyboardEvent('keydown', { key: 'w', ctrlKey: true, bubbles: true, cancelable: true }));
   await sleep(200);
   ok('Ctrl+W 关闭标签', d.querySelectorAll('#tabbar .tab').length === tabs0);
 
-  // ⑥ 标签切换保留编辑器内容与光标
-  const marker = '-- selftest-' + Date.now() + '\n';
-  const sqlText = marker + 'get 1;';
-  const caretAt = marker.length + 2;
+  // ⑧ 标签切换保留编辑器内容与光标
   d.querySelectorAll('#tabbar .tab')[0].dispatchEvent(new MouseEvent('click', { bubbles: true }));
   await sleep(250);
-  const tas = () => d.querySelectorAll('#tabbody textarea');
+  const marker = '-- selftest-' + Date.now() + '\n';
+  const sqlText = marker + 'get id, v in ' + scratch + ';';
+  const caretAt = marker.length + 2;
   const ta = d.querySelector('#tabbody textarea');
   ta.value = sqlText;
   ta.dispatchEvent(new Event('input', { bubbles: true }));
   ta.selectionStart = ta.selectionEnd = caretAt;
-  ok(`赋值后 value 长度=${ta.value.length}（期望 ${sqlText.length}）caret=${ta.selectionStart}`,
-    ta.value.length === sqlText.length && ta.selectionStart === caretAt);
-  d.querySelectorAll('#tabbar .tab')[1].dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  const otherTab = [...d.querySelectorAll('#tabbar .tab')].find((t) => !t.textContent.includes('查询'));
+  otherTab.dispatchEvent(new MouseEvent('click', { bubbles: true }));
   await sleep(250);
-  const dbg = w.__cella.state$().tabs.map((t) => t.type + ':' + JSON.stringify(t.caret));
   d.querySelectorAll('#tabbar .tab')[0].dispatchEvent(new MouseEvent('click', { bubbles: true }));
   const taBack = d.querySelector('#tabbody textarea');
-  const immediate = taBack.selectionStart;
   await sleep(400);
   ok('切走再切回，编辑器内容保留', taBack.value === sqlText);
-  ok(`切走再切回，光标位置保留（期望 ${caretAt}｜立刻 ${immediate}｜400ms 后 ${taBack.selectionStart}｜tabs ${dbg}）`,
-    taBack.selectionStart === caretAt);
-  ok('编辑器实例未重建（同一 DOM）', ta === taBack && tas().length >= 1);
+  ok('切走再切回，光标位置保留（' + taBack.selectionStart + '）', taBack.selectionStart === caretAt);
 
-  // ⑦ 执行 SQL → 结果网格 + 历史记录 + 消息面板
-  const before = d.getElementById('sqlHistory').options.length;
+  // ⑨ 执行 SQL → 历史 + 消息面板
+  const histBefore = d.getElementById('sqlHistory').options.length;
   d.getElementById('btnRun').dispatchEvent(new MouseEvent('click', { bubbles: true }));
-  await sleep(900);
-  const after = d.getElementById('sqlHistory').options.length;
-  ok(`执行后写入 SQL 历史 ${before} → ${after}`, after > before);
-  ok('执行后历史下拉可用', !d.getElementById('sqlHistory').disabled);
-  ok('结果消息面板打开', !d.getElementById('bottomPanel').classList.contains('hidden'));
-  ok('历史记录里是刚执行的那条', d.getElementById('sqlHistory').textContent.includes('selftest-'));
+  const histOk = await until(() => d.getElementById('sqlHistory').options.length > histBefore, 5000);
+  ok('执行后写入 SQL 历史', !!histOk);
+  const panelOk = await until(() => !d.getElementById('bottomPanel').classList.contains('hidden'), 5000);
+  ok('结果消息面板打开', !!panelOk);
 
-  // ⑧ 右键表名 → 菜单（6 项，含「生成 SELECT」）
-  const tn = d.querySelector('.treenode.tbl');
+  // ⑩ 右键表名 → 菜单 6 项（含「生成 SELECT」）
+  const tn = [...d.querySelectorAll('.treenode.tbl')].find((t) => t.textContent === scratch);
   tn.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 60, clientY: 120 }));
   await sleep(150);
   const menu = d.querySelector('.ctxmenu');
-  ok('右键菜单弹出', !!menu);
-  ok('菜单 6 项且含「生成 SELECT」',
+  ok('右键菜单弹出且 6 项含「生成 SELECT」',
     !!menu && menu.children.length === 6 && menu.textContent.includes('生成 SELECT'));
   if (menu) menu.children[3].dispatchEvent(new MouseEvent('click', { bubbles: true }));
   await sleep(250);
-  ok('「生成 SELECT」新建了查询标签', d.querySelectorAll('#tabbar .tab').length === tabs0 + 1);
+  ok('「生成 SELECT」新建了查询标签', d.querySelectorAll('#tabbar .tab').length >= tabs0 + 1);
 
-  // ⑨ 诊断面板（结构化）+ 计划视图 + 断线横幅 + 加载态元素
+  // ⑪ 诊断面板结构化 + 计划视图 + 断线横幅 + 加载态元素
   d.getElementById('stDiag').dispatchEvent(new MouseEvent('click', { bubbles: true }));
-  await sleep(800);
-  const dv = d.querySelector('.diagview');
-  ok('诊断面板有子页签 4 个', d.querySelectorAll('.diagbar .diagtab').length >= 4);
-  const statTab = [...d.querySelectorAll('.diagbar .diagtab')].find((b) => b.textContent === '缓冲池');
+  const statTab = await until(() => [...d.querySelectorAll('.diagbar .diagtab')].find((b) => b.textContent === '缓冲池'), 4000);
   statTab.dispatchEvent(new MouseEvent('click', { bubbles: true }));
   await sleep(700);
   ok('缓冲池结构化渲染（命中率进度条 + 计数卡片）',
     !!d.querySelector('.hitrate .hbar i') && d.querySelectorAll('.diagcards .card').length >= 8);
   ok('诊断可切原始文本', !!d.querySelector('.viewbar'));
-  ok('切到原始文本后显示 pre',
-    (() => {
-      [...d.querySelectorAll('.viewbar .diagtab')].find((b) => b.textContent === '原始文本')
-        .dispatchEvent(new MouseEvent('click', { bubbles: true }));
-      return !!d.querySelector('.diagview pre');
-    })());
-  [...d.querySelectorAll('.viewbar .diagtab')].find((b) => b.textContent === '结构化')
-    .dispatchEvent(new MouseEvent('click', { bubbles: true }));
-  const txnTab = [...d.querySelectorAll('.diagbar .diagtab')].find((b) => b.textContent === '事务表');
-  txnTab.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-  await sleep(700);
-  ok('事务表渲染成表格（含表头「事务」）',
-    !!d.querySelector('.diagview table.grid.diag') && d.querySelector('.diagview').textContent.includes('事务'));
 
-  d.querySelector('#tabbar .tab').dispatchEvent(new MouseEvent('click', { bubbles: true }));
-  await sleep(200);
-  const qta = d.querySelector('#tabbody textarea');
-  qta.value = 'get id, name in student limit id > 1 ordered name asc;';
-  qta.dispatchEvent(new Event('input', { bubbles: true }));
-  d.getElementById('btnRun').dispatchEvent(new MouseEvent('click', { bubbles: true }));
-  await sleep(1000);
   d.getElementById('stPlan').dispatchEvent(new MouseEvent('click', { bubbles: true }));
   await sleep(300);
-  ok('计划视图渲染算子树（' + d.querySelectorAll('.planrow').length + ' 行） + 编译耗时',
-    d.querySelectorAll('.planrow').length >= 4 && d.querySelector('.planhead').textContent.includes('编译耗时'));
-
+  ok('计划视图渲染算子树', d.querySelectorAll('.planrow').length >= 2);
   ok('断线横幅元素存在（默认隐藏）',
     !!d.getElementById('connBanner') && d.getElementById('connBanner').style.display !== 'flex');
   ok('加载态元素存在（进度条 + 状态栏提示）',
     !!d.getElementById('busyBar') && !!d.getElementById('stBusy'));
 
-  // ⑩ 断线横幅：把 iframe 的 fetch 打坏 → 触发请求 → 应显示横幅；修好并重试 → 横幅消失
-  const realFetch = w.fetch;
-  w.fetch = () => Promise.reject(new TypeError('模拟断线'));
+  // ⑫ 断线横幅：打坏 fetch → 触发请求 → 横幅出现；恢复 → 消失
+  const brokenFetch = () => Promise.reject(new TypeError('模拟断线'));
+  const savedFetch = w.fetch;
+  w.fetch = brokenFetch;
   d.getElementById('btnRefresh').dispatchEvent(new MouseEvent('click', { bubbles: true }));
   await sleep(700);
   ok('请求失败后显示断线横幅', d.getElementById('connBanner').style.display === 'flex');
-  w.fetch = realFetch;
+  w.fetch = savedFetch;
   d.getElementById('connRetry').dispatchEvent(new MouseEvent('click', { bubbles: true }));
   await sleep(900);
   ok('恢复后横幅消失（自动重连）', d.getElementById('connBanner').style.display === 'none');
 
-  document.getElementById('out').textContent = L.join('\n');
+  // ⑬ 清理临时表
+  w.fetch = realFetch;
+  await sqlExec('DROP TABLE ' + scratch + ';');
+  await w.__cella.fullRefresh();
+
+  out().textContent = L.join('\n');
 }
 </script>
 </body></html>

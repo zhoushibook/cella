@@ -163,6 +163,18 @@ host.addEventListener('dblclick', () => { dblSeen = true; }, { once: true });
 td0.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
 ok('dblclick 冒泡到容器（编辑入口可达）', dblSeen);
 
+// ⑬ 脏标记（暂存编辑）：dirtyFn 返回 kind（dirty/deleted/inserted），c=-1 表示整行
+g.setData(cols, rows, (r, c) => (r === 1 && (c === -1 || c === 1) ? 'dirty' : null));
+ok('暂存格有 dirty 类', !!host.querySelector('tr[data-r="1"] td[data-c="1"].dirty'));
+ok('行号格有 dirty 类（左缘色条）', !!host.querySelector('tr[data-r="1"] td.rownum.dirty'));
+ok('未修改列无标记', !host.querySelector('tr[data-r="1"] td[data-c="0"].dirty'));
+g.setData(cols, rows, (r) => (r === 0 ? 'deleted' : null));
+ok('删除行样式（划线）', !!host.querySelector('tr[data-r="0"] td[data-c="1"].deleted'));
+g.setData(cols, rows, (r) => (r === 2 ? 'inserted' : null));
+ok('新增行样式', !!host.querySelector('tr[data-r="2"] td[data-c="0"].inserted'));
+g.setData(cols, rows);
+ok('清除后无标记', !host.querySelector('.grid .dirty, .grid .deleted, .grid .inserted'));
+
 document.getElementById('out').textContent = L.join('\n');
 </script>
 </body></html>

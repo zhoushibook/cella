@@ -46,6 +46,7 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
   let dragMode = null;      // 'cell' | 'row'
   let resizeState = null;   // {kind:'col'|'rownum', x, w} | {kind:'row', y, h}
   let suppressClick = false; // 拖拽列宽/行高后浏览器会补一个 click，不能当成排序/全选
+  let dirtyFn = null;       // (r, c) => bool：c=-1 表示「整行有未提交修改」（画在行号格上）
   let rowH = loadNum('rowH', ROW_H_DEF, ROW_H_MIN, ROW_H_MAX);          // 行高（可拖）
   let rownumW = loadNum('rownumW', ROWNUM_W_DEF, 34, 160);              // 「#」列宽（可拖）
 
@@ -133,15 +134,20 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
     if (start > 0) {
       html += `<tr class="pad"><td colspan="${span}" style="height:${start * rowH}px"></td></tr>`;
     }
+    const kindTitle = { dirty: '该行有未提交的修改', deleted: '该行已标记删除（提交时生效）', inserted: '新行（提交时写入）' };
     for (let r = start; r < end; r++) {
       const row = view[r];
       const rs = isRowSel(r) ? ' sel' : '';
+      const rowKind = dirtyFn ? (dirtyFn(r, -1) || '') : '';
+      const rowTip = rowKind ? ` title="${kindTitle[rowKind] || ''}"` : '';
       html += `<tr data-r="${r}">`;
       if (checkable) html += `<td class="ck${rs}"><input type="checkbox" data-ck="${r}"${checked.has(r) ? ' checked' : ''}></td>`;
-      html += `<td class="rownum${rs}">${r + 1}</td>`;
+      html += `<td class="rownum${rs}${rowKind ? ' ' + rowKind : ''}"${rowTip}>${r + 1}</td>`;
       for (let c = 0; c < cols.length; c++) {
         const v = row[c];
-        const cls = (isNumCol(cols[c]) ? 'num ' : '') + (inSel(r, c) ? 'sel ' : '') + (v === null || v === undefined ? 'nullv' : '');
+        const kind = dirtyFn ? (dirtyFn(r, c) || '') : '';
+        const cls = (isNumCol(cols[c]) ? 'num ' : '') + (inSel(r, c) ? 'sel ' : '') +
+          (v === null || v === undefined ? 'nullv ' : '') + (kind ? kind + ' ' : '');
         html += `<td data-c="${c}" class="${cls.trim()}" title="${esc(cellText(v))}">${esc(cellText(v))}</td>`;
       }
       html += '</tr>';
@@ -404,13 +410,14 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
   });
 
   return {
-    setData(columns, dataRows) {
+    setData(columns, dataRows, isDirty) {
       // 保留「同名同类型」列的宽度：翻页 / 排序 / 保存 / 重跑查询 / 换列集再换回来，都不冲掉用户调过的列宽
       const prevCols = cols;
       const prevWidths = widths;
       prevCols.forEach((c, i) => widthMemo.set(colKey(c), prevWidths[i]));
       cols = columns || [];
       rows = dataRows || [];
+      dirtyFn = isDirty || null;
       checked = new Set();
       sel = null;
       firstVisible = 0;
@@ -435,6 +442,8 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
       render();
       afterCheck();
     },
+    // 数据没换、只是暂存集变化时，重新应用脏标记
+    setDirtyFn(fn) { dirtyFn = fn || null; render(); },
     setSort(k) { sortKey = k; },
     // 行高 / 行号列宽复位（供自测与「恢复默认」用）
     resetLayout() {
@@ -445,7 +454,7 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
       render();
     },
     rowHeight: () => rowH,
-    clear() { cols = []; rows = []; view = []; widths = []; sel = null; checked = new Set(); render(); },
+    clear() { cols = []; rows = []; view = []; widths = []; sel = null; checked = new Set(); dirtyFn = null; render(); },
     rowAt(i) { return view[i]; },
     rowCount: () => view.length,
     getChecked: () => [...checked].sort((a, b) => a - b),

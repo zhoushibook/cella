@@ -347,6 +347,21 @@ table.grid.diag code { font-family: var(--mono); }
 }
 .editing-hint { color: var(--warn); }
 
+/* ── 暂存编辑（Navicat 式）──────────────────── */
+.editbar {
+  display: flex; align-items: center; gap: 8px; padding: 5px 12px;
+  border-top: 1px solid var(--border); flex: none; font-size: 12px;
+  color: var(--text-dim); background: var(--bg-sub);
+}
+.editbar .pendstat.has, .editbar [data-act="pstat"].has { color: var(--warn); }
+.editbar .hint { color: var(--text-dim); }
+.grid td.dirty { color: var(--accent); font-weight: 500; background-image: linear-gradient(135deg, var(--accent-soft) 0 7px, transparent 7px); }
+.grid td.inserted { color: var(--ok); }
+.grid td.deleted { color: var(--err); text-decoration: line-through; opacity: 0.8; }
+.grid td.rownum.dirty { box-shadow: inset 3px 0 0 var(--warn); }
+.grid td.rownum.inserted { box-shadow: inset 3px 0 0 var(--ok); }
+.grid td.rownum.deleted { box-shadow: inset 3px 0 0 var(--err); }
+
 /* ── 空态 / 加载态 ─────────────────────────── */
 .empty { padding: 40px; text-align: center; color: var(--text-dim); line-height: 2; }
 .empty .hint { font-size: 12px; }
