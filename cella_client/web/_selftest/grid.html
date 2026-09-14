@@ -175,6 +175,55 @@ ok('新增行样式', !!host.querySelector('tr[data-r="2"] td[data-c="0"].insert
 g.setData(cols, rows);
 ok('清除后无标记', !host.querySelector('.grid .dirty, .grid .deleted, .grid .inserted'));
 
+// ⑭ 任意单元格交界可拖拽（Excel 式）：右缘 = 列宽，下缘 = 行高，行号格右缘 = 行号列宽
+g.clearSelection();
+const nearRect = (el, side, back = 2) => {
+  const r = el.getBoundingClientRect();
+  return side === 'r' ? { x: r.right - back, y: r.top + 3 } : { x: r.left + 5, y: r.bottom - back };
+};
+const tdA = host.querySelector('tr[data-r="0"] td[data-c="0"]');
+// 光标提示
+tdA.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: nearRect(tdA, 'r').x, clientY: nearRect(tdA, 'r').y }));
+ok('悬停单元格右缘出现 col-resize 光标', host.querySelector('table').style.cursor === 'col-resize');
+tdA.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: tdA.getBoundingClientRect().left + 6, clientY: nearRect(tdA, 'r').y }));
+ok('离开交界光标恢复（' + JSON.stringify(host.querySelector('table').style.cursor) + '）', host.querySelector('table').style.cursor === '');
+// 右缘拖列宽：只改 colgroup、不重建 DOM、不产生选区
+const wa0 = wOf(0);
+tdA.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: nearRect(tdA, 'r').x, clientY: nearRect(tdA, 'r').y, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: nearRect(tdA, 'r').x + 45, clientY: nearRect(tdA, 'r').y, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+ok('单元格右缘拖列宽 ' + wa0 + ' → ' + wOf(0), wOf(0) === wa0 + 45);
+ok('交界拖拽不重建 DOM（td 实例不变）', host.querySelector('tr[data-r="0"] td[data-c="0"]') === tdA);
+ok('交界拖拽不产生选区', !host.querySelector('td.sel'));
+tdA.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+ok('交界拖拽的尾随 click 无副作用（仍无选区）', !host.querySelector('td.sel'));
+// 下缘拖行高（⑩ 后行高 = 36）
+const rh0 = g.rowHeight();
+const tdB = host.querySelector('tr[data-r="1"] td[data-c="1"]');
+tdB.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: nearRect(tdB, 'b').x, clientY: nearRect(tdB, 'b').y }));
+ok('悬停单元格下缘出现 row-resize 光标', host.querySelector('table').style.cursor === 'row-resize');
+tdB.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: nearRect(tdB, 'b').x, clientY: nearRect(tdB, 'b').y, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: nearRect(tdB, 'b').x, clientY: nearRect(tdB, 'b').y + 8, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+ok('单元格下缘拖行高 ' + rh0 + ' → ' + g.rowHeight(), g.rowHeight() === rh0 + 8);
+// 行号格右缘 = 行号列宽
+const rnTd = host.querySelector('tr[data-r="0"] td.rownum');
+const rnCol = host.querySelectorAll('colgroup col')[1];
+const rn0 = parseInt(rnCol.style.width, 10);
+rnTd.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: nearRect(rnTd, 'r').x, clientY: nearRect(rnTd, 'r').y, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: nearRect(rnTd, 'r').x + 10, clientY: nearRect(rnTd, 'r').y, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+ok('行号格右缘拖行号列宽 ' + rn0 + ' → ' + parseInt(rnCol.style.width, 10), parseInt(rnCol.style.width, 10) === rn0 + 10);
+// 交界拖拽后双击仍能进编辑（dblclick 冒泡不被拖拽路径吞掉）。
+// 注意：行高拖拽会 render() 重建 DOM，须重新取节点（列宽拖拽只改 colgroup，不重建）。
+let dblCell = false;
+host.addEventListener('dblclick', () => { dblCell = true; }, { once: true });
+const tdA2 = host.querySelector('tr[data-r="0"] td[data-c="0"]');
+ok('行高拖拽后仍是同一网格内容（新 td 已就位）', !!tdA2 && tdA2 !== tdA);
+tdA2.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+ok('交界处双击仍冒泡（编辑入口可达）', dblCell);
+g.resetLayout();
+
 document.getElementById('out').textContent = L.join('\n');
 </script>
 </body></html>

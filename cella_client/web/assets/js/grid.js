@@ -212,6 +212,24 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
   }
 
   // ── 列宽 / 行高拖拽（双击自适应、复位）──────────────────
+  // 任意单元格交界都能拖：数据格/行号格右缘 = 列宽，任意格下缘 = 行高（Excel 式）。
+  // 用事件坐标判定，不给每个 td 挂手柄元素（虚拟滚动下 DOM 频繁重建，挂不住也不划算）。
+  const EDGE = 5;   // 距交界多少像素内算「在交界上」
+  function edgeZone(e) {
+    const td = e.target.closest('td');
+    if (!td || !td.isConnected || td.classList.contains('empty')) return null;
+    const tr = td.closest('tr');
+    if (!tr || tr.classList.contains('pad')) return null;
+    const rect = td.getBoundingClientRect();
+    if (rect.right - e.clientX <= EDGE && rect.right - e.clientX >= -1) {
+      if (td.hasAttribute('data-c')) return { kind: 'col', ci: +td.getAttribute('data-c') };
+      if (td.classList.contains('rownum')) return { kind: 'rownum' };
+      return null;   // 复选框列宽固定，不给拖
+    }
+    if (rect.bottom - e.clientY <= EDGE && rect.bottom - e.clientY >= -1) return { kind: 'row' };
+    return null;
+  }
+
   table.addEventListener('mousedown', (e) => {
     const rowHandle = e.target.closest('.rowresize');
     if (rowHandle) {
@@ -228,6 +246,23 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
       else resizeState = { kind: 'col', ci, x: e.clientX, w: widths[ci] };
       suppressClick = true;
       document.body.style.cursor = 'col-resize';
+      e.preventDefault();
+      return;
+    }
+    // 单元格交界：右缘拖列宽 / 下缘拖行高（优先于选区）
+    const zone = edgeZone(e);
+    if (zone) {
+      if (zone.kind === 'row') {
+        resizeState = { kind: 'row', y: e.clientY, h: rowH };
+        document.body.style.cursor = 'row-resize';
+      } else if (zone.kind === 'rownum') {
+        resizeState = { kind: 'rownum', x: e.clientX, w: rownumW };
+        document.body.style.cursor = 'col-resize';
+      } else {
+        resizeState = { kind: 'col', ci: zone.ci, x: e.clientX, w: widths[zone.ci] };
+        document.body.style.cursor = 'col-resize';
+      }
+      suppressClick = true;
       e.preventDefault();
       return;
     }
@@ -248,6 +283,16 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
     sel = { r1: r, c1: +td.getAttribute('data-c'), r2: r, c2: +td.getAttribute('data-c') };
     dragMode = 'cell';
     paintSelection();
+  });
+
+  // 悬停在交界上时给出光标提示（拖拽进行中交给 body 级光标）
+  table.addEventListener('mousemove', (e) => {
+    if (resizeState || dragMode) return;
+    const z = edgeZone(e);
+    table.style.cursor = z ? (z.kind === 'row' ? 'row-resize' : 'col-resize') : '';
+  });
+  table.addEventListener('mouseleave', () => {
+    if (!resizeState && !dragMode) table.style.cursor = '';
   });
 
   table.addEventListener('mousemove', (e) => {

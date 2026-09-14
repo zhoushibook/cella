@@ -16,11 +16,11 @@
 </head><body>
 <h1>cella 前端自测</h1>
 <p class="dim">零依赖的行为测试：在真实浏览器里 import 真实模块，派发真实事件，把断言结果写回页面。
-用 headless 浏览器跑（无需 npm / 无需装 agent-browser）。五个套件共 <b>152 项</b>。</p>
+用 headless 浏览器跑（无需 npm / 无需装 agent-browser）。五个套件共 <b>163 项</b>。</p>
 
 <div class="case">
   <h3>① <a href="/_selftest/grid.html">grid.html</a> —— 结果网格</h3>
-  <p class="dim">41 项：固定布局与 colgroup、列宽拖拽 + 双击自适应、<b>行高拖拽</b>与垫片重算、三态排序、
+  <p class="dim">52 项：固定布局与 colgroup、列宽拖拽 + 双击自适应、<b>行高拖拽</b>与垫片重算、三态排序、
   勾选与全选、区块选区 + Ctrl+C TSV、点行号选整行 / Ctrl+A 全选、无 onSort 时本地排序，<br><b>回归：拖拽后的尾随 click 不触发排序/全选；setData 不冲掉手动列宽；<br>mousedown 选区不得重建 DOM（重建会打断浏览器 dblclick 计数 → 双击编辑失灵）</b>。</p>
 </div>
 <div class="case">
