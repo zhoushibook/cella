@@ -824,5 +824,12 @@ out->rows.push_back(in.rows[i]);     // ← 然后才切片
 （`scrollTop / rowH`）与上下垫片高度，拖拽时必须 `render()` 重算（不能只改 CSS）；
 单元格高度由 `--row-h` 驱动，并配合 `box-sizing: border-box` 让实测行高与 `rowH` 一致。
 
-自测：新增 `web/_selftest/layout.html`（30 项）覆盖夹逼、持久化、双击复位与真实页面拖拽；
-`grid.html` 追加垫片随行高重算的断言。前端套件合计 **124 项**。
+自测：新增 `web/_selftest/layout.html`（40 项）覆盖夹逼、持久化、双击复位与真实页面拖拽；
+`grid.html` 追加垫片随行高重算的断言。前端套件合计 **134 项**。
+
+**⚠️ 拖拽基准的坑（已修，2026-09-14 用户反馈）**：`mousemove` 给的是**相对按下点的累计位移**，
+所以基准必须**在按下瞬间取当前实际尺寸**，且移动过程中不能把结果写回基准。
+`initSplitters` 最初把启动时读到的 `sw0/ph0` 当基准 → 第二次拖动会**先跳回默认值再跟手**；
+`editor.js` 最初写 `height = height + dy` → 一次拖动内**每步累加、跟手速度翻倍**。
+现在统一为 `onStart` 里 `getBoundingClientRect()` 取基准 + `base + delta`，
+并在 `layout.html` 加了两类回归断言（连续两次拖拽 / 一次拖拽内多步位移）。

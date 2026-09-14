@@ -110,6 +110,7 @@ export function createEditor(container, { onRun, onChange, onHistory } = {}) {
 
   // 编辑器高度可拖（拖下边缘；双击复位），偏好写到 localStorage
   let height = loadNum('editorH', 168, 80, 900);
+  let baseH = height;      // 按下瞬间的实际高度：onMove 的 dy 是累计位移，基准不能累加
   container.style.height = height + 'px';
   const grip = document.createElement('div');
   grip.className = 'edresize';
@@ -118,8 +119,9 @@ export function createEditor(container, { onRun, onChange, onHistory } = {}) {
   makeSplitter(grip, {
     axis: 'y',
     noClass: true,
+    onStart: () => { baseH = container.getBoundingClientRect().height; },
     onMove: (dx, dy) => {
-      height = Math.max(80, Math.min(900, Math.round(height + dy)));
+      height = Math.max(80, Math.min(900, Math.round(baseH + dy)));
       container.style.height = height + 'px';
       sync();
     },

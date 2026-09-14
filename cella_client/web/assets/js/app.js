@@ -943,24 +943,32 @@ function initSplitters() {
 
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
+  // 拖拽基准必须在**按下瞬间**取当前实际尺寸：否则第二次拖动会从启动时的旧值算起，
+  // 表现为「先跳回默认宽度再跟随鼠标」。（onMove 的 dx 是相对按下点的累计位移，基准不能累加）
+  const sidebarBox = $('sidebar');
   const sideEl = $('sidebarSplit');
+  let sideBase = sw0;
   let sideW = sw0;
   makeSplitter(sideEl, {
     axis: 'x',
+    onStart: () => { sideBase = sidebarBox.getBoundingClientRect().width; },
     onMove: (dx) => {
-      sideW = clamp(sw0 + dx, SIDEBAR_W.min, SIDEBAR_W.max);
+      sideW = clamp(sideBase + dx, SIDEBAR_W.min, SIDEBAR_W.max);
       setVar('--sidebar-w', sideW);
     },
     onEnd: () => saveNum('sidebarW', sideW),
   });
   sideEl.addEventListener('dblclick', () => { sideW = SIDEBAR_W.def; applySidebarW(sideW); });
 
+  const panelBox = $('bottomPanel');
   const panelEl = $('panelSplit');
+  let panelBase = ph0;
   let panelH = ph0;
   makeSplitter(panelEl, {
     axis: 'y',
+    onStart: () => { panelBase = panelBox.getBoundingClientRect().height; },
     onMove: (dx, dy) => {
-      panelH = clamp(ph0 - dy, PANEL_H.min, PANEL_H.max);   // 向上拖 = 面板变高
+      panelH = clamp(panelBase - dy, PANEL_H.min, PANEL_H.max);   // 向上拖 = 面板变高
       setVar('--panel-h', panelH);
     },
     onEnd: () => saveNum('panelH', panelH),

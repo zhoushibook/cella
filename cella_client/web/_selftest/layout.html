@@ -46,11 +46,14 @@ const f = document.getElementById('f');
 let started = false;
 f.addEventListener('load', async () => { if (!started) { started = true; await run(); } });
 
-const drag = (target, doc, dx, dy) => {
+const dragSeq = (target, doc, steps) => {          // steps: [[dx,dy],...] 相对按下点的累计位移
   target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: 200, clientY: 200 }));
-  doc.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 200 + dx, clientY: 200 + dy, buttons: 1 }));
-  doc.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: 200 + dx, clientY: 200 + dy }));
+  for (const [dx, dy] of steps) {
+    doc.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 200 + dx, clientY: 200 + dy, buttons: 1 }));
+  }
+  doc.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: 200, clientY: 200 }));
 };
+const drag = (target, doc, dx, dy) => dragSeq(target, doc, [[dx, dy]]);
 const dbl = (target, doc) => {
   target.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true }));
   void doc;
@@ -74,6 +77,16 @@ async function run() {
   dbl(d.getElementById('sidebarSplit'), d);
   ok('双击侧边栏手柄复位 200', cssVar(d, '--sidebar-w') === '200px');
 
+  // 回归：第二次拖动必须以「当前宽度」为基准（曾经用启动时的旧值 → 先跳回默认再跟随鼠标）
+  lay.reset();
+  drag(d.getElementById('sidebarSplit'), d, 60, 0);
+  ok('连续拖拽① 200 → 260', cssVar(d, '--sidebar-w') === '260px');
+  drag(d.getElementById('sidebarSplit'), d, 20, 0);
+  ok('连续拖拽② 以当前 260 为基准 → 280（回归点）', cssVar(d, '--sidebar-w') === '280px');
+  dragSeq(d.getElementById('sidebarSplit'), d, [[10, 0], [30, 0], [50, 0]]);
+  ok('一次拖拽内多步位移不累加 → 330', cssVar(d, '--sidebar-w') === '330px');
+  dbl(d.getElementById('sidebarSplit'), d);
+
   // 底部面板高度（要先打开面板）
   ok('面板隐藏时手柄也隐藏', d.getElementById('panelSplit').classList.contains('hidden'));
   d.getElementById('stDiag').dispatchEvent(new MouseEvent('click', { bubbles: true }));
@@ -88,6 +101,16 @@ async function run() {
   dbl(d.getElementById('panelSplit'), d);
   ok('双击面板手柄复位 200', cssVar(d, '--panel-h') === '200px');
 
+  // 回归：面板同样要以当前高度为基准，且一次拖拽内多步不累加
+  drag(d.getElementById('panelSplit'), d, 0, -50);
+  ok('连续拖拽面板① 200 → 250', cssVar(d, '--panel-h') === '250px');
+  drag(d.getElementById('panelSplit'), d, 0, -30);
+  ok('连续拖拽面板② 以当前 250 为基准 → 280（回归点）', cssVar(d, '--panel-h') === '280px');
+  dragSeq(d.getElementById('panelSplit'), d, [[0, -10], [0, -30], [0, -40]]);
+  ok('一次拖拽内多步位移不累加 → 320', cssVar(d, '--panel-h') === '320px');
+  dbl(d.getElementById('panelSplit'), d);
+  ok('面板复位回 200', cssVar(d, '--panel-h') === '200px');
+
   // 编辑器高度
   const ed = d.querySelector('.editorwrap');
   ok('编辑器默认高 168', ed.style.height === '168px' && !!ed.querySelector('.edresize'));
@@ -96,6 +119,14 @@ async function run() {
   ok('编辑器高度已持久化', w.localStorage.getItem('cella.ui.editorH') === '208');
   dbl(ed.querySelector('.edresize'), d);
   ok('双击编辑器手柄复位 168', ed.style.height === '168px');
+
+  // 回归：一次拖拽内多步位移不能累加（曾经 height + dy 逐步累加 → 跟手速度翻倍）
+  dragSeq(ed.querySelector('.edresize'), d, [[0, 20], [0, 40]]);
+  ok('编辑器多步拖拽取最后位移 → 208（回归点）', ed.style.height === '208px');
+  drag(ed.querySelector('.edresize'), d, 0, 12);
+  ok('编辑器连续拖拽以当前高度为基准 → 220', ed.style.height === '220px');
+  dbl(ed.querySelector('.edresize'), d);
+  ok('编辑器复位 168', ed.style.height === '168px');
 
   // 网格行高 / 行号列宽（在数据标签里）
   d.querySelector('.treenode.tbl').dispatchEvent(new MouseEvent('click', { bubbles: true }));

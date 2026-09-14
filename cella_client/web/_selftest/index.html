@@ -16,7 +16,7 @@
 </head><body>
 <h1>cella 前端自测</h1>
 <p class="dim">零依赖的行为测试：在真实浏览器里 import 真实模块，派发真实事件，把断言结果写回页面。
-用 headless 浏览器跑（无需 npm / 无需装 agent-browser）。五个套件共 <b>124 项</b>。</p>
+用 headless 浏览器跑（无需 npm / 无需装 agent-browser）。五个套件共 <b>134 项</b>。</p>
 
 <div class="case">
   <h3>① <a href="/_selftest/grid.html">grid.html</a> —— 结果网格</h3>
@@ -35,8 +35,8 @@
 </div>
 <div class="case">
   <h3>④ <a href="/_selftest/layout.html">layout.html</a> —— 布局拖拽</h3>
-  <p class="dim">30 项：偏好读写与夹逼、分隔条的位移/收尾回调；真实页面里拖<b>侧边栏宽度</b>、<b>底部面板高度</b>、
-  <b>编辑器高度</b>、<b>网格行高</b>与<b>行号列宽</b>，含上下限夹逼、双击复位与 localStorage 持久化。</p>
+  <p class="dim">40 项：偏好读写与夹逼、分隔条的位移/收尾回调；真实页面里拖<b>侧边栏宽度</b>、<b>底部面板高度</b>、
+  <b>编辑器高度</b>、<b>网格行高</b>与<b>行号列宽</b>，含上下限夹逼、双击复位与 localStorage 持久化，以及**连续拖拽/多步位移的基准回归**。</p>
 </div>
 <div class="case">
   <h3>⑤ <a href="/_selftest/app.html">app.html</a> —— 整体集成</h3>
