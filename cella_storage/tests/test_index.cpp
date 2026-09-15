@@ -37,7 +37,7 @@ Value Int64(int64_t v) { return Value::BigInt(v); }
 Value Varchar(const std::string& s) { return Value::Varchar(s); }
 
 // 便捷：插入一个 int 值
-Status InsertInt(BPlusTree* t, int32_t v, page_id_t page, uint8_t slot, bool* dup) {
+Status InsertInt(BPlusTree* t, int32_t v, page_id_t page, uint16_t slot, bool* dup) {
   return t->Insert(EncodeLeafKey(Int32(v), page, slot), dup);
 }
 
@@ -83,7 +83,7 @@ TEST_CASE(index_key_leaf_rid_roundtrip) {
   EXPECT_TRUE(DecodeLeafKeyColumn(k, ValueType::kInt32, &out));
   EXPECT_EQ(out.int32_val, 42);
   page_id_t pg = 0;
-  uint8_t slot = 0;
+  uint16_t slot = 0;
   EXPECT_TRUE(DecodeLeafKeyRid(k, &pg, &slot));
   EXPECT_EQ(pg, 7u);
   EXPECT_EQ(slot, 13);
@@ -584,7 +584,7 @@ TEST_CASE(bptree_leaf_pages_match_scan) {
 namespace {
 
 // 便捷：复合叶子键
-std::string LeafKey(const std::vector<Value>& vals, page_id_t page, uint8_t slot) {
+std::string LeafKey(const std::vector<Value>& vals, page_id_t page, uint16_t slot) {
   return EncodeLeafKeyColumns(vals, page, slot);
 }
 
@@ -648,7 +648,7 @@ TEST_CASE(composite_key_roundtrip_all_types) {
     }
     // 行定位 roundtrip
     page_id_t pg = 0;
-    uint8_t slot = 0;
+    uint16_t slot = 0;
     EXPECT_TRUE(DecodeLeafKeyRid(leaf, &pg, &slot));
     EXPECT_EQ(pg, 9u);
     EXPECT_EQ(slot, 4);
@@ -662,9 +662,9 @@ TEST_CASE(composite_key_null_bitmap_disambiguates) {
   const std::string a = EncodeColumnKeys({Value::Null(), Varchar("xy")});
   const std::string b = EncodeColumnKeys({Int32(-2147417223), Varchar("")});
   EXPECT_TRUE(a != b);
-  // 补一个哑行定位，变成合法叶子键后再解码（长度 ≥ 5 的键会按「尾部 5B
+  // 补一个哑行定位，变成合法叶子键后再解码（长度 ≥ 6 的键会按「尾部 6B
   // 是行定位」切分 —— 这正是行定位恒在键尾的约定）
-  const std::string dummy_rid(5, '\0');
+  const std::string dummy_rid(6, '\0');
   std::vector<Value> da, db;
   EXPECT_TRUE(DecodeLeafKeyColumns(a + dummy_rid, {ValueType::kInt32, ValueType::kVarchar}, &da));
   EXPECT_TRUE(da[0].IsNull());

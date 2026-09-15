@@ -420,3 +420,170 @@ MT_TEST(P13_显式IndexScan由EXPLAIN与GET共用同一路径) {
   MT_CHECK(g.all_ok());
   MT_EQ(RowsText(g.statements[0].result), std::string("250|500"));
 }
+
+// ── 根页号的持久化（回归：大表上索引漏查）───────────────────────
+//
+// 复现的是一条「索引建在空表上、之后才灌数据」的链路：
+//   * 建表带 PRIMARY KEY → t_pk 在空表上建；或先 CREATE INDEX 再 INSERT；
+//   * 插入/回填过程中叶子页装满 → 树分裂 → **根页号变化**；
+//   * 根页号唯一的持久化位置是系统表 cella_index.root_page_id。
+// 若分裂后写进目录的不是**最终根**（早期实现写的是 Create() 在空树上分配的
+// 那个页号，回填几百行后它早已是普通子节点），下一次 OpenTableIndexes 就会
+// 按旧根 Attach —— 分裂出去的兄弟子树全部不可达，表现为「表里明明有这行，
+// 按索引列点查却返回 0 行」（实测 300 行表漏查 14 行）。
+//
+// 为什么既有用例没抓到：BigSetup() 是「先 INSERT 再 CREATE INDEX」，且所有
+// 一致性用例只查一个固定值，行数与取值都没落到分裂之后的区间上。
+// 这里把四种顺序/路径都覆盖一遍，并**逐行**断言。
+namespace {
+
+// 逐行等值点查，返回查不到的行数。rows 从 1 起，第 i 行 v = i*3。
+int CountMissingByValue(Engine& e, int rows) {
+  int missing = 0;
+  for (int i = 1; i <= rows; ++i) {
+    const ScriptReport r = e.Run("GET id IN t LIMIT v = " + std::to_string(i * 3) + ";");
+    if (!r.all_ok() || testutil::RowCount(r.statements[0].result) != 1) {
+      ++missing;
+    }
+  }
+  return missing;
+}
+
+std::string InsertRowSql(int i) {
+  return "INSERT INTO t VALUES (" + std::to_string(i) + "," + std::to_string(i * 3) + ");";
+}
+
+}  // namespace
+
+// ① 索引在空表上创建，之后逐行插入（必然经历多次分裂）
+MT_TEST(P13_根页号持久化_先建索引后插数据不丢行) {
+  Engine e("p13_root_persist");
+  MT_CHECK(e.opened);
+
+  const int kRows = 300;
+  MT_CHECK(e.Run("CREATE TABLE t (id INT, v INT);CREATE INDEX idx_v ON t (v);").all_ok());
+  for (int i = 1; i <= kRows; ++i) {
+    MT_CHECK(e.Run(InsertRowSql(i)).all_ok());
+  }
+  MT_EQ(CountMissingByValue(e, kRows), 0);
+}
+
+// ② 主键索引随建表创建（同样是空表），再灌数据 —— 走的是另一条建索引路径
+MT_TEST(P13_根页号持久化_主键索引同样成立) {
+  Engine e("p13_root_persist_pk");
+  MT_CHECK(e.opened);
+
+  const int kRows = 300;
+  MT_CHECK(e.Run("CREATE TABLE t (id INT PRIMARY KEY, v INT);").all_ok());
+  for (int i = 1; i <= kRows; ++i) {
+    MT_CHECK(e.Run(InsertRowSql(i)).all_ok());
+  }
+
+  int missing = 0;
+  for (int i = 1; i <= kRows; ++i) {
+    const ScriptReport r = e.Run("GET id IN t LIMIT id = " + std::to_string(i) + ";");
+    if (!r.all_ok() || testutil::RowCount(r.statements[0].result) != 1) {
+      ++missing;
+    }
+  }
+  MT_EQ(missing, 0);
+}
+
+// ③ 换一个进程重新打开：目录里存的必须是最终根（验证真的落盘了，不只是内存对）
+MT_TEST(P13_根页号持久化_重启后仍然正确) {
+  Engine e("p13_root_persist_reopen");
+  MT_CHECK(e.opened);
+
+  const int kRows = 300;
+  MT_CHECK(e.Run("CREATE TABLE t (id INT, v INT);CREATE INDEX idx_v ON t (v);").all_ok());
+  for (int i = 1; i <= kRows; ++i) {
+    MT_CHECK(e.Run(InsertRowSql(i)).all_ok());
+  }
+  MT_CHECK(e.Reopen());
+  MT_EQ(CountMissingByValue(e, kRows), 0);
+}
+
+// ④ CREATE INDEX 的全量回填路径：落库的必须是回填**结束**后的根
+MT_TEST(P13_根页号持久化_回填路径写的是最终根) {
+  Engine e("p13_root_backfill");
+  MT_CHECK(e.opened);
+
+  const int kRows = 300;
+  MT_CHECK(e.Run("CREATE TABLE t (id INT, v INT);").all_ok());
+  for (int i = 1; i <= kRows; ++i) {
+    MT_CHECK(e.Run(InsertRowSql(i)).all_ok());
+  }
+  MT_CHECK(e.Run("CREATE INDEX idx_v ON t (v);").all_ok());
+  MT_EQ(CountMissingByValue(e, kRows), 0);
+}
+
+// ⑤ 全表扫描与索引扫描在大表上必须给出一致的结果（原用例只查一个值）
+MT_TEST(P13_大表索引与全表扫描结果一致) {
+  Engine e("p13_big_consistency");
+  MT_CHECK(e.opened);
+
+  const int kRows = 300;
+  MT_CHECK(e.Run("CREATE TABLE t (id INT, v INT);CREATE INDEX idx_v ON t (v);").all_ok());
+  for (int i = 1; i <= kRows; ++i) {
+    MT_CHECK(e.Run(InsertRowSql(i)).all_ok());
+  }
+
+  // 基准：删掉索引走全表扫描
+  const ScriptReport seq =
+      e.Run("DROP INDEX idx_v;GET id IN t LIMIT v >= 600 AND v <= 900 ordered id asc;");
+  MT_CHECK(seq.all_ok());
+  const std::string seq_rows = RowsText(seq.statements[1].result);
+
+  // 重建索引后同一条件（此时走索引区间扫描）
+  const ScriptReport idx =
+      e.Run("CREATE INDEX idx_v ON t (v);"
+            "GET id IN t LIMIT v >= 600 AND v <= 900 ordered id asc;");
+  MT_CHECK(idx.all_ok());
+  MT_EQ(RowsText(idx.statements[1].result), seq_rows);
+}
+
+// ⑥ 页内槽号必须完整参与索引键（回归：槽号被截断成 1 字节）
+//
+// 这是上面那组用例背后**更深的那个**缺陷，单独钉住它：
+//   * slot_id_t 是 uint16_t，4KB 页上 (INT,INT) 记录能放 **270 行**；
+//   * 早先索引叶子键的行定位是 page_id(4B) + **slot_id(1B)**；
+//   * 于是槽号 ≥ 256 被截断（256 → 0），与同页 0..13 号槽的键**逐字节相同**，
+//     插入时被当成「完全重复键」丢弃 → 这些行的索引项根本不存在。
+// 现象：每张表页的**最后 14 行**（槽号 256..269）按索引列/主键点查一律返回 0 行，
+//       而全表扫描能找到它们；表越大漏得越多（600 行时漏 28 行）。
+// 行号与表页的对应关系（实测 rowid = (页号<<16)|槽号）：
+//   行 1..270   → 页 4，槽 0..269   → 行 257..270  = 槽 256..269  ← 会漏
+//   行 271..540 → 页 5，槽 0..269   → 行 527..540  = 槽 256..269  ← 会漏
+MT_TEST(P13_页内槽号超过255的行也能被索引找到) {
+  Engine e("p13_slot_width");
+  MT_CHECK(e.opened);
+
+  const int kRows = 600;  // 跨 3 张表页，前两张各含槽号 256..269
+  MT_CHECK(e.Run("CREATE TABLE t (id INT, v INT);CREATE INDEX idx_v ON t (v);").all_ok());
+  for (int i = 1; i <= kRows; ++i) {
+    MT_CHECK(e.Run(InsertRowSql(i)).all_ok());
+  }
+
+  // 先确认这几行确实落在「槽号 ≥ 256」的区间上（前提失效时这条会先炸，
+  // 避免用例变成「碰巧通过」）。不硬编码页号：数据页与索引页交错分配，
+  // 页号随实现变化，但「低 16 位 = 页内槽号」这个 rowid 约定是稳定的。
+  for (int row : {257, 270, 527, 540}) {
+    const ScriptReport r = e.Run("GET rowid IN t LIMIT id = " + std::to_string(row) + ";");
+    MT_CHECK(r.all_ok());
+    const std::string text = RowsText(r.statements[0].result);
+    MT_CHECK(!text.empty());
+    const unsigned long rowid = std::stoul(text);
+    MT_CHECK((rowid & 0xFFFFul) >= 256ul);   // 槽号确实越过了 1 字节上限
+  }
+
+  // 这几行必须能被索引找到（第 i 行的 v = i*3，见 InsertRowSql）
+  for (int row : {256, 257, 270, 271, 526, 527, 540, 541}) {
+    const ScriptReport r =
+        e.Run("GET id IN t LIMIT v = " + std::to_string(row * 3) + ";");
+    MT_CHECK(r.all_ok());
+    MT_EQ(RowsText(r.statements[0].result), std::to_string(row));
+  }
+
+  // 全量复核：600 行逐行点查一行都不能少
+  MT_EQ(CountMissingByValue(e, kRows), 0);
+}

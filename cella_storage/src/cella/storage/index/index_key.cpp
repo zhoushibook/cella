@@ -239,14 +239,16 @@ void EncodeIndexColumn(const Value& v, std::string* out) {
   }
 }
 
-std::string EncodeLeafKey(const Value& v, page_id_t page_id, uint8_t slot_id) {
+std::string EncodeLeafKey(const Value& v, page_id_t page_id, uint16_t slot_id) {
   std::string key;
   EncodeIndexColumn(v, &key);
   key.push_back(static_cast<char>((page_id >> 24) & 0xFFu));
   key.push_back(static_cast<char>((page_id >> 16) & 0xFFu));
   key.push_back(static_cast<char>((page_id >> 8) & 0xFFu));
   key.push_back(static_cast<char>(page_id & 0xFFu));
-  key.push_back(static_cast<char>(slot_id));
+  // 槽号 2 字节大端（与 EncodeLeafKeyColumns 一致；见那里的注释）
+  key.push_back(static_cast<char>((slot_id >> 8) & 0xFFu));
+  key.push_back(static_cast<char>(slot_id & 0xFFu));
   return key;
 }
 
@@ -318,13 +320,17 @@ std::string EncodeColumnPrefix(const std::vector<Value>& prefix_vals, size_t tot
 }
 
 std::string EncodeLeafKeyColumns(const std::vector<Value>& vals, page_id_t page_id,
-                                 uint8_t slot_id) {
+                                 uint16_t slot_id) {
   std::string key = EncodeColumnKeys(vals);
   key.push_back(static_cast<char>((page_id >> 24) & 0xFFu));
   key.push_back(static_cast<char>((page_id >> 16) & 0xFFu));
   key.push_back(static_cast<char>((page_id >> 8) & 0xFFu));
   key.push_back(static_cast<char>(page_id & 0xFFu));
-  key.push_back(static_cast<char>(slot_id));
+  // 槽号 2 字节大端。**不能**只写低 8 位：slot_id_t 是 uint16_t，4KB 页上
+  // 一页能放几百行，槽号 ≥ 256 截断后会与同页低槽号的键完全相同，
+  // 索引插入把它当「重复键」丢弃 → 那些行再也查不到。
+  key.push_back(static_cast<char>((slot_id >> 8) & 0xFFu));
+  key.push_back(static_cast<char>(slot_id & 0xFFu));
   return key;
 }
 
@@ -410,7 +416,7 @@ bool DecodeLeafKeyColumns(const std::string& key, const std::vector<ValueType>& 
   if (types.empty()) {
     return false;
   }
-  // 列值部分 = 去掉尾部行定位。不足 5 字节的键视为「纯列值键」（内部节点
+  // 列值部分 = 去掉尾部行定位。不足 6 字节的键视为「纯列值键」（内部节点
   // 分隔键形态），此时列值部分就是整键 —— 宽容处理，方便诊断工具复用。
   const size_t col_total =
       (key.size() >= kIndexLeafRidBytes) ? key.size() - kIndexLeafRidBytes : key.size();
@@ -457,13 +463,15 @@ bool DecodeLeafKeyColumns(const std::string& key, const std::vector<ValueType>& 
   return true;
 }
 
-bool DecodeLeafKeyRid(const std::string& key, page_id_t* page_id, uint8_t* slot_id) {
+bool DecodeLeafKeyRid(const std::string& key, page_id_t* page_id, uint16_t* slot_id) {
   if (key.size() < kIndexLeafRidBytes) {
     return false;
   }
   const size_t base = key.size() - kIndexLeafRidBytes;
   *page_id = ReadU32BE(key.data() + base);
-  *slot_id = static_cast<uint8_t>(key[base + 4]);
+  const unsigned char hi = static_cast<unsigned char>(key[base + 4]);
+  const unsigned char lo = static_cast<unsigned char>(key[base + 5]);
+  *slot_id = static_cast<uint16_t>((static_cast<uint16_t>(hi) << 8) | lo);
   return true;
 }
 

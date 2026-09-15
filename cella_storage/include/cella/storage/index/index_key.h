@@ -57,7 +57,7 @@ void EncodeIndexColumn(const Value& v, std::string* out);
 
 // 编码「列值 + 行定位」，得到叶子里完整的键（单列便捷接口，等价于
 // EncodeLeafKeyColumns 的列数为 1 特例）。
-std::string EncodeLeafKey(const Value& v, page_id_t page_id, uint8_t slot_id);
+std::string EncodeLeafKey(const Value& v, page_id_t page_id, uint16_t slot_id);
 
 // ── 复合键 ──────────────────────────────────────────────────
 // 列值键（无行定位）：各列依次拼接；列数 ≥ 2 时前缀加 NULL 位图。
@@ -70,9 +70,10 @@ std::string EncodeColumnKeys(const std::vector<Value>& vals);
 // 含 NULL」的行落在另一个位图区，不被部分前缀命中（全键等值不受影响）。
 std::string EncodeColumnPrefix(const std::vector<Value>& prefix_vals, size_t total_columns);
 
-// 叶子键 = EncodeColumnKeys + 行定位 5B。
+// 叶子键 = EncodeColumnKeys + 行定位 6B（页号 4 + 槽号 2）。
+// 槽号必须给足 2 字节：slot_id_t 是 uint16_t，页内槽数没有 255 的上限。
 std::string EncodeLeafKeyColumns(const std::vector<Value>& vals, page_id_t page_id,
-                                 uint8_t slot_id);
+                                 uint16_t slot_id);
 
 // 解码叶子键的列值部分（按给定列类型解释，单列便捷接口）。
 bool DecodeLeafKeyColumn(const std::string& key, ValueType type, Value* out);
@@ -82,11 +83,11 @@ bool DecodeLeafKeyColumn(const std::string& key, ValueType type, Value* out);
 bool DecodeLeafKeyColumns(const std::string& key, const std::vector<ValueType>& types,
                           std::vector<Value>* out);
 
-// 解码叶子键的行定位部分。
-bool DecodeLeafKeyRid(const std::string& key, page_id_t* page_id, uint8_t* slot_id);
+// 解码叶子键的行定位部分（槽号是 2 字节，与 slot_id_t 同宽）。
+bool DecodeLeafKeyRid(const std::string& key, page_id_t* page_id, uint16_t* slot_id);
 
 // 去掉叶子键尾部的行定位，得到「列值键」（内部节点分隔键形态）。
-// 行定位恒在键尾 5 字节 → 复合键去尾后仍是完整元组编码，
+// 行定位恒在键尾 6 字节 → 复合键去尾后仍是完整元组编码，
 // CompareIndexKey 的前缀比较继续成立。
 std::string StripLeafRowId(const std::string& leaf_key);
 
@@ -102,6 +103,6 @@ size_t MaxEncodedColumnLen(ValueType type, uint16_t max_len);
 size_t NullBitmapBytes(size_t column_count);
 
 // 键的尾部行定位长度（供空间估算）
-constexpr size_t kIndexLeafRidBytes = 5;
+constexpr size_t kIndexLeafRidBytes = 6;
 
 }  // namespace cella::storage

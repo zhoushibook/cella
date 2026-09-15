@@ -651,7 +651,7 @@ namespace cella::db
         continue;
       }
       const std::string leaf = storage::EncodeLeafKeyColumns(
-          key_vals, it.rid().page_id, static_cast<uint8_t>(it.rid().slot_id));
+          key_vals, it.rid().page_id, static_cast<uint16_t>(it.rid().slot_id));
       bool dup = false;
       const storage::Status is = tree.Insert(leaf, &dup);
       if (!is.ok())
@@ -667,7 +667,9 @@ namespace cella::db
     entry.columns = pk_names;
     entry.column = entry.JoinedColumns();
     entry.unique = true; // 主键语义就是唯一
-    entry.root_page_id = root;
+    // 落库的是**回填结束后的**根页号，不是 Create() 在空树上给的页号 ——
+    // 回填触发分裂后旧页只是普通子节点，用它当根会让一半键不可达。
+    entry.root_page_id = static_cast<uint32_t>(tree.root_page());
     entry.created_at = static_cast<int64_t>(std::time(nullptr));
     const DbStatus ws = catalog_->WriteIndexRow(entry);
     if (!ws.ok())
@@ -861,7 +863,7 @@ namespace cella::db
           continue;
         }
         const std::string leaf = storage::EncodeLeafKeyColumns(
-            key_vals, it.rid().page_id, static_cast<uint8_t>(it.rid().slot_id));
+            key_vals, it.rid().page_id, static_cast<uint16_t>(it.rid().slot_id));
         bool dup = false;
         const storage::Status is = tree->Insert(leaf, &dup);
         if (!is.ok())
@@ -870,6 +872,12 @@ namespace cella::db
         }
         ++backfilled;
       }
+
+      // 回填过程中根会随分裂换页 —— 落库的必须是**回填结束后的**根页号。
+      // `root` 是 Create() 在空树上分配的页号，回填几百行后它早已是普通子节点；
+      // 把它写进 cella_index，之后每次 Attach 都从这棵子树下降，分裂出去的
+      // 兄弟子树全部不可达（表现为「表里有这行，索引点查却返回 0 行」）。
+      root = tree->root_page();
 
       // 唯一性检查：同列值元组不同行（键不同但列值前缀相同）视为冲突。
       // 键按「元组编码 + 行定位」有序 → 相邻键去尾后相等即同元组。
@@ -1151,7 +1159,7 @@ namespace cella::db
         }
       }
       const std::string leaf = storage::EncodeLeafKeyColumns(
-          key_vals, it.rid().page_id, static_cast<uint8_t>(it.rid().slot_id));
+          key_vals, it.rid().page_id, static_cast<uint16_t>(it.rid().slot_id));
       bool dup = false;
       const storage::Status is = tree.Insert(leaf, &dup);
       if (!is.ok())
@@ -1181,7 +1189,9 @@ namespace cella::db
     }
     if (root_out != nullptr)
     {
-      *root_out = static_cast<uint32_t>(root);
+      // 同 CREATE INDEX：必须回填结束后再取根。空树 Create() 给出的页号
+      // 在回填几十/几百个键之后已经不是根了。
+      *root_out = static_cast<uint32_t>(tree.root_page());
     }
     return DbStatus::Ok();
   }
@@ -2120,7 +2130,7 @@ namespace cella::db
   //     删除时先打墓碑再删索引项，避免「索引里有、表里没有」的悬空项。
   //   * 唯一性检查必须在**插入索引项之前**做，否则重复值已经进树，再去查重会
   //     把自己也算作冲突。
-  //   * 同一列值 → 同一条叶子键？不是：叶子键 = 列值编码 + 5B 行定位。因此
+  //   * 同一列值 → 同一条叶子键？不是：叶子键 = 列值编码 + 6B 行定位。因此
   //     「列值相同、行不同」在树里是**两条键**，唯一索引查重必须按列值前缀比，
   //     这正是 IndexValueFree 用 ScanRange 圈出等值区间再逐键解码的原因。
   //   * UPDATE 的存储实现是「删旧 + 插新」：若被索引列的值变了，索引项必须
@@ -2217,7 +2227,7 @@ namespace cella::db
     // NULL 也进索引（与编码约定一致：NULL 排在最前）。
     // 唯一性由 IndexValueFree 单独判定（含 NULL 的元组不参与唯一判定）。
     *leaf_key = storage::EncodeLeafKeyColumns(key_vals, rid.page_id,
-                                              static_cast<uint8_t>(rid.slot_id));
+                                              static_cast<uint16_t>(rid.slot_id));
     return true;
   }
 
@@ -2266,13 +2276,84 @@ namespace cella::db
     {
       // 同一个 Rid 是自己 → 不算冲突（UPDATE 原地不动时应允许）
       storage::page_id_t p = 0;
-      uint8_t s = 0;
+      uint16_t s = 0;
       if (storage::DecodeLeafKeyRid(leaf, &p, &s) && p == rid.page_id && s == rid.slot_id)
       {
         continue;
       }
       *busy = true;   // 前缀相同且 Rid 不同 → 同元组的另一行，冲突
       return DbStatus::Ok();
+    }
+    return DbStatus::Ok();
+  }
+
+  DbStatus Executor::PersistIndexRoots(std::vector<IndexHandle> *indexes)
+  {
+    if (catalog_ == nullptr || indexes == nullptr || indexes->empty())
+    {
+      return DbStatus::Ok();
+    }
+
+    // 名字先留一份：下面替换目录条目会让 IndexHandle::meta 全部悬空，
+    // 之后不能再碰它。
+    std::vector<std::string> names;
+    names.reserve(indexes->size());
+    for (const IndexHandle &ix : *indexes)
+    {
+      names.push_back(ix.meta == nullptr ? std::string() : ix.meta->name);
+    }
+
+    // 第一遍：只收集「换过根」的索引，先不动目录。
+    std::vector<std::pair<std::string, CatalogIndex>> pending;
+    for (size_t i = 0; i < indexes->size(); ++i)
+    {
+      const IndexHandle &ix = (*indexes)[i];
+      if (ix.meta == nullptr || ix.tree == nullptr || !ix.tree->valid() || names[i].empty())
+      {
+        continue;
+      }
+      const uint32_t cur = static_cast<uint32_t>(ix.tree->root_page());
+      if (cur == ix.meta->root_page_id)
+      {
+        continue; // 没换根（绝大多数写入都走这里）→ 一次目录写都不做
+      }
+      // 先整体拷贝再写：直接拿 ix.meta 的字段去写等于边读边写。
+      CatalogIndex entry = *ix.meta;
+      entry.root_page_id = cur;
+      pending.emplace_back(names[i], entry);
+    }
+    if (pending.empty())
+    {
+      return DbStatus::Ok();
+    }
+
+    // 第二遍：先删旧行、再写新行。
+    // 为什么不是直接 WriteIndexRow（它只追加）：LoadIndexesFromStorage 对重名是
+    // 「先到先得」，追加会让重启后读回**旧根**，等于换个方式继续错。
+    for (const auto &p : pending)
+    {
+      const DbStatus ds = catalog_->DeleteIndexRows(p.first);
+      if (!ds.ok())
+      {
+        return ds;
+      }
+      const DbStatus ws = catalog_->WriteIndexRow(p.second);
+      if (!ws.ok())
+      {
+        return ws;
+      }
+      DbLogInfo(logcat::kExec, "索引 " + p.first + " 根页号随分裂更新为 " +
+                                   std::to_string(p.second.root_page_id));
+    }
+
+    // 第三遍：DeleteIndexRows 会 erase 掉目录条目，原有指针已悬空 → 按名字重新取。
+    for (size_t i = 0; i < indexes->size(); ++i)
+    {
+      if (names[i].empty())
+      {
+        continue;
+      }
+      (*indexes)[i].meta = catalog_->FindIndex(names[i]);
     }
     return DbStatus::Ok();
   }
@@ -2312,7 +2393,8 @@ namespace cella::db
       }
       ++index_stats_.inserts;
     }
-    return DbStatus::Ok();
+    // 插入可能触发根分裂 → 根页号变了必须立刻回写目录（见 PersistIndexRoots 注释）
+    return PersistIndexRoots(indexes);
   }
 
   DbStatus Executor::IndexRowDelete(std::vector<IndexHandle> *indexes, const CatalogTable &table,
@@ -2338,7 +2420,7 @@ namespace cella::db
         ++index_stats_.deletes;
       }
     }
-    return DbStatus::Ok();
+    return PersistIndexRoots(indexes);
   }
 
   DbStatus Executor::IndexRowUpdate(std::vector<IndexHandle> *indexes, const CatalogTable &table,
@@ -2394,7 +2476,7 @@ namespace cella::db
       ++index_stats_.inserts;
       ++index_stats_.updates;
     }
-    return DbStatus::Ok();
+    return PersistIndexRoots(indexes);
   }
 
   DbStatus Executor::IndexRowCheckUpdate(const std::vector<IndexHandle> &indexes,
@@ -2509,7 +2591,7 @@ namespace cella::db
       for (const std::string &leaf : victims)
       {
         storage::page_id_t p = 0;
-        uint8_t s = 0;
+        uint16_t s = 0;
         if (!storage::DecodeLeafKeyRid(leaf, &p, &s))
         {
           continue;
@@ -2531,6 +2613,8 @@ namespace cella::db
         }
       }
     }
+    // 回滚路径同样可能触发分裂（撤销一次删除 = 重新插入）→ 根页号也要回写
+    (void)PersistIndexRoots(&indexes);
   }
 
   void Executor::UndoIndexRebuildRow(const std::string &table_name, const storage::Rid &rid,
@@ -2568,6 +2652,8 @@ namespace cella::db
         ++index_stats_.inserts;
       }
     }
+    // 撤销一次删除会把行重新插回索引，同样可能触发分裂 → 回写根页号
+    (void)PersistIndexRoots(&indexes);
   }
 
   void Executor::IndexUndoAdapter::OnUndoInsertDeleted(const std::string &table,
@@ -4022,7 +4108,7 @@ namespace cella::db
           [&](const std::string &leaf) -> bool
           {
             storage::page_id_t p = 0;
-            uint8_t s = 0;
+            uint16_t s = 0;
             if (storage::DecodeLeafKeyRid(leaf, &p, &s))
             {
               storage::Rid rid;
@@ -4062,7 +4148,7 @@ namespace cella::db
         [&](const std::string &leaf) -> bool
         {
           storage::page_id_t p = 0;
-          uint8_t s = 0;
+          uint16_t s = 0;
           if (storage::DecodeLeafKeyRid(leaf, &p, &s))
           {
             storage::Rid rid;
