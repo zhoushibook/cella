@@ -638,6 +638,75 @@ DbStatus CatalogManager::DeleteTableRow(const std::string& name) {
   return DbStatus::Ok();
 }
 
+DbStatus CatalogManager::ReplaceTableMeta(const std::string& old_name, const CatalogTable& table) {
+  if (storage_ == nullptr) {
+    return DbStatus::Error(DbCode::kCatalogError, "目录未附加存储引擎");
+  }
+  if (table.name.empty()) {
+    return DbStatus::Error(DbCode::kCatalogError, "表名不能为空");
+  }
+  const std::string old_key = ToUpper(old_name);
+  const std::string new_key = ToUpper(table.name);
+
+  // 先把「新旧两个名字」对应的目录行全部清掉（改名时旧行仍在），再写新行。
+  // 这样即使历史遗留了重复行，也能在 ALTER 时被顺手清理干净。
+  std::vector<storage::Rid> victims;
+  std::shared_ptr<storage::TableHeap> heap;
+  if (storage_->open_table(kSystemTableName, &heap).ok()) {
+    for (auto it = heap->begin(); it != heap->end(); ++it) {
+      const storage::Record& rec = *it;
+      if (rec.value_count() == 0 || rec.value(0).type != storage::ValueType::kVarchar) {
+        continue;
+      }
+      const std::string key = ToUpper(rec.value(0).str_val);
+      if (key == old_key || key == new_key) {
+        victims.push_back(it.rid());
+      }
+    }
+  }
+  for (const storage::Rid& rid : victims) {
+    const storage::Status s = storage_->delete_record(kSystemTableName, rid);
+    if (!s.ok()) {
+      return CatalogStorageError("ALTER：清理旧目录行失败", s);
+    }
+  }
+  tables_.erase(old_key);
+  if (new_key != old_key) {
+    tables_.erase(new_key);
+  }
+
+  CatalogTable entry = table;
+  for (auto& c : entry.columns) {
+    NormalizeColumn(&c);
+  }
+  if (entry.table_id == 0) {
+    entry.table_id = AllocateTableId();
+  } else {
+    next_table_id_ = std::max(next_table_id_, entry.table_id + 1);
+  }
+  if (entry.created_at == 0) {
+    entry.created_at = static_cast<int64_t>(std::time(nullptr));
+  }
+  const DbStatus ws = WriteTableRow(entry);
+  if (!ws.ok()) {
+    return ws;
+  }
+  tables_[new_key] = std::move(entry);
+  return DbStatus::Ok();
+}
+
+DbStatus CatalogManager::ReplaceIndexMeta(const CatalogIndex& index) {
+  if (storage_ == nullptr) {
+    return DbStatus::Error(DbCode::kCatalogError, "目录未附加存储引擎");
+  }
+  // 先删同名旧行（含内存条目）再写新行 → 天然幂等，可用于改列清单 / 换 root 页。
+  const DbStatus ds = DeleteIndexRows(index.name);
+  if (!ds.ok()) {
+    return ds;
+  }
+  return WriteIndexRow(index);
+}
+
 DbStatus CatalogManager::EnsurePhysicalTable(const CatalogTable& table) {
   if (storage_ == nullptr) {
     return DbStatus::Error(DbCode::kCatalogError, "目录未附加存储引擎");
@@ -889,6 +958,10 @@ cella::CELLA_Catalog CatalogManager::ToCompilerCatalog() const {
       cc.type = c.type;
       cc.len = c.len;
       cc.notNull = c.not_null;
+      // 主键标志必须带过去（P5）：ALTER TABLE ADD/DROP PRIMARY KEY 的合法性判定
+      // 完全靠编译器目录，而每次语句结束后 EnsureCatalogInSync 都会用它重建目录 ——
+      // 漏掉这一位会让「已有主键」的判断在第二条语句上就失效。
+      cc.primaryKey = c.primary_key;
       ct.columns.push_back(std::move(cc));
     }
     // 二级索引也要进编译器目录，否则语义层会在 CREATE/DROP INDEX 上误报

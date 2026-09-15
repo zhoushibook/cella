@@ -39,6 +39,8 @@
 #include "cella/db/exec/query_result.h"
 #include "cella/db/txn/lock_manager.h"
 #include "cella/db/txn/transaction.h"
+#include "cella/db/wal/recovery_manager.h"
+#include "cella/db/wal/wal_manager.h"
 #include "cella/storage/api/i_storage.h"
 #include "cella/storage/common/config.h"
 
@@ -60,7 +62,17 @@ struct EngineConfig {
   bool log_to_console = false;           // 同时打到控制台
   storage::LogLevel log_level = storage::LogLevel::kInfo;
   std::chrono::milliseconds lock_timeout{5000};
-  bool enable_journal = true;            // 写 <data_dir>/journal.log
+  // ── 预写日志 / 崩溃恢复（P2）──
+  // enable_journal 的含义已从「写审计文本」升级为「写真正的 WAL」。
+  bool enable_journal = true;
+  // WAL 文件名；空 → <data_dir>/<库名>.wal（**按库分文件**，切库时不会串味）。
+  // 它取代了早期的 <data_dir>/journal.log（那份只是提交后才补一行的审计文本，
+  // 没有任何恢复能力）；首次打开时若发现旧的 journal.log，会改名为 journal.log.legacy。
+  std::string wal_file;
+  // WAL 规则强度：每条记录都立刻刷到操作系统。
+  // 关掉会快一些，但「未提交事务的脏页被缓冲池淘汰到磁盘」时，日志里可能还没有
+  // 对应记录 → 恢复时无从撤销。默认开，宁可慢也要保住原子性。
+  bool wal_flush_each_record = true;
   // 访问控制（默认关：关掉时跳过全部权限检查、免登录，行为与引入本特性前一致）。
   // 用户/权限语句本身始终可用（会按需创建身份库），「强制」由本开关控制。
   bool enable_auth = false;
@@ -122,7 +134,25 @@ class DbEngine {
   // 因此这里用公开的 Close + Open 组合实现一次存盘；调用期间会独占存储互斥量，
   // 不会与其它会话的存储访问交叉。副作用：缓冲池统计计数器会被重置（已在
   // StatsText 里累计历史值，观测不丢）。
+  //
+  // P2 之后它同时是**日志的截断点**，顺序严格遵守 WAL 规则：
+  //   ① 先把日志刷到当前 LSN（脏页落盘前，日志必须已经在盘上）；
+  //   ② 再刷全部脏页；
+  //   ③ 写一条 checkpoint 记录（记录此刻仍活动的事务），刷盘；
+  //   ④ 压缩日志：只保留仍活动事务的记录 —— 于是「恢复时间 ∝ 距上次存盘点的改动量」。
   DbStatus Checkpoint();
+
+  // ── WAL / 崩溃恢复（P2）──
+  wal::WalManager* wal() { return wal_.get(); }
+  const wal::RecoveryStats& recovery_stats() const { return recovery_stats_; }
+  std::string WalText() const;
+
+  // 测试用：模拟「进程被强杀」。
+  // 做法是把**崩溃瞬间的磁盘状态**（数据文件 + WAL 文件，即缓冲池里尚未刷出的
+  // 脏页全部丢弃后的样子）原样固定下来，然后把工作目录恢复成这个状态。
+  // 于是下一次 Open 走的就是与真机崩溃完全相同的恢复路径。
+  // 不做任何 flush、不回滚活动事务 —— 崩溃也不会替你做这些。
+  DbStatus SimulateCrash();
 
   const EngineConfig& config() const { return config_; }
   CatalogManager& catalog() { return catalog_; }
@@ -208,6 +238,17 @@ class DbEngine {
   // 当前库 / 启动库（库名 = db_file 去掉 .db 后缀）
   std::string current_db_;
   std::string startup_db_;
+
+  // ── WAL / 恢复（P2）──
+  std::unique_ptr<wal::WalManager> wal_;
+  std::string wal_path_;
+  wal::RecoveryStats recovery_stats_;
+  // WAL 文件的默认名（按库分文件）
+  std::string DefaultWalPath() const;
+  // 打开/重挂当前库的 WAL，并在必要时跑一次崩溃恢复
+  DbStatus OpenWalAndRecover();
+  // 退役旧版纯文本 journal.log（一次性改名留档）
+  void RetireLegacyJournal();
 };
 
 // ── 会话：一条 SQL 执行链路 ─────────────────────────────────

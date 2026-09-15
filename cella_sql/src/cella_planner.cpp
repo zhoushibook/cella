@@ -293,6 +293,57 @@ namespace cella
                 node->extra.push_back("index: " + st.indexName);
                 break;
             }
+            case CELLA_Stmt::Kind::ALTER_TABLE:
+            {
+                node = makeNode("AlterTable", "", st.line, st.col);
+                node->stmt = &st;   // 执行期：动作 + 列定义 / 列名 / 新名 / 主键列清单
+                node->extra.push_back("table: " + st.tableName);
+                switch (st.alterAction)
+                {
+                case CELLA_Stmt::AlterAction::ADD_COLUMN:
+                {
+                    node->extra.push_back("action: ADD COLUMN");
+                    std::string s = st.newColumn.name + " " + cella_typeName(st.newColumn.type);
+                    if (st.newColumn.type == CELLA_DataType::CHAR ||
+                        st.newColumn.type == CELLA_DataType::VARCHAR)
+                    {
+                        s += "(" + std::to_string(st.newColumn.hasLen ? st.newColumn.len : 255) + ")";
+                    }
+                    if (st.newColumn.notNull)
+                        s += " NOT NULL";
+                    node->extra.push_back("column: " + s);
+                    break;
+                }
+                case CELLA_Stmt::AlterAction::DROP_COLUMN:
+                    node->extra.push_back("action: DROP COLUMN");
+                    node->extra.push_back("column: " + st.alterColumnName);
+                    break;
+                case CELLA_Stmt::AlterAction::RENAME_TABLE:
+                    node->extra.push_back("action: RENAME TO");
+                    node->extra.push_back("new_name: " + st.newName);
+                    break;
+                case CELLA_Stmt::AlterAction::RENAME_COLUMN:
+                    node->extra.push_back("action: RENAME COLUMN");
+                    node->extra.push_back("column: " + st.alterColumnName);
+                    node->extra.push_back("new_name: " + st.newName);
+                    break;
+                case CELLA_Stmt::AlterAction::ADD_PRIMARY_KEY:
+                    node->extra.push_back("action: ADD PRIMARY KEY");
+                    node->extra.push_back("columns: " + joinStrs(st.pkColumns, ", "));
+                    break;
+                case CELLA_Stmt::AlterAction::DROP_PRIMARY_KEY:
+                    node->extra.push_back("action: DROP PRIMARY KEY");
+                    break;
+                }
+                break;
+            }
+            case CELLA_Stmt::Kind::TRUNCATE_TABLE:
+            {
+                node = makeNode("TruncateTable", "", st.line, st.col);
+                node->stmt = &st;   // 执行期：表名
+                node->extra.push_back("table: " + st.tableName);
+                break;
+            }
             case CELLA_Stmt::Kind::GET:
                 node = buildGet(st);
                 break;

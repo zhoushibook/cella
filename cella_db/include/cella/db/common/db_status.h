@@ -38,6 +38,7 @@ enum class DbCode {
 
   // —— 存储层透传（DB-5xx）——
   kStorageError,        // DB-520 存储引擎返回失败（message 携带原始码）
+  kWalError,            // DB-521 WAL 读写/格式/恢复失败（P2 崩溃恢复）
 
   // —— 事务/并发（DB-6xx）——
   kNoActiveTxn,         // DB-601 没有活动事务时执行了需事务的操作

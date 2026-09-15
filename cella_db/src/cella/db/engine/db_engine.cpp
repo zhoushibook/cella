@@ -74,6 +74,10 @@ namespace cella::db
         return "CREATE INDEX";
       case cella::CELLA_Stmt::Kind::DROP_INDEX:
         return "DROP INDEX";
+      case cella::CELLA_Stmt::Kind::ALTER_TABLE:
+        return "ALTER TABLE";
+      case cella::CELLA_Stmt::Kind::TRUNCATE_TABLE:
+        return "TRUNCATE TABLE";
       }
       return "?";
     }
@@ -417,12 +421,8 @@ namespace cella::db
       }
     }
 
-    // ⑥ 事务管理器（含审计日志）
+    // ⑥ 事务管理器
     txn_manager_ = std::make_unique<TxnManager>(storage_.get(), locks_.get(), &storage_mutex_);
-    if (config_.enable_journal)
-    {
-      txn_manager_->SetJournalPath(config_.data_dir + "/journal.log");
-    }
 
     // ⑦ 执行器
     executor_ = std::make_unique<Executor>(storage_.get(), &catalog_, txn_manager_.get(), locks_.get(),
@@ -431,6 +431,17 @@ namespace cella::db
     // P1.5：把执行器侧的索引维护挂到事务回滚路径上。回滚只补偿表行，
     // 若不挂钩子，索引会与表数据分叉（重启后仍是脏的）。
     txn_manager_->SetUndoIndexHooks(executor_->undo_adapter());
+
+    // ⑦b WAL + 崩溃恢复（P2）
+    // 顺序有讲究：执行器与事务管理器都要写日志，而恢复又要用到它们去回放数据，
+    // 所以先把 WAL 装配好、再让恢复去跑。
+    {
+      const DbStatus ws = OpenWalAndRecover();
+      if (!ws.ok())
+      {
+        return ws;
+      }
+    }
 
     // ⑧ 默认会话
     default_session_ = std::make_unique<Session>(this, "main");
@@ -468,6 +479,87 @@ namespace cella::db
                                    std::to_string(config_.page_size) + " 缓冲池=" +
                                    std::to_string(config_.pool_size) + " 替换策略=" +
                                    config_.replacer + " 表数=" + std::to_string(catalog_.table_count()));
+    return DbStatus::Ok();
+  }
+
+  // ═════════════════════════════════════════════════════════════
+  // WAL / 崩溃恢复（P2）
+  // ═════════════════════════════════════════════════════════════
+
+  std::string DbEngine::DefaultWalPath() const
+  {
+    // 按库分文件：切库（USE）时不会把两个库的日志写进同一个文件。
+    const std::string stem = DbNameFromFile(config_.db_file);
+    return config_.data_dir + "/" + (stem.empty() ? "main" : stem) + ".wal";
+  }
+
+  // 早期版本写的是 <data_dir>/journal.log：一份「事务提交后才补一行」的纯文本，
+  // 没有任何恢复能力。P2 之后它由 <库名>.wal 取代 —— 这里把老文件改名留档，
+  // 既避免误把文本当日志解析，也留下了升级痕迹。
+  void DbEngine::RetireLegacyJournal()
+  {
+    const std::string legacy = config_.data_dir + "/journal.log";
+    std::error_code ec;
+    if (!std::filesystem::exists(legacy, ec))
+    {
+      return;
+    }
+    std::error_code rec;
+    std::filesystem::rename(legacy, legacy + ".legacy", rec);
+    if (!rec)
+    {
+      DbLogInfo(logcat::kEngine, "旧版审计日志已退役: journal.log → journal.log.legacy");
+    }
+  }
+
+  DbStatus DbEngine::OpenWalAndRecover()
+  {
+    if (!config_.enable_journal)
+    {
+      wal_.reset();
+      wal_path_.clear();
+      return DbStatus::Ok();
+    }
+    RetireLegacyJournal();
+    wal_ = std::make_unique<wal::WalManager>();
+    wal_->set_flush_each_record(config_.wal_flush_each_record);
+    wal_path_ = config_.wal_file.empty() ? DefaultWalPath() : config_.wal_file;
+    wal::OpenResult opened;
+    const DbStatus ws = wal_->Open(wal_path_, &opened);
+    if (!ws.ok())
+    {
+      return ws;
+    }
+    // 装配：事务的 begin/commit/abort 由 TxnManager 写，行变更由 Executor 写
+    txn_manager_->SetWal(wal_.get());
+    executor_->AttachWal(wal_.get());
+
+    if (opened.truncated_bytes != 0)
+    {
+      DbLogWarn(logcat::kEngine, "发现上次崩溃留下的半截日志（" +
+                                     std::to_string(opened.truncated_bytes) + " 字节），已截断");
+    }
+
+    wal::RecoveryManager recovery(wal_.get(), txn_manager_.get(), executor_.get());
+    const DbStatus rs = recovery.Recover(&recovery_stats_);
+    if (!rs.ok())
+    {
+      return rs;
+    }
+    if (recovery_stats_.ran)
+    {
+      DbLogInfo(logcat::kEngine, "崩溃恢复: " + recovery_stats_.ToText());
+      // 恢复结果立刻落盘（存盘点把重放出来的脏页写回数据文件），随后把日志整体
+      // 清空 —— 恢复出来的状态已是「干净关闭」等价物：已提交改动都落盘、未提交
+      // 改动已撤销、没有活动事务，于是日志再没有可重放的内容。下次启动直接打开，
+      // 无需再跑一遍恢复（恢复时间与存盘点频率成反比）。
+      const DbStatus cs = Checkpoint();
+      if (!cs.ok())
+      {
+        return cs;
+      }
+      (void)wal_->TruncateAll();
+    }
     return DbStatus::Ok();
   }
 
@@ -623,6 +715,16 @@ namespace cella::db
     stats_before_checkpoints_.page_allocs += before.page_allocs;
     stats_before_checkpoints_.page_frees += before.page_frees;
 
+    // ── ① WAL 规则：脏页落盘之前，日志必须先刷到当前 LSN ──
+    if (wal_ != nullptr)
+    {
+      const DbStatus ws = wal_->FlushDurable();
+      if (!ws.ok())
+      {
+        return ws;
+      }
+    }
+
     storage_->Close(); // 内部 FlushAllPages：目录页与脏数据页真正写盘
     const storage::Status s = storage_->Open(storage_config_);
     if (!s.ok())
@@ -630,7 +732,116 @@ namespace cella::db
       return DbStatus::Error(DbCode::kStorageError, "存盘点后重开存储引擎失败: " + s.ToString());
     }
     ++checkpoint_count_;
+
+    // ── ③ 写 checkpoint 记录：记录此刻仍活动的事务（恢复时据此定 redo 起点）──
+    // ── ④ 压缩日志：只保留仍活动事务的记录，其余已经随脏页落盘，不再需要 ──
+    if (wal_ != nullptr)
+    {
+      wal::WalRecord ckpt;
+      ckpt.type = wal::RecordType::kCheckpoint;
+      if (txn_manager_ != nullptr)
+      {
+        ckpt.active_txns = txn_manager_->ActiveTxnsWithFirstLsn();
+      }
+      const wal::lsn_t ckpt_lsn = wal_->Append(ckpt);
+      wal_->Flush();
+      // keep_from = ckpt_lsn：checkpoint 记录本身要保留 —— 它是「新日志的起点」
+      // （ARIES 的截断边界），下一次恢复要靠它定位 redo 起点。只有 lsn 严格小于
+      // 它的记录（已随脏页落盘、且不属于任何活动事务）才丢弃。
+      // 无活动事务时，这等价于「整段数据记录都可以丢，但 checkpoint 标记留下」。
+      wal::lsn_t keep_from = ckpt_lsn;
+      for (const auto &kv : ckpt.active_txns)
+      {
+        if (kv.second != wal::kInvalidLsn && kv.second < keep_from)
+        {
+          keep_from = kv.second;
+        }
+      }
+      size_t kept = 0;
+      size_t dropped = 0;
+      const DbStatus xs = wal_->Compact(keep_from, &kept, &dropped);
+      if (!xs.ok())
+      {
+        return xs;
+      }
+      DbLogInfo(logcat::kEngine, "存盘点完成（第 " + std::to_string(checkpoint_count_) +
+                                     " 次）: 日志保留 " + std::to_string(kept) + " 条，丢弃 " +
+                                     std::to_string(dropped) + " 条");
+      return DbStatus::Ok();
+    }
     DbLogInfo(logcat::kEngine, "存盘点完成（第 " + std::to_string(checkpoint_count_) + " 次）");
+    return DbStatus::Ok();
+  }
+
+  std::string DbEngine::WalText() const
+  {
+    std::ostringstream os;
+    os << (wal_ != nullptr ? wal_->Describe() : std::string("WAL 未启用")) << "\n";
+    os << recovery_stats_.ToText();
+    return os.str();
+  }
+
+  // 模拟强杀：把「崩溃瞬间的磁盘状态」固定下来。
+  //
+  // 为什么不直接 abort()：真正的崩溃测试需要子进程，而这里要的是**可重复、
+  // 可移植、不拖慢测试**的等价物。崩溃丢掉的是「缓冲池里尚未落盘的脏页」，
+  // 磁盘上留下的是「上次存盘点 + 期间被淘汰出去的页」，WAL 里留下的是
+  // 「按刷盘策略已经交给 OS 的那些记录」。把这三者此刻的字节原样复制出来，
+  // 再用它覆盖工作目录，重新打开面对的就是一模一样的现场。
+  DbStatus DbEngine::SimulateCrash()
+  {
+    if (!opened_)
+    {
+      return DbStatus::Error(DbCode::kInternal, "引擎未打开，无法模拟崩溃");
+    }
+    std::error_code ec;
+    const std::string snap_dir = config_.data_dir + "/__crash_snapshot";
+    std::filesystem::remove_all(snap_dir, ec);
+    std::filesystem::create_directories(snap_dir, ec);
+
+    const std::string db_path = config_.data_dir + "/" + config_.db_file;
+    // 关键：wal_path_ 在下面的 Close() 里会被清空，所以必须在 Close 之前
+    // 把 WAL 路径抓一份下来，否则还原时就拿不到正确的文件名（空串会把
+    // 快照目录错误地覆盖到数据目录上，WAL 等于没恢复）。
+    const std::string wal_path = wal_path_;
+    auto snapshot = [&](const std::string &src) -> bool
+    {
+      if (src.empty() || !std::filesystem::exists(src, ec))
+      {
+        return false;
+      }
+      const std::string dst = snap_dir + "/" + std::filesystem::path(src).filename().string();
+      std::error_code cec;
+      std::filesystem::copy_file(src, dst,
+                                 std::filesystem::copy_options::overwrite_existing, cec);
+      return !cec;
+    };
+    const bool snapped_db = snapshot(db_path);
+    const bool snapped_wal = snapshot(wal_path);
+
+    // 正常关闭（里面会刷页、回滚、清日志），随后用崩溃快照覆盖回去 ——
+    // 这样既不会泄漏文件句柄，也不会把「正常关闭」的副作用带进崩溃现场。
+    Close();
+
+    auto restore = [&](const std::string &src, bool ok) -> bool
+    {
+      if (!ok)
+      {
+        return false;
+      }
+      const std::string dst = config_.data_dir + "/" + std::filesystem::path(src).filename().string();
+      std::error_code rec;
+      std::filesystem::copy_file(src, dst,
+                                 std::filesystem::copy_options::overwrite_existing, rec);
+      return !rec;
+    };
+    restore(snap_dir + "/" + std::filesystem::path(db_path).filename().string(), snapped_db);
+    if (snapped_wal)
+    {
+      restore(snap_dir + "/" + std::filesystem::path(wal_path).filename().string(), true);
+    }
+    // 身份库不参与崩溃断言，快照里没有它 —— 保持原样即可。
+    DbLogWarn(logcat::kEngine, "已模拟进程强杀（崩溃快照: " + snap_dir + "）");
     return DbStatus::Ok();
   }
 
@@ -739,7 +950,18 @@ namespace cella::db
     // 切换 = 关旧库（Close 内部 FlushAllPages，顺带完成旧库落盘）→ 换 db_file → 开新库。
     // 与 Checkpoint 相同，独占存储互斥量，防止别的线程拿着旧缓冲池的句柄。
     std::lock_guard<std::recursive_mutex> guard(storage_mutex_);
+    // 旧库的日志先收尾：页马上要全部落盘，之后这段日志就没有用了。
+    if (wal_ != nullptr)
+    {
+      wal_->Flush();
+    }
     storage_->Close();
+    if (wal_ != nullptr)
+    {
+      (void)wal_->TruncateAll();
+      wal_.reset();
+    }
+    wal_path_.clear();
     config_.db_file = DbFileOf(name);
     storage_config_.db_file = config_.db_file;
     const storage::Status s = storage_->Open(storage_config_);
@@ -774,6 +996,13 @@ namespace cella::db
       return ixs;
     }
     current_db_ = name;
+    // WAL 按库分文件 → 打开新库的日志，并顺带跑一次崩溃恢复
+    // （新库上次也可能是被强杀的）。
+    const DbStatus ws = OpenWalAndRecover();
+    if (!ws.ok())
+    {
+      return ws;
+    }
     if (note != nullptr)
     {
       *note = "已切换到数据库 " + name;
@@ -996,8 +1225,17 @@ namespace cella::db
 
     if (storage_)
     {
+      // 干净关闭：先把日志刷下去（顺序不能反 —— 页里的改动必须先在日志里有据可查），
       storage_->Close(); // FlushAllPages：把脏页（含目录表与目录页）真正写盘
     }
+    // 再清空日志：数据已经全部落盘，下次启动无需重放任何东西。
+    // 这正是「恢复时间与存盘点频率成反比」在干净关闭时的极端情形 —— 时间为零。
+    if (wal_ != nullptr)
+    {
+      (void)wal_->TruncateAll();
+      wal_.reset();
+    }
+    wal_path_.clear();
     txn_manager_.reset();
     if (logger_)
     {
@@ -1726,6 +1964,21 @@ namespace cella::db
       {
         ps = CheckDbPrivilege(Priv::kDrop, "DROP INDEX");
       }
+      else if (sk == cella::CELLA_Stmt::Kind::ALTER_TABLE)
+      {
+        // ALTER 按动作分档，与该动作用到的建/删能力对齐（与 CREATE/DROP INDEX 的
+        // kCreate / kDrop 约定一致）：加/改/改名 → kCreate；删（列/主键）→ kDrop。
+        const cella::CELLA_Stmt::AlterAction aa = program->statements[0]->alterAction;
+        const bool destructive =
+            (aa == cella::CELLA_Stmt::AlterAction::DROP_COLUMN ||
+             aa == cella::CELLA_Stmt::AlterAction::DROP_PRIMARY_KEY);
+        ps = CheckDbPrivilege(destructive ? Priv::kDrop : Priv::kCreate, "ALTER TABLE");
+      }
+      else if (sk == cella::CELLA_Stmt::Kind::TRUNCATE_TABLE)
+      {
+        // TRUNCATE 清空数据 → 与 DELETE 同级，要求 kDelete（且是库级，代价更大）
+        ps = CheckDbPrivilege(Priv::kDelete, "TRUNCATE TABLE");
+      }
       if (!ps.ok())
       {
         // 语义阶段可能已把这张（不存在的）表登记进编译器目录副本 → 必须复位，
@@ -1749,11 +2002,13 @@ namespace cella::db
     }
 
     // ── ④ 事务上下文：显式事务优先，否则为单语句开自动提交事务 ──
-    // DDL 例外：建表/删表/建删索引会立即改写目录（元数据无法回滚），故按 MySQL 惯例
-    // 先隐式提交前置事务，再以自动提交方式执行 DDL，避免出现「目录已改、事务回滚」
-    // 造成的元数据与数据不一致。
+    // DDL 例外：建表/删表/建删索引/ALTER/TRUNCATE 都会立即改写目录或重建物理表
+    // （元数据无法回滚），故按 MySQL 惯例先隐式提交前置事务，再以自动提交方式
+    // 执行 DDL，避免出现「目录已改、事务回滚」造成的元数据与数据不一致。
+    // TRUNCATE 也归入 DDL：它的语义就是「不可回滚的快速清空」（MySQL 亦然）。
     const bool is_ddl = (out->kind == "CREATE TABLE" || out->kind == "DROP TABLE" ||
-                         out->kind == "CREATE INDEX" || out->kind == "DROP INDEX");
+                         out->kind == "CREATE INDEX" || out->kind == "DROP INDEX" ||
+                         out->kind == "ALTER TABLE" || out->kind == "TRUNCATE TABLE");
     if (is_ddl && in_transaction())
     {
       const txn_id_t prev = txn_;

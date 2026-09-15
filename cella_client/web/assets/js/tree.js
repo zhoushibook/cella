@@ -1,6 +1,6 @@
 // tree.js —— 库/表两层树 + 右键菜单（PLAN §5.2）。
 // 两层：库节点（当前库展开列出表；其它库点击即切换）→ 表节点。
-// 表节点右键：打开数据 / 查看结构 / 新建查询 / 生成 SELECT / 复制表名 / 删除表。
+// 表节点右键：打开数据 / 查看结构 / 设计表结构 / 新建查询 / 生成 SELECT / 复制表名 / 删除表。
 
 const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
@@ -45,6 +45,7 @@ export function createTree(container, { store, actions }) {
       showMenu(e.clientX, e.clientY, [
         { label: '打开数据', fn: () => actions.openTable(t.name) },
         { label: '查看结构', fn: () => actions.openStruct(t.name) },
+        { label: '设计表结构', fn: () => actions.openDesigner(t.name) },
         { label: '新建查询', fn: () => actions.newQueryFor(t.name) },
         { label: '生成 SELECT', fn: () => actions.genSelect(t.name) },
         { label: '复制表名', fn: () => navigator.clipboard.writeText(t.name) },

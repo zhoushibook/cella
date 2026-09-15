@@ -242,7 +242,10 @@ MT_TEST(事务_重启保留删除效果)
         std::string("1\n3"));
 }
 
-MT_TEST(事务_统计与审计日志)
+// P2 之前这里断言的是 <data_dir>/journal.log 的**文本**内容（提交/回滚后才补一行的
+// 审计轨迹）。P2 把它升级成了带 LSN 的二进制 WAL（<库名>.wal），所以断言改为
+// 直接检查日志记录本身 —— 这比 grep 文本强得多：类型、LSN 单调性都能验证。
+MT_TEST(事务_统计与WAL记录)
 {
   Engine e("txn_journal");
   SeedAccounts(&e);
@@ -252,10 +255,44 @@ MT_TEST(事务_统计与审计日志)
   MT_CHECK(e.engine.txn_manager().aborted_total() >= 1u);
   MT_EQ(e.engine.txn_manager().active_count(), 0u);
 
-  const std::string journal = ReadFile(e.cfg.data_dir + "/journal.log");
-  MT_CHECK(journal.find("COMMIT") != std::string::npos);
-  MT_CHECK(journal.find("ABORT") != std::string::npos);
-  MT_CHECK(journal.find("用户 ROLLBACK") != std::string::npos);
+  wal::WalManager *w = e.engine.wal();
+  MT_CHECK(w != nullptr);
+  std::vector<wal::WalRecord> recs;
+  MT_CHECK(w->ReadAll(&recs).ok());
+  MT_CHECK(!recs.empty());
+
+  bool has_begin = false;
+  bool has_commit = false;
+  bool has_abort = false;
+  bool has_insert = false;
+  for (const auto &r : recs)
+  {
+    if (r.type == wal::RecordType::kBegin)
+    {
+      has_begin = true;
+    }
+    else if (r.type == wal::RecordType::kCommit)
+    {
+      has_commit = true;
+    }
+    else if (r.type == wal::RecordType::kAbort)
+    {
+      has_abort = true;
+    }
+    else if (r.type == wal::RecordType::kInsert)
+    {
+      has_insert = true;
+    }
+  }
+  MT_CHECK(has_begin);
+  MT_CHECK(has_commit);
+  MT_CHECK(has_abort);
+  MT_CHECK(has_insert);
+  // LSN 必须严格单调递增 —— 它是恢复阶段「顺序」的唯一依据
+  for (size_t i = 1; i < recs.size(); ++i)
+  {
+    MT_CHECK(recs[i].lsn > recs[i - 1].lsn);
+  }
 }
 
 MT_TEST(事务_关闭时回滚未提交事务)
@@ -368,12 +405,12 @@ MT_TEST(事务_UPDATE插入失败恢复旧行)
 MT_TEST(事务_DDL立即持久化)
 {
   Engine e("txn_ddl_durable");
-  // DDL 在自动提交后立刻存盘；随后的 DML 默认不存盘（checkpoint_on_commit=false）
+  // DDL 在自动提交后立刻存盘；随后的 DML 不刷数据页，但已提交记录会进入 WAL。
   MT_CHECK(e.Run("CREATE TABLE t(id INT NOT NULL, v VARCHAR(16));"
                  "INSERT INTO t VALUES (1,'a');")
                .all_ok());
 
-  // 不关闭引擎，直接把数据目录复制一份（等同于进程被强杀后拿磁盘上的文件来恢复）
+  // 不关闭引擎，直接把数据目录复制一份；副本重开时会走 WAL 恢复。
   const std::string copy_dir = testutil::FreshDir("txn_ddl_durable_copy");
   std::error_code ec;
   std::filesystem::copy(e.cfg.data_dir, copy_dir,
@@ -387,8 +424,8 @@ MT_TEST(事务_DDL立即持久化)
   ScriptReport r;
   (void)e2->default_session().Execute("get * in t;", &r);
   MT_CHECK(r.all_ok());
-  // 数据不在（DML 默认不存盘，属于设计内的持久性边界）
-  MT_EQ(testutil::RowsText(r.statements[0].result), std::string(""));
+  // 已提交 DML 虽未刷数据页，但 WAL redo 后必须可见。
+  MT_EQ(testutil::RowsText(r.statements[0].result), std::string("1|a"));
   e2->Close();
 }
 

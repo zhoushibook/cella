@@ -240,6 +240,10 @@ namespace
         if (!need_value(&opt->password))
           return false;
       }
+      else if (a.rfind("--password=", 0) == 0)
+      {
+        opt->password = a.substr(11);
+      }
       else if (!a.empty() && a[0] == '-')
       {
         *err = "未知选项: " + a;

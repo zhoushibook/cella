@@ -1,0 +1,69 @@
+CreateTable
+  table: stu
+  columns: id INT PRIMARY KEY, name VARCHAR(20) NOT NULL
+
+Insert
+  table: stu
+  columns: id, name
+  rows: [1, 'amy'], [2, 'bob']
+
+AlterTable
+  table: stu
+  action: ADD COLUMN
+  column: age INT
+
+AlterTable
+  table: stu
+  action: DROP COLUMN
+  column: age
+
+AlterTable
+  table: stu
+  action: RENAME COLUMN
+  column: name
+  new_name: sname
+
+AlterTable
+  table: stu
+  action: RENAME TO
+  new_name: student
+
+AlterTable
+  table: student
+  action: DROP PRIMARY KEY
+
+AlterTable
+  table: student
+  action: ADD PRIMARY KEY
+  columns: id
+
+CreateIndex
+  index: idx_stu_sname
+  table: student
+  column: sname
+  unique: false
+
+AlterTable
+  table: student
+  action: DROP COLUMN
+  column: sname
+
+TruncateTable
+  table: student
+
+CreateTable
+  table: empty_t
+  columns: k INT
+
+AlterTable
+  table: empty_t
+  action: ADD COLUMN
+  column: note VARCHAR(10) NOT NULL
+
+Insert
+  table: empty_t
+  columns: k, note
+  rows: [1, 'hi']
+
+TruncateTable
+  table: empty_t

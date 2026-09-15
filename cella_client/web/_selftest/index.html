@@ -16,7 +16,7 @@
 </head><body>
 <h1>cella 前端自测</h1>
 <p class="dim">零依赖的行为测试：在真实浏览器里 import 真实模块，派发真实事件，把断言结果写回页面。
-用 headless 浏览器跑（无需 npm / 无需装 agent-browser）。五个套件共 <b>191 项</b>。</p>
+用 headless 浏览器跑（无需 npm / 无需装 agent-browser）。六个套件共 <b>246 项</b>。</p>
 
 <div class="case">
   <h3>① <a href="/_selftest/grid.html">grid.html</a> —— 结果网格</h3>
@@ -36,25 +36,52 @@
 </div>
 <div class="case">
   <h3>④ <a href="/_selftest/layout.html">layout.html</a> —— 布局拖拽</h3>
-  <p class="dim">40 项：偏好读写与夹逼、分隔条的位移/收尾回调；真实页面里拖<b>侧边栏宽度</b>、<b>底部面板高度</b>、
-  <b>编辑器高度</b>、<b>网格行高</b>与<b>行号列宽</b>，含上下限夹逼、双击复位与 localStorage 持久化，以及**连续拖拽/多步位移的基准回归**。</p>
+  <p class="dim">42 项：偏好读写与夹逼、分隔条的位移/收尾回调；真实页面里拖<b>侧边栏宽度</b>、<b>底部面板高度</b>、
+  <b>编辑器高度</b>、<b>网格行高</b>与<b>行号列宽</b>，含上下限夹逼、双击复位与 localStorage 持久化，以及**连续拖拽/多步位移的基准回归**。
+  开测前自建一张带数据的种子表（不依赖数据目录里恰好有表）。</p>
 </div>
 <div class="case">
   <h3>⑤ <a href="/_selftest/app.html">app.html</a> —— 整体集成</h3>
   <p class="dim">46 项：在 iframe 里驱动真实页面 —— 两层树、数据工具条与每页行数、勾选批量删除按钮联动、
-  Ctrl+T/W 标签、切换保留光标、SQL 历史落库、右键菜单 6 项、诊断面板结构化与原始文本切换、
+  Ctrl+T/W 标签、切换保留光标、SQL 历史落库、右键菜单 7 项、诊断面板结构化与原始文本切换、
   计划视图算子树 + 该语句耗时、断线横幅与加载态元素；
   <b>查询耗时显示</b>（结果栏徽标与三口径 title、消息逐条耗时、状态栏入口、点徽标打开耗时面板、
   数据工具条取数耗时）；
   <b>Navicat 式暂存编辑全链路</b>（编辑/新增/删除先暂存 → 左下角单事务提交 / 一键回退，用自建临时表隔离，不碰用户正在看的数据）。</p>
 </div>
+<div class="case">
+  <h3>⑥ <a href="/_selftest/designer.html">designer.html</a> —— 表设计器（P5.6）</h3>
+  <p class="dim">53 项：<b>纯函数层</b>（30 项）直接断言 diffSchema —— 改名识别（按行身份，不误判成 DROP+ADD）、
+  改名链的拓扑排序与成环报错、<b>墓碑行</b>支撑的删列、语句顺序约束
+  （RENAME → DROP PRIMARY KEY → DROP COLUMN → ADD COLUMN → ADD PRIMARY KEY）、
+  改类型/改非空的能力边界报错、列名校验、新建表形态；<br>
+  <b>集成层</b>（23 项）在 iframe 里驱动真实页面与真实引擎：打开设计器 → 改列名 + 加列 → 点执行 →
+  用 <code>/api/catalog</code> 校验结构真的变了、<b>老数据仍在且改名后取值正确</b>、
+  设计器自动重载（等的是「列名已换 + 预览归零 + 按钮禁用」这个真终态，不是「行数够」）、
+  删除/撤销的墓碑行为、「查看结构」面板的入口按钮。</p>
+</div>
 
 <h2>怎么跑</h2>
-<p>先起服务（<code>cella_web.exe --data ./mydb --port 8080</code>），然后任一浏览器打开上面的页面即可；
-结果直接打印在页面底部。</p>
-<p>命令行（headless Edge，配合脚本化断言解析）：</p>
-<pre>msedge --headless=new --disable-gpu --virtual-time-budget=25000 \
-       --user-data-dir=&lt;临时目录&gt; --dump-dom http://127.0.0.1:8080/_selftest/app.html</pre>
+<p><b>推荐：一条命令跑全部</b>（自己起/停服务、自己选端口、汇总统计，有 FAIL 就非 0 退出）：</p>
+<pre>./cella_client/run_web_tests.sh        # 可选参数：端口，默认 8131
+# 浏览器不在默认路径时：CHROME=/path/to/chrome ./cella_client/run_web_tests.sh</pre>
+<p>也可以手工打开单个页面：先起服务（<code>cella_web.exe --data ./mydb --port 8080</code>），
+然后任一浏览器打开上面的页面，结果直接打印在页面底部。</p>
+<p>命令行（headless Chrome/Edge）：</p>
+<pre>chrome --headless=new --disable-gpu --no-proxy-server --enable-logging=stderr \
+       --virtual-time-budget=120000 --user-data-dir=&lt;临时目录&gt; \
+       --dump-dom http://127.0.0.1:8080/_selftest/app.html</pre>
 <p class="dim">注意：<code>--user-data-dir</code> 用独立目录，避免并发实例互相占锁；
 断言结果在输出 DOM 的 <code>&lt;pre id="out"&gt;</code> 里（每个 PASS/FAIL 一行）。</p>
+
+<h2>两个踩过的坑（改测试时务必知道）</h2>
+<p class="dim"><b>① 不要从整份 DOM 里 grep PASS/FAIL。</b>套件页面自己的源码里就写着
+<code>'PASS '</code> / <code>'FAIL '</code> 字面量，整页一 grep 会把源码算进统计，出现
+「54 PASS 2 FAIL」这种假结果。必须只统计 <code>&lt;pre id="out"&gt;</code> 区块内的行。</p>
+<p class="dim"><b>② headless 下一定要带 <code>--enable-logging=stderr</code>。</b>
+模块图一旦坏掉（例如 <code>app.js</code> 引用了没 import 的符号），页面会<b>静静地不启动</b> ——
+断言全挂、却看不出任何原因。这个开关会把 <code>Uncaught ReferenceError: ...</code> 打到日志里，
+一眼定位。另外别用 iframe 的 <code>readyState === 'complete'</code> 判断「应用加载好了」：
+<code>src</code> 还没开始加载时，里面的 <code>about:blank</code> 就<b>已经</b>是 complete，
+照着它跑只会拿到一个空文档。正确做法是轮询 <code>iframe.contentWindow.__cella</code>。</p>
 </body></html>

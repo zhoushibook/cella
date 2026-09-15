@@ -263,6 +263,16 @@ Project [name]
 | 语义 | SEM-310 | 条件表达式必须为 BOOL |
 | 语义 | SEM-311 | 分页参数必须为正整数（page 页码/每页行数） |
 | 语义 | SEM-312 | 分页与 among 冲突（起始行超出 among 限定范围） |
+| 语义 | SEM-313 | 表级主键与列级主键同时定义 |
+| 语义 | SEM-314 | `rowid` 作列名声明（只读伪列） |
+| 语义 | SEM-320 | HAVING 中不支持聚合函数 |
+| 语义 | SEM-321 | SELECT 项为复杂表达式且非聚合 |
+| 语义 | SEM-322 | 列既不在 GROUP BY 也不是聚合函数 |
+| 语义 | SEM-323 | `DROP COLUMN` 删除最后一列（表至少要有一列） |
+| 语义 | SEM-325 | `ADD COLUMN` 带 PRIMARY KEY（新列无法为已有行补主键值） |
+| 语义 | SEM-326 | `DROP COLUMN` 目标是主键列（须先 `DROP PRIMARY KEY`） |
+| 语义 | SEM-327 | `ADD PRIMARY KEY` 但表已有主键（须先 `DROP PRIMARY KEY`） |
+| 语义 | SEM-328 | `DROP PRIMARY KEY` 但表没有主键 |
 | 计划 | PLN-401 | 不支持的语句类型（防御性） |
 
 ## 测试
@@ -271,10 +281,10 @@ Project [name]
 powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1
 ```
 
-- 正向（`ok_*.sql`，17 个）：`-a -s -p` 退出码必须为 0，且 `-p` 输出与 `tests/expected/ok_*_plan.txt` golden 完全一致。
+- 正向（`ok_*.sql`）：`-a -s -p` 退出码必须为 0，且 `-p` 输出与 `tests/expected/ok_*_plan.txt` golden 完全一致。
 - 优化（`ok_opt_*.sql`）：额外比对 `-o` 输出与 `tests/expected/ok_opt_*_opt.txt`。
-- 负向（`err_*.sql`，25 个）：`--all` 退出码必须为 1，且输出包含首行注释 `-- expect: 错误码` 声明的错误码。
-- 覆盖点：缺分号、未闭合字符串、非法字符、未定义表、列拼写错误、类型不匹配（INSERT/运算/条件）、值个数不一致、重复建表、重复列名、保留字作标识符、limit 列不存在、NULL→NOT NULL、大小写混合、空输入、join/union/distinct/grouped/having/ordered/among、**COUNT 聚合与分组上下文校验（SEM-320/322）**、UPDATE/DROP TABLE、索引 DDL、优化规则 golden。
+- 负向（`err_*.sql`）：`--all` 退出码必须为 1，且输出包含首行注释 `-- expect: 错误码` 声明的错误码。
+- 覆盖点：缺分号、未闭合字符串、非法字符、未定义表、列拼写错误、类型不匹配（INSERT/运算/条件）、值个数不一致、重复建表、重复列名、保留字作标识符、limit 列不存在、NULL→NOT NULL、大小写混合、空输入、join/union/distinct/grouped/having/ordered/among、**COUNT 聚合与分组上下文校验（SEM-320/322）**、**ALTER TABLE / TRUNCATE 的全部动作与边界（SEM-323/325/326/327/328）**、UPDATE/DROP TABLE、索引 DDL、优化规则 golden。
 - 捕获方式：通过 `cmd` 重定向取原始字节再按 UTF-8 读取，避免控制台代码页造成乱码。
 
 ## 实现决策与偏差说明

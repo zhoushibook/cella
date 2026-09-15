@@ -24,6 +24,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -33,6 +34,7 @@
 #include "cella/db/exec/query_result.h"
 #include "cella/db/exec/row_set.h"
 #include "cella/db/txn/transaction.h"
+#include "cella/db/wal/wal_types.h"
 #include "cella/storage/api/i_storage.h"
 #include "cella/storage/common/record.h"
 #include "cella/storage/common/types.h"
@@ -111,7 +113,7 @@ struct ExecContext {
 // 会话层用它决定是否让扫描附加 rowid（见 ExecContext::with_rowid）。
 bool StmtRefersRowid(const cella::CELLA_Stmt* st);
 
-class Executor {
+class Executor : public wal::IUndoApplier {
  public:
   Executor(storage::IStorage* storage, CatalogManager* catalog, TxnManager* txn_manager,
            LockManager* locks, std::recursive_mutex* storage_mutex);
@@ -121,6 +123,49 @@ class Executor {
 
   // 绑定身份库（访问控制判定用；不接管所有权）。引擎在打开后调用一次即可。
   void AttachAuth(const AuthStore* auth) { auth_ = auth; }
+
+  // ── WAL 绑定（P2）──────────────────────────────────────────
+  // 行变更记录由执行器在「改动刚发生」的当下写入（执行器才知道前后像），
+  // 事务的 begin/commit/abort 记录由 TxnManager 写 —— 两边共用同一个 WalManager。
+  void AttachWal(wal::WalManager* wal) { wal_ = wal; }
+  wal::WalManager* wal() const { return wal_; }
+
+  // ── 恢复期重放（P2.4 redo / P2.5 undo 的物理落点）──────────
+  // 与运行时 DML 的唯一区别是**幂等**：重做一条已经生效的记录什么也不做，
+  // 找不到目标行也只是跳过（说明后续还有一条记录会把它删掉/加回来）。
+  // 幂等是必须的 —— 崩溃时哪些脏页已经落盘是不确定的，重放必然遇到「已生效」的记录。
+  // 索引随表行一起维护，恢复结束后索引与表数据天然一致。
+  DbStatus RecoveryInsertRow(const std::string& table,
+                             const std::vector<storage::Value>& values);
+  DbStatus RecoveryDeleteRow(const std::string& table,
+                             const std::vector<storage::Value>& before);
+  DbStatus RecoveryReplaceRow(const std::string& table,
+                              const std::vector<storage::Value>& before,
+                              const std::vector<storage::Value>& after);
+
+  // ── 恢复期的索引处理（P2）──────────────────────────────────
+  // WAL 只记表行的逻辑变更，索引是**派生数据**，不进日志。但索引页同样会被缓冲池
+  // 淘汰到磁盘 —— 崩溃后索引可能停在「半个状态」：有的键在、有的不在。
+  // 于是恢复这样处理：
+  //   * 重做/撤销之前：把受影响表的索引项全部清空（避免残键导致误判唯一冲突）；
+  //   * 重做/撤销之后：按最终表数据整体重建（保证索引与表逐行一致）。
+  // 代价是 O(n log n)，只在真正跑恢复时付出。
+  DbStatus ClearIndexes(const std::set<std::string>& tables);
+  DbStatus RebuildIndexes(const std::set<std::string>& tables);
+
+  // ── IUndoApplier：撤销 = 反向重放（P2.5）────────────────────
+  DbStatus UndoInsert(const std::string& table,
+                      const std::vector<storage::Value>& row) override {
+    return RecoveryDeleteRow(table, row);
+  }
+  DbStatus UndoDelete(const std::string& table,
+                      const std::vector<storage::Value>& row) override {
+    return RecoveryInsertRow(table, row);
+  }
+  DbStatus UndoUpdate(const std::string& table, const std::vector<storage::Value>& new_row,
+                      const std::vector<storage::Value>& old_row) override {
+    return RecoveryReplaceRow(table, new_row, old_row);
+  }
 
   // ── undo 补偿期间的索引维护（P1.5）──────────────────────────
   // 事务回滚只补偿表行，索引会与表数据分叉。本方法是 TxnManager::UndoIndexHooks
@@ -199,6 +244,10 @@ class Executor {
   DbStatus ExecCreateIndex(const cella::CELLA_PlanNode& plan, const ExecContext& ctx,
                            QueryResult* out);
   DbStatus ExecDropIndex(const cella::CELLA_PlanNode& plan, const ExecContext& ctx, QueryResult* out);
+  // ── P5：DDL 演进 ────────────────────────────────────────────
+  DbStatus ExecAlterTable(const cella::CELLA_PlanNode& plan, const ExecContext& ctx, QueryResult* out);
+  DbStatus ExecTruncateTable(const cella::CELLA_PlanNode& plan, const ExecContext& ctx,
+                             QueryResult* out);
   DbStatus ExecInsert(const cella::CELLA_PlanNode& plan, const ExecContext& ctx, QueryResult* out);
   DbStatus ExecDelete(const cella::CELLA_PlanNode& plan, const ExecContext& ctx, QueryResult* out);
   DbStatus ExecUpdate(const cella::CELLA_PlanNode& plan, const ExecContext& ctx, QueryResult* out);
@@ -255,6 +304,75 @@ class Executor {
   static std::string PrimaryIndexName(const std::string& table);
   // 该表当前是否已有主键自动索引
   bool HasPrimaryIndex(const std::string& table) const;
+
+  // ── ALTER TABLE / TRUNCATE 的重建原语（P5）────────────────────
+  // 「整表重建」：把 old_meta 的物理表按 new_meta 的结构重写一遍。
+  //   col_map[i] = 新表第 i 列的数据来自旧表第几列；-1 = 新列（老行填 NULL）。
+  //   copy_rows  = false 表示只换结构不搬数据（TRUNCATE：= 原地清空并释放数据页）。
+  // 为什么必须重建（而不是原地改 schema）：记录二进制以「列数 + 位图 + 逐列值」
+  // 编码，反序列化会校验列数 ⇔ schema（见 slotted_record_serializer.cpp），
+  // 列数一变老字节流就解不出来；存储层也没有原地改列的能力。于是走
+  // 「导出全部行 → 换 schema 重建 → 按 col_map 回填」这条最直接的路径。
+  // 副作用：行定位（页号 + 槽位）全变 → 表的索引全部失效，须由调用方随后重建。
+  // 须在 storage_mutex_ 临界区内调用。new_first_page 非空时回写新表首数据页。
+  DbStatus RebuildTableRows(const CatalogTable& old_meta, const CatalogTable& new_meta,
+                            const std::vector<int>& col_map, bool copy_rows,
+                            uint32_t* new_first_page);
+
+  // 在 table 上按 cols 建一棵索引树并回填（不改任何元数据）。
+  //   unique           —— 校验列值元组无重复（重复返回 kUniqueViolation）
+  //   require_not_null —— 校验索引列无 NULL（主键用；命中返回 kNotNullViolation）
+  // 成功时 root_out 回写新树的根页号。须在 storage_mutex_ 临界区内调用。
+  DbStatus BuildIndexTree(const CatalogTable& table, const std::vector<std::string>& cols,
+                          bool unique, bool require_not_null, uint32_t* root_out);
+
+  // 重建一张表的全部（已快照的）索引：为每条索引建新树并把元数据指向新根。
+  //   rename_from/rename_to —— 表改名时同步索引的 table 字段与 <表>_pk 索引名；
+  //                           空字符串表示表名未变。
+  // 须在 storage_mutex_ 临界区内、且目录已换到新表之后调用。
+  DbStatus RebuildTableIndexes(const CatalogTable& new_meta,
+                               const std::vector<CatalogIndex>& index_metas,
+                               const std::string& rename_from, const std::string& rename_to);
+
+  // 在另一张表上执行「按表名删索引元数据」（表改名导致 <表>_pk 也要跟着改名时用）。
+  // 须在 storage_mutex_ 临界区内调用。
+  DbStatus RenameIndexMeta(const std::string& old_index_name, const CatalogIndex& index);
+
+  // ALTER TABLE 六个动作的实现。共用 ExecAlterTable 已做好的前置：
+  // 表存在性/写保护校验、排他锁、old_meta 与索引清单的快照。
+  DbStatus AlterAddColumn(const CatalogTable& old_meta,
+                          const std::vector<CatalogIndex>& indexes,
+                          const cella::CELLA_Stmt& st, QueryResult* out);
+  DbStatus AlterDropColumn(const CatalogTable& old_meta,
+                           const std::vector<CatalogIndex>& indexes,
+                           const cella::CELLA_Stmt& st, QueryResult* out);
+  DbStatus AlterRenameTable(const CatalogTable& old_meta,
+                            const std::vector<CatalogIndex>& indexes,
+                            const cella::CELLA_Stmt& st, QueryResult* out);
+  DbStatus AlterRenameColumn(const CatalogTable& old_meta,
+                             const std::vector<CatalogIndex>& indexes,
+                             const cella::CELLA_Stmt& st, QueryResult* out);
+  DbStatus AlterAddPrimaryKey(const CatalogTable& old_meta,
+                              const std::vector<CatalogIndex>& indexes,
+                              const cella::CELLA_Stmt& st, QueryResult* out);
+  DbStatus AlterDropPrimaryKey(const CatalogTable& old_meta,
+                               const std::vector<CatalogIndex>& indexes,
+                               const cella::CELLA_Stmt& st, QueryResult* out);
+
+  // 表内行数（重建前判断「老行能否补出新列的值」用）。须在 storage_mutex_ 内调用。
+  size_t CountRowsOf(const std::string& table) const;
+
+  // ── WAL（P2）──────────────────────────────────────────────
+  // 写一条行变更记录。rid 只取页号用于重建脏页表；行定位靠 before/after 的内容。
+  void AppendWalRow(txn_id_t txn, wal::RecordType type, const std::string& table,
+                    const storage::Rid& rid, const std::vector<storage::Value>& before,
+                    const std::vector<storage::Value>& after);
+
+  // 恢复期按「主键（有则）/ 整行内容（无则）」定位一行；命中返回 true。
+  // 必须在 storage_mutex_ 临界区内调用。
+  bool LocateRowForRecovery(const CatalogTable& table,
+                            const std::vector<storage::Value>& values, storage::Rid* rid,
+                            storage::Record* row);
 
   // ── 索引维护（P1.5）──────────────────────────────────────────  // 表上全部有效索引的运行时句柄：元数据 + 已 Attach 的 B+ 树。
   // 键按首个索引列下标升序，便于多索引维护时保持稳定顺序。
@@ -438,6 +556,7 @@ class Executor {
   TxnManager* txn_manager_;
   LockManager* locks_;
   std::recursive_mutex* storage_mutex_;
+  wal::WalManager* wal_ = nullptr;   // 预写日志（可为空 = 不记日志、无崩溃恢复）
   const AuthStore* auth_ = nullptr;  // 访问控制判定（可为空 = 不做检查）
   size_t operator_calls_ = 0;
   IndexMaintenanceStats index_stats_;

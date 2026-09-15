@@ -12,22 +12,30 @@
 //     kUpdate  → 回滚时删掉新版本、重插旧版本
 //   对本教学系统的可观察语义（行内容）而言，回滚是精确的；物理 Rid 不保证复原。
 //
-// 持久化：提交时把该事务的变更通过存储层缓冲池留在内存，由存储层 Close 时的
-//   FlushAllPages 落盘；journal.log 记录 COMMIT/ABORT 审计轨迹，用于诊断与
-//   崩溃后的人工核对。这不是完整的 ARIES/WAL 恢复，属有意简化。
+// 持久化（P2 之后，见 docs/WAL_RECOVERY.md）：
+//   journal.log 已从「提交后才补一行的审计文本」升级为真正的 WAL：
+//     * 每条记录带 LSN；begin / commit / abort / checkpoint 由本管理器写入；
+//     * 行变更（insert / delete / update）由执行器在改动发生的当下写入，
+//       带前后像（before / after），足以重做也能撤销；
+//     * undo 的每一步补偿同样入日志 —— 否则「语句级回滚后又提交」的事务
+//       在重放时会把已补偿掉的改动又加回来。
+//   WAL 规则由 DbEngine::Checkpoint 与 TxnManager::Commit 共同保证：
+//   提交返回前本事务日志必须落盘；存盘点先刷日志再刷脏页。
 #pragma once
 
 #include <cstdint>
-#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cella/db/common/db_status.h"
 #include "cella/db/txn/lock_manager.h"
+#include "cella/db/wal/wal_manager.h"
+#include "cella/db/wal/wal_types.h"
 #include "cella/storage/api/i_storage.h"
 #include "cella/storage/common/record.h"
 
@@ -44,6 +52,9 @@ namespace cella::db
   const char *ToString(TxnState s);
 
   // ── 回滚日志项 ──────────────────────────────────────────────
+  // after 是 P2 才补上的字段：WAL 的补偿记录需要「被撤销的那一行长什么样」
+  // （撤销一次插入 = 删掉刚插入的内容 → 要写一条 kDelete，其 before 就是这里的 after）。
+  // 没有它，撤销动作就无法完整入日志，重放时已补偿的改动会被加回来。
   struct UndoRecord
   {
     enum class Kind
@@ -56,6 +67,7 @@ namespace cella::db
     std::string table;
     storage::Rid rid;       // kInsert: 新行位置；kDelete/kUpdate: 变更后的行位置
     storage::Record before; // kDelete/kUpdate: 变更前的内容
+    storage::Record after;  // kInsert/kUpdate: 变更后的内容
   };
 
   // ── 事务对象（单线程使用；跨线程共享由 TxnManager 负责）─────
@@ -96,6 +108,12 @@ namespace cella::db
     int64_t end_time() const { return end_time_; }
     void SetEndTime(int64_t t) { end_time_ = t; }
 
+    // ── WAL 相关（P2）───────────────────────────────────────
+    // 本事务第一条日志记录的 LSN。存盘点要把它写进 checkpoint 记录，
+    // 恢复时据此确定 redo 起点（仍活动的事务必须从头重放）。
+    wal::lsn_t first_lsn() const { return first_lsn_; }
+    void SetFirstLsn(wal::lsn_t l) { first_lsn_ = l; }
+
     // 诊断用一行文本
     std::string Describe() const;
 
@@ -107,6 +125,7 @@ namespace cella::db
     size_t statements_ = 0;
     int64_t begin_time_ = 0;
     int64_t end_time_ = 0;
+    wal::lsn_t first_lsn_ = wal::kInvalidLsn;
   };
 
   // ── 事务管理器 ──────────────────────────────────────────────
@@ -137,9 +156,10 @@ namespace cella::db
     TxnManager(const TxnManager &) = delete;
     TxnManager &operator=(const TxnManager &) = delete;
 
-    // 审计日志路径；空字符串表示不落文件
-    void SetJournalPath(const std::string &path);
-    const std::string &journal_path() const { return journal_path_; }
+    // ── WAL 绑定（P2）────────────────────────────────────────
+    // 由 DbEngine 在装配时注入；为空表示不记日志（也就没有崩溃恢复能力）。
+    void SetWal(wal::WalManager *wal) { wal_ = wal; }
+    wal::WalManager *wal() const { return wal_; }
 
     txn_id_t Begin();
     DbStatus Commit(txn_id_t id);
@@ -154,6 +174,20 @@ namespace cella::db
     // 取事务句柄（共享所有权，保证使用期间不被销毁）
     std::shared_ptr<Transaction> Find(txn_id_t id) const;
 
+    // ── 供存盘点 / 恢复使用 ──────────────────────────────────
+    // 仍活动的事务（id + 首条记录 LSN）：存盘点把它写进 checkpoint 记录，
+    // 恢复阶段据此定 redo 起点。
+    std::vector<std::pair<txn_id_t, wal::lsn_t>> ActiveTxnsWithFirstLsn() const;
+    // 恢复期把日志里出现过的最大事务号告知本管理器，保证之后新分配的事务号
+    // 不会与「刚被恢复回滚掉的事务」重号。
+    void ObserveTxnId(txn_id_t id);
+    // 恢复期回滚（P2.5）：records 是**日志顺序**（旧 → 新）的 WAL 行变更记录，
+    // 本方法从后往前倒着撤销 —— 后做的先撤，这才是 undo 的方向。
+    // 撤销动作用 applier 完成（= 执行器的反向重放），语义与运行时的逻辑补偿一致。
+    // 结束后写一条 ABORT 并刷盘，这样下次恢复不必再撤一次。
+    DbStatus UndoWalRecords(txn_id_t id, const std::vector<wal::WalRecord> &records,
+                            wal::IUndoApplier *applier, const std::string &reason);
+
     size_t active_count() const;
     size_t committed_total() const;
     size_t aborted_total() const;
@@ -163,18 +197,18 @@ namespace cella::db
   private:
     DbStatus RollbackLocked(Transaction *t);                  // 整事务回滚（需已持 storage_mutex）
     DbStatus ApplyUndoLocked(Transaction *t, size_t stop_at); // 回滚到 undo 水位
-    void WriteJournal(const std::string &line);
+    // 把一次「逻辑补偿」写进 WAL。没有它，重放会把已撤销的改动又加回来。
+    void LogCompensationLocked(txn_id_t id, const UndoRecord &u);
 
     storage::IStorage *storage_;
     LockManager *locks_;
     std::recursive_mutex *storage_mutex_;
+    wal::WalManager *wal_ = nullptr;   // 不接管所有权
     mutable std::mutex mutex_; // 保护 txns_ / 计数器
     std::map<txn_id_t, std::shared_ptr<Transaction>> txns_;
     txn_id_t next_id_ = 0;
     size_t committed_total_ = 0;
     size_t aborted_total_ = 0;
-    std::string journal_path_;
-    std::ofstream journal_;
     UndoIndexHooks *undo_hooks_ = nullptr; // 可为空（不维护索引 / 单元测试直连）
   };
 

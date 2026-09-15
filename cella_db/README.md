@@ -130,6 +130,27 @@ update t set name = 'x' limit rowid = 393216;
 `rowid` 不可声明为列名、不可作为 INSERT 列清单或 UPDATE 的 SET 目标；`UPDATE` 后该行 rowid 会变
 （删旧+插新），删除后槽位可能被复用 —— 客户端应在同一持锁事务内 fetch → 改，改完重新取一次 rowid。
 
+表结构演进（`ALTER TABLE` / `TRUNCATE`，一次只做一个动作）：
+
+```sql
+ALTER TABLE t ADD COLUMN c INT;              -- COLUMN 可省略；老行补 NULL
+ALTER TABLE t ADD COLUMN c VARCHAR(20) NOT NULL;  -- 表里已有数据时会被拒绝（无法给老行补值）
+ALTER TABLE t DROP COLUMN c;                 -- 主键列 / 最后一列 → 拒绝
+ALTER TABLE t RENAME TO t2;                  -- 连带 <表>_pk 索引改名
+ALTER TABLE t RENAME COLUMN a TO b;          -- 目标名须先空闲；索引元数据同步改名
+ALTER TABLE t ADD PRIMARY KEY (c);           -- 也可 (c1, c2)；要求既有数据无 NULL 且无重复
+ALTER TABLE t DROP PRIMARY KEY;
+TRUNCATE TABLE t;                            -- 清空数据 + 重建索引，比 `delete in t` 快
+```
+
+`ALTER` 走的是**整表重建**：记录二进制以「列数 + NULL 位图 + 逐列值」编码，反序列化会校验
+列数 ⇔ schema，列数一变老字节流就解不出来 —— 所以只能「导出全部行 → 换 schema 重建 → 回填」。
+副作用是行定位（页号 + 槽位）全变，**表上的索引会在重建后全部重建**。`RENAME` 则只改目录与
+索引名（B+ 树键按值编码，不含列名），不动数据。
+
+> DDL **不做事务回滚**（与 MySQL 一致）：语句逐条立即生效，中途失败时前面已成功的不会撤销。
+> 客户端表设计器因此把一次编辑差分成多条语句，并在失败时明确告知「第几条失败、前面的不会回滚」。
+
 多库控制（同样由会话拦截，编译器不识别）：
 
 ```sql

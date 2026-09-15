@@ -390,6 +390,14 @@ namespace cella::db
     {
       return ExecDropIndex(plan, ctx, out);
     }
+    if (plan.op == "AlterTable")
+    {
+      return ExecAlterTable(plan, ctx, out);
+    }
+    if (plan.op == "TruncateTable")
+    {
+      return ExecTruncateTable(plan, ctx, out);
+    }
     if (plan.op == "Insert")
     {
       return ExecInsert(plan, ctx, out);
@@ -941,6 +949,878 @@ namespace cella::db
     return DbStatus::Ok();
   }
 
+  // ═════════════════════════════════════════════════════════════
+  // ALTER TABLE / TRUNCATE TABLE（P5：DDL 演进能力）
+  // ═════════════════════════════════════════════════════════════
+  //
+  // 统一套路：除 ADD/DROP PRIMARY KEY 之外，所有动作都要**重建物理表**。
+  //
+  //   为什么重建是必需的？
+  //     行的二进制布局是 `列数 + NULL 位图 + 逐列值`，反序列化会拿 schema 的列数
+  //     与字节流里的列数对账（slotted_record_serializer.cpp）。列集合一变，
+  //     老字节流立刻解不出来；存储层也没有「原地改列」的能力。所以只能把老表
+  //     整体导出、按新结构建表、再逐行回填。表改名同理（存储层没有 rename）。
+  //
+  //   代价与副作用：
+  //     * O(表行数) 的读写 —— 与「改列必须重写每一行」的物理事实一致；
+  //     * 所有行的定位（页号 + 槽位）都会变 → 表上的索引全部失效，必须重建
+  //       （见 RebuildTableIndexes），否则索引会指向已不存在的行。
+  //
+  //   这些语句按 DDL 处理（会话层隐式提交前置事务 + 执行后强制存盘），
+  //   与 CREATE/DROP TABLE 一致：元数据与物理表已经改了，回滚它们没有意义。
+
+  size_t Executor::CountRowsOf(const std::string &table) const
+  {
+    if (storage_ == nullptr)
+    {
+      return 0;
+    }
+    std::shared_ptr<storage::TableHeap> heap;
+    if (!storage_->open_table(table, &heap).ok() || !heap)
+    {
+      return 0;
+    }
+    size_t n = 0;
+    for (auto it = heap->begin(); it != heap->end(); ++it)
+    {
+      ++n;
+    }
+    return n;
+  }
+
+  DbStatus Executor::RebuildTableRows(const CatalogTable &old_meta, const CatalogTable &new_meta,
+                                      const std::vector<int> &col_map, bool copy_rows,
+                                      uint32_t *new_first_page)
+  {
+    if (storage_ == nullptr)
+    {
+      return DbStatus::Error(DbCode::kInternal, "执行器未绑定存储，无法重建表");
+    }
+    // ① 把老表全部行进内存（必须先读完再删表；TRUNCATE 不搬数据则跳过）
+    std::vector<std::vector<storage::Value>> rows;
+    if (copy_rows)
+    {
+      std::shared_ptr<storage::TableHeap> heap;
+      const storage::Status os = storage_->open_table(old_meta.name, &heap);
+      if (!os.ok())
+      {
+        return FromStorage(os, "ALTER 时打开表 " + old_meta.name);
+      }
+      for (auto it = heap->begin(); it != heap->end(); ++it)
+      {
+        const storage::Record &rec = *it;
+        std::vector<storage::Value> row;
+        row.reserve(rec.value_count());
+        for (size_t i = 0; i < rec.value_count(); ++i)
+        {
+          row.push_back(rec.value(i));
+        }
+        rows.push_back(std::move(row));
+      }
+    }
+    // ② 按新结构重建物理表（原表名与新表名可能不同 —— 表改名场景）
+    const storage::Schema schema = ToStorageSchema(new_meta);
+    {
+      const storage::Status ds = storage_->drop_table(old_meta.name);
+      if (!ds.ok())
+      {
+        return FromStorage(ds, "ALTER 时删除旧表 " + old_meta.name);
+      }
+      const storage::Status cs = storage_->create_table(new_meta.name, schema);
+      if (!cs.ok())
+      {
+        return FromStorage(cs, "ALTER 后重建表 " + new_meta.name);
+      }
+    }
+    // ③ 回填：按 col_map 逐列取值，新列（-1）补 NULL
+    for (const auto &old_row : rows)
+    {
+      storage::Record rec;
+      for (size_t i = 0; i < col_map.size(); ++i)
+      {
+        const int src = col_map[i];
+        if (src < 0 || static_cast<size_t>(src) >= old_row.size())
+        {
+          rec.AddValue(storage::Value::Null());
+        }
+        else
+        {
+          rec.AddValue(old_row[static_cast<size_t>(src)]);
+        }
+      }
+      storage::Rid rid;
+      const storage::Status is = storage_->insert_record(new_meta.name, rec, &rid);
+      if (!is.ok())
+      {
+        return FromStorage(is, "ALTER 回填 " + new_meta.name);
+      }
+    }
+    if (new_first_page != nullptr)
+    {
+      std::shared_ptr<storage::TableHeap> heap;
+      if (storage_->open_table(new_meta.name, &heap).ok() && heap)
+      {
+        *new_first_page = static_cast<uint32_t>(heap->first_page_id());
+      }
+    }
+    DbLogInfo(logcat::kCatalog, "ALTER：已重建表 " + old_meta.name + " → " + new_meta.name + "（" +
+                                    std::to_string(rows.size()) + " 行，" +
+                                    std::to_string(new_meta.columns.size()) + " 列）");
+    return DbStatus::Ok();
+  }
+
+  DbStatus Executor::BuildIndexTree(const CatalogTable &table,
+                                    const std::vector<std::string> &cols, bool unique,
+                                    bool require_not_null, uint32_t *root_out)
+  {
+    if (storage_ == nullptr)
+    {
+      return DbStatus::Error(DbCode::kInternal, "执行器未绑定存储，无法建索引");
+    }
+    storage::BufferPoolManager *bpm = storage_->buffer_pool();
+    if (bpm == nullptr)
+    {
+      return DbStatus::Error(DbCode::kInternal, "存储引擎未暴露缓冲池，无法建索引");
+    }
+    // 列定位 + 键规格（按声明序）
+    storage::BPlusTree::KeySpec spec;
+    std::vector<int> col_idxs;
+    for (const std::string &cn : cols)
+    {
+      const CatalogColumn *col = table.FindColumn(cn);
+      if (col == nullptr)
+      {
+        return DbStatus::Error(DbCode::kColumnNotFound, "列不存在: " + table.name + "." + cn);
+      }
+      spec.columns.push_back(storage::BPlusTree::Column{
+          ToStorageType(col->type), static_cast<uint16_t>(col->len)});
+      col_idxs.push_back(table.ColumnIndex(col->name));
+    }
+    if (cols.empty())
+    {
+      return DbStatus::Error(DbCode::kInternal, "索引列清单为空");
+    }
+    if (!storage::BPlusTree::KeyFitsPage(bpm->page_size(), spec))
+    {
+      return DbStatus::Error(DbCode::kValueTooLong,
+                             "索引列 (" + JoinIndexColumns(cols) +
+                                 ") 的键编码过长，单页放不下最坏情况，拒绝建索引");
+    }
+    storage::BPlusTree tree(bpm, spec);
+    storage::page_id_t root = storage::kInvalidPageId;
+    const storage::Status cs = tree.Create(&root);
+    if (!cs.ok())
+    {
+      return FromStorage(cs, "建索引树 " + table.name);
+    }
+
+    std::shared_ptr<storage::TableHeap> heap;
+    const storage::Status os = storage_->open_table(table.name, &heap);
+    if (!os.ok())
+    {
+      return FromStorage(os, "回填索引时打开表 " + table.name);
+    }
+    for (auto it = heap->begin(); it != heap->end(); ++it)
+    {
+      const storage::Record &rec = *it;
+      std::vector<storage::Value> key_vals;
+      bool bad = false;
+      for (int ci : col_idxs)
+      {
+        if (ci < 0 || static_cast<size_t>(ci) >= rec.value_count())
+        {
+          bad = true;
+          break;
+        }
+        key_vals.push_back(rec.value(static_cast<size_t>(ci)));
+      }
+      if (bad)
+      {
+        continue;
+      }
+      if (require_not_null)
+      {
+        for (const storage::Value &v : key_vals)
+        {
+          if (v.IsNull())
+          {
+            return DbStatus::Error(DbCode::kNotNullViolation,
+                                   "列 (" + JoinIndexColumns(cols) +
+                                       ") 存在 NULL 值，无法建立主键（主键列隐含非空）");
+          }
+        }
+      }
+      const std::string leaf = storage::EncodeLeafKeyColumns(
+          key_vals, it.rid().page_id, static_cast<uint8_t>(it.rid().slot_id));
+      bool dup = false;
+      const storage::Status is = tree.Insert(leaf, &dup);
+      if (!is.ok())
+      {
+        return FromStorage(is, "回填索引 " + table.name);
+      }
+    }
+    // 唯一性校验：键 = 元组编码 + 行定位，按字节序排列 → 相邻键「去掉行定位后」
+    // 相等即同元组。这把「列值元组重复」与「同键重复」一次覆盖。
+    if (unique)
+    {
+      std::vector<std::string> all;
+      const storage::Status ss = tree.ScanAll(&all);
+      if (!ss.ok())
+      {
+        return FromStorage(ss, "校验唯一索引 " + table.name);
+      }
+      for (size_t i = 1; i < all.size(); ++i)
+      {
+        if (storage::StripLeafRowId(all[i - 1]).compare(storage::StripLeafRowId(all[i])) == 0)
+        {
+          return DbStatus::Error(DbCode::kUniqueViolation,
+                                 "列 (" + JoinIndexColumns(cols) +
+                                     ") 存在重复值，无法建立唯一索引/主键");
+        }
+      }
+    }
+    if (root_out != nullptr)
+    {
+      *root_out = static_cast<uint32_t>(root);
+    }
+    return DbStatus::Ok();
+  }
+
+  DbStatus Executor::RenameIndexMeta(const std::string &old_index_name, const CatalogIndex &index)
+  {
+    const DbStatus ds = catalog_->DeleteIndexRows(old_index_name);
+    if (!ds.ok())
+    {
+      return ds;
+    }
+    return catalog_->WriteIndexRow(index);
+  }
+
+  DbStatus Executor::RebuildTableIndexes(const CatalogTable &new_meta,
+                                         const std::vector<CatalogIndex> &index_metas,
+                                         const std::string &rename_from,
+                                         const std::string &rename_to)
+  {
+    const bool renaming = !rename_from.empty() && !rename_to.empty();
+    for (const CatalogIndex &snap : index_metas)
+    {
+      CatalogIndex ix = snap;
+      if (renaming)
+      {
+        ix.table = rename_to;
+        // <表>_pk 是系统按表名派生的（见 PrimaryIndexName），表改名时跟着改；
+        // 用户起的二级索引名保持不动（索引名全局唯一，改它反而是意外）。
+        if (ix.name == PrimaryIndexName(rename_from))
+        {
+          ix.name = PrimaryIndexName(rename_to);
+        }
+      }
+      uint32_t root = 0;
+      const DbStatus bs = BuildIndexTree(new_meta, ix.columns, ix.unique, false, &root);
+      if (!bs.ok())
+      {
+        return bs;
+      }
+      ix.root_page_id = root;
+      // 旧名要显式删 —— 表改名时 <旧表>_pk 那条元数据行必须清掉，
+      // 否则重启后目录里会多出一个指向不存在的表的索引。
+      const DbStatus ws = RenameIndexMeta(snap.name, ix);
+      if (!ws.ok())
+      {
+        return ws;
+      }
+    }
+    return DbStatus::Ok();
+  }
+
+  DbStatus Executor::ExecAlterTable(const cella::CELLA_PlanNode &plan, const ExecContext &ctx,
+                                    QueryResult *out)
+  {
+    const cella::CELLA_Stmt *st = plan.stmt;
+    if (st == nullptr)
+    {
+      return DbStatus::Error(DbCode::kInternal, "AlterTable 计划缺少语句信息");
+    }
+    const CatalogTable *found = catalog_->FindTable(st->tableName);
+    if (found == nullptr)
+    {
+      return DbStatus::Error(DbCode::kTableNotFound, "表不存在: " + st->tableName);
+    }
+    if (CatalogManager::IsProtectedSystemTable(found->name))
+    {
+      return DbStatus::Error(DbCode::kSystemTableProtected, "系统表禁止修改: " + found->name);
+    }
+    const DbStatus ls = LockTable(found->name, LockMode::kExclusive, ctx, TablePriv::kNone);
+    if (!ls.ok())
+    {
+      return ls;
+    }
+    // 快照：ReplaceTableMeta 会重建 tables_ 里的条目，之后再解引用 found 就悬空了。
+    const CatalogTable old_meta = *found;
+    std::vector<CatalogIndex> saved;
+    for (const CatalogIndex *ix : catalog_->IndexesOfTable(old_meta.name))
+    {
+      saved.push_back(*ix);
+    }
+
+    switch (st->alterAction)
+    {
+    case cella::CELLA_Stmt::AlterAction::ADD_COLUMN:
+      return AlterAddColumn(old_meta, saved, *st, out);
+    case cella::CELLA_Stmt::AlterAction::DROP_COLUMN:
+      return AlterDropColumn(old_meta, saved, *st, out);
+    case cella::CELLA_Stmt::AlterAction::RENAME_TABLE:
+      return AlterRenameTable(old_meta, saved, *st, out);
+    case cella::CELLA_Stmt::AlterAction::RENAME_COLUMN:
+      return AlterRenameColumn(old_meta, saved, *st, out);
+    case cella::CELLA_Stmt::AlterAction::ADD_PRIMARY_KEY:
+      return AlterAddPrimaryKey(old_meta, saved, *st, out);
+    case cella::CELLA_Stmt::AlterAction::DROP_PRIMARY_KEY:
+      return AlterDropPrimaryKey(old_meta, saved, *st, out);
+    }
+    return DbStatus::Error(DbCode::kInternal, "未知的 ALTER TABLE 动作");
+  }
+
+  // ALTER TABLE ... ADD [COLUMN] c T [NOT NULL]
+  // 老行补 NULL（P5.1 的关键点）。若新列声明 NOT NULL 而表里已有数据 → 无法补值，拒绝。
+  DbStatus Executor::AlterAddColumn(const CatalogTable &old_meta,
+                                    const std::vector<CatalogIndex> &indexes,
+                                    const cella::CELLA_Stmt &st, QueryResult *out)
+  {
+    const cella::CELLA_ColumnDef &cd = st.newColumn;
+    if (IsRowidName(cd.name))
+    {
+      return DbStatus::Error(DbCode::kSqlError, "rowid 是只读伪列，不能用作列名");
+    }
+    if (old_meta.FindColumn(cd.name) != nullptr)
+    {
+      return DbStatus::Error(DbCode::kSqlError,
+                             "列已存在: " + old_meta.name + "." + cd.name);
+    }
+    if (cd.primaryKey)
+    {
+      return DbStatus::Error(DbCode::kSqlError,
+                             "ADD COLUMN 不接受 PRIMARY KEY；请改用 ADD PRIMARY KEY (列)");
+    }
+
+    CatalogColumn nc;
+    nc.name = cd.name;
+    nc.type = cd.type;
+    nc.len = (cd.type == cella::CELLA_DataType::CHAR || cd.type == cella::CELLA_DataType::VARCHAR)
+                 ? (cd.hasLen ? cd.len : 255)
+                 : 0;
+    nc.not_null = cd.notNull;
+    nc.primary_key = false;
+
+    {
+      StorageGuard guard(storage_mutex_);
+      if (nc.not_null && CountRowsOf(old_meta.name) > 0)
+      {
+        return DbStatus::Error(DbCode::kNotNullViolation,
+                               "表 " + old_meta.name + " 已有数据，新列 " + cd.name +
+                                   " 声明 NOT NULL 却无法为老行补值；"
+                                   "请先去数据或改用允许 NULL 的列");
+      }
+    }
+
+    CatalogTable new_meta = old_meta;
+    new_meta.columns = old_meta.columns;
+    new_meta.columns.push_back(nc);
+    std::vector<int> col_map;
+    for (size_t i = 0; i < old_meta.columns.size(); ++i)
+    {
+      col_map.push_back(static_cast<int>(i));
+    }
+    col_map.push_back(-1); // 新列：老行补 NULL
+
+    uint32_t first_page = 0;
+    {
+      StorageGuard guard(storage_mutex_);
+      const DbStatus rs = RebuildTableRows(old_meta, new_meta, col_map, true, &first_page);
+      if (!rs.ok())
+      {
+        return rs;
+      }
+      CatalogTable persisted = new_meta;
+      persisted.first_page_id = first_page;
+      const DbStatus ws = catalog_->ReplaceTableMeta(old_meta.name, persisted);
+      if (!ws.ok())
+      {
+        return ws;
+      }
+      const DbStatus is = RebuildTableIndexes(persisted, indexes, "", "");
+      if (!is.ok())
+      {
+        return is;
+      }
+    }
+    out->tag = "ALTER TABLE " + old_meta.name + " ADD COLUMN " + cd.name;
+    DbLogInfo(logcat::kCatalog, out->tag);
+    return DbStatus::Ok();
+  }
+
+  // ALTER TABLE ... DROP [COLUMN] c
+  // 需要重写行（P5.2）：删掉该列后每一行的列数少 1。涉及该列的索引整条级联删除
+  // （与语义层 SEM 的级联规则一致）；其余索引因行定位改变而重建。
+  DbStatus Executor::AlterDropColumn(const CatalogTable &old_meta,
+                                     const std::vector<CatalogIndex> &indexes,
+                                     const cella::CELLA_Stmt &st, QueryResult *out)
+  {
+    const CatalogColumn *col = old_meta.FindColumn(st.alterColumnName);
+    if (col == nullptr)
+    {
+      return DbStatus::Error(DbCode::kColumnNotFound,
+                             "列不存在: " + old_meta.name + "." + st.alterColumnName);
+    }
+    if (old_meta.columns.size() <= 1)
+    {
+      return DbStatus::Error(DbCode::kSqlError,
+                             "不能删除表 " + old_meta.name + " 的最后一列（表至少要有一列）");
+    }
+    if (col->primary_key)
+    {
+      return DbStatus::Error(DbCode::kSqlError,
+                             "列 " + col->name + " 是主键列，不能直接删除；"
+                             "请先 ALTER TABLE " + old_meta.name + " DROP PRIMARY KEY");
+    }
+    const std::string drop_name = col->name;
+    const std::string drop_key = cella::cella_toUpper(drop_name);
+    const int drop_idx = old_meta.ColumnIndex(drop_name);
+
+    // 新列定义与映射：跳过被删列
+    CatalogTable new_meta = old_meta;
+    new_meta.columns.clear();
+    std::vector<int> col_map;
+    for (size_t i = 0; i < old_meta.columns.size(); ++i)
+    {
+      if (static_cast<int>(i) == drop_idx)
+      {
+        continue;
+      }
+      new_meta.columns.push_back(old_meta.columns[i]);
+      col_map.push_back(static_cast<int>(i));
+    }
+
+    // 索引分两拨：引用了被删列的 → 删除；其余的 → 重建
+    std::vector<CatalogIndex> keep;
+    std::vector<std::string> cascaded;
+    for (const CatalogIndex &ix : indexes)
+    {
+      bool hit = false;
+      for (const std::string &ic : ix.columns)
+      {
+        if (cella::cella_toUpper(ic) == drop_key)
+        {
+          hit = true;
+          break;
+        }
+      }
+      if (hit)
+      {
+        cascaded.push_back(ix.name);
+      }
+      else
+      {
+        keep.push_back(ix);
+      }
+    }
+
+    uint32_t first_page = 0;
+    {
+      StorageGuard guard(storage_mutex_);
+      const DbStatus rs = RebuildTableRows(old_meta, new_meta, col_map, true, &first_page);
+      if (!rs.ok())
+      {
+        return rs;
+      }
+      CatalogTable persisted = new_meta;
+      persisted.first_page_id = first_page;
+      const DbStatus ws = catalog_->ReplaceTableMeta(old_meta.name, persisted);
+      if (!ws.ok())
+      {
+        return ws;
+      }
+      for (const std::string &ixn : cascaded)
+      {
+        const DbStatus ds = catalog_->DeleteIndexRows(ixn);
+        if (!ds.ok())
+        {
+          return ds;
+        }
+      }
+      const DbStatus is = RebuildTableIndexes(persisted, keep, "", "");
+      if (!is.ok())
+      {
+        return is;
+      }
+    }
+    out->tag = "ALTER TABLE " + old_meta.name + " DROP COLUMN " + drop_name;
+    DbLogInfo(logcat::kCatalog, out->tag + (cascaded.empty()
+                                                ? std::string()
+                                                : "（级联删除索引 " +
+                                                      JoinIndexColumns(cascaded) + "）"));
+    return DbStatus::Ok();
+  }
+
+  // ALTER TABLE ... RENAME TO <new>
+  // 存储层没有 rename_table，因此同样走「重建」：换名建表 + 回填 + 换目录。
+  DbStatus Executor::AlterRenameTable(const CatalogTable &old_meta,
+                                      const std::vector<CatalogIndex> &indexes,
+                                      const cella::CELLA_Stmt &st, QueryResult *out)
+  {
+    if (cella::cella_toUpper(st.newName) == cella::cella_toUpper(old_meta.name))
+    {
+      out->tag = "ALTER TABLE " + old_meta.name + " RENAME TO " + st.newName;
+      return DbStatus::Ok(); // 改成同名：空操作
+    }
+    if (CatalogManager::IsSystemTable(st.newName))
+    {
+      return DbStatus::Error(DbCode::kSqlError, "不能把表改名为系统表名: " + st.newName);
+    }
+    if (catalog_->FindTable(st.newName) != nullptr)
+    {
+      return DbStatus::Error(DbCode::kTableExists, "表已存在: " + st.newName);
+    }
+
+    CatalogTable new_meta = old_meta;
+    new_meta.name = st.newName;
+    std::vector<int> col_map;
+    for (size_t i = 0; i < old_meta.columns.size(); ++i)
+    {
+      col_map.push_back(static_cast<int>(i)); // 列集合不变
+    }
+
+    uint32_t first_page = 0;
+    {
+      StorageGuard guard(storage_mutex_);
+      const DbStatus rs = RebuildTableRows(old_meta, new_meta, col_map, true, &first_page);
+      if (!rs.ok())
+      {
+        return rs;
+      }
+      CatalogTable persisted = new_meta;
+      persisted.first_page_id = first_page;
+      const DbStatus ws = catalog_->ReplaceTableMeta(old_meta.name, persisted);
+      if (!ws.ok())
+      {
+        return ws;
+      }
+      const DbStatus is =
+          RebuildTableIndexes(persisted, indexes, old_meta.name, st.newName);
+      if (!is.ok())
+      {
+        return is;
+      }
+    }
+    out->tag = "ALTER TABLE " + old_meta.name + " RENAME TO " + st.newName;
+    DbLogInfo(logcat::kCatalog, out->tag);
+    return DbStatus::Ok();
+  }
+
+  // ALTER TABLE ... RENAME COLUMN <old> TO <new>
+  DbStatus Executor::AlterRenameColumn(const CatalogTable &old_meta,
+                                       const std::vector<CatalogIndex> &indexes,
+                                       const cella::CELLA_Stmt &st, QueryResult *out)
+  {
+    const CatalogColumn *col = old_meta.FindColumn(st.alterColumnName);
+    if (col == nullptr)
+    {
+      return DbStatus::Error(DbCode::kColumnNotFound,
+                             "列不存在: " + old_meta.name + "." + st.alterColumnName);
+    }
+    if (IsRowidName(st.newName))
+    {
+      return DbStatus::Error(DbCode::kSqlError, "rowid 是只读伪列，不能用作列名");
+    }
+    if (cella::cella_toUpper(st.newName) != cella::cella_toUpper(col->name) &&
+        old_meta.FindColumn(st.newName) != nullptr)
+    {
+      return DbStatus::Error(DbCode::kSqlError, "列已存在: " + old_meta.name + "." + st.newName);
+    }
+    const std::string old_col_name = col->name;
+    const std::string old_key = cella::cella_toUpper(old_col_name);
+
+    CatalogTable new_meta = old_meta;
+    new_meta.columns = old_meta.columns;
+    for (CatalogColumn &c : new_meta.columns)
+    {
+      if (cella::cella_toUpper(c.name) == old_key)
+      {
+        c.name = st.newName;
+      }
+    }
+    std::vector<int> col_map;
+    for (size_t i = 0; i < old_meta.columns.size(); ++i)
+    {
+      col_map.push_back(static_cast<int>(i));
+    }
+
+    // 索引元数据里的列名同步改名（键按「值」编码、不含列名），但行定位变了 → 重建树
+    std::vector<CatalogIndex> renamed = indexes;
+    for (CatalogIndex &ix : renamed)
+    {
+      for (std::string &ic : ix.columns)
+      {
+        if (cella::cella_toUpper(ic) == old_key)
+        {
+          ic = st.newName;
+        }
+      }
+      // column 字段是 cella_index 行格式里的权威文本，必须跟着 columns 重新拼
+      ix.column = ix.JoinedColumns();
+    }
+
+    uint32_t first_page = 0;
+    {
+      StorageGuard guard(storage_mutex_);
+      const DbStatus rs = RebuildTableRows(old_meta, new_meta, col_map, true, &first_page);
+      if (!rs.ok())
+      {
+        return rs;
+      }
+      CatalogTable persisted = new_meta;
+      persisted.first_page_id = first_page;
+      const DbStatus ws = catalog_->ReplaceTableMeta(old_meta.name, persisted);
+      if (!ws.ok())
+      {
+        return ws;
+      }
+      const DbStatus is = RebuildTableIndexes(persisted, renamed, "", "");
+      if (!is.ok())
+      {
+        return is;
+      }
+    }
+    out->tag = "ALTER TABLE " + old_meta.name + " RENAME COLUMN " + old_col_name + " TO " +
+               st.newName;
+    DbLogInfo(logcat::kCatalog, out->tag);
+    return DbStatus::Ok();
+  }
+
+  // ALTER TABLE ... ADD PRIMARY KEY (a [, b])
+  // 只加约束与索引，不动行布局 —— 因此**不需要重建物理表**。
+  // 但已有数据必须满足主键的两条前提（非空 + 唯一），由 BuildIndexTree 校验。
+  DbStatus Executor::AlterAddPrimaryKey(const CatalogTable &old_meta,
+                                        const std::vector<CatalogIndex> &indexes,
+                                        const cella::CELLA_Stmt &st, QueryResult *out)
+  {
+    (void)indexes;
+    if (!old_meta.PrimaryKeyColumns().empty())
+    {
+      return DbStatus::Error(DbCode::kSqlError,
+                             "表 " + old_meta.name + " 已有主键；请先 DROP PRIMARY KEY");
+    }
+    if (st.pkColumns.empty())
+    {
+      return DbStatus::Error(DbCode::kSqlError, "ADD PRIMARY KEY 至少需要一列");
+    }
+    // 解析成表内真实列名（保持大小写），并顺手查重
+    std::vector<std::string> pk_names;
+    std::set<std::string> seen;
+    for (const std::string &cn : st.pkColumns)
+    {
+      const CatalogColumn *col = old_meta.FindColumn(cn);
+      if (col == nullptr)
+      {
+        return DbStatus::Error(DbCode::kColumnNotFound,
+                               "主键列不存在: " + old_meta.name + "." + cn);
+      }
+      if (!seen.insert(cella::cella_toUpper(col->name)).second)
+      {
+        return DbStatus::Error(DbCode::kSqlError, "主键列重复: " + col->name);
+      }
+      pk_names.push_back(col->name);
+    }
+    const std::string index_name = PrimaryIndexName(old_meta.name);
+
+    CatalogTable new_meta = old_meta;
+    new_meta.columns = old_meta.columns;
+    for (CatalogColumn &c : new_meta.columns)
+    {
+      for (const std::string &pn : pk_names)
+      {
+        if (cella::cella_toUpper(c.name) == cella::cella_toUpper(pn))
+        {
+          c.primary_key = true;
+          c.not_null = true; // 主键隐含非空（与 CREATE TABLE 一致）
+        }
+      }
+    }
+
+    {
+      StorageGuard guard(storage_mutex_);
+      // 顺序很重要：先建树（唯一性与空值校验都在里面），树建成后再落元数据。
+      // 若中途失败，最坏情况是「多了个索引但目录还没标主键」——数据层的唯一性
+      // 依然被索引守着，比反过来（标了主键却没有索引 → 唯一性失守）安全得多。
+      uint32_t root = 0;
+      const DbStatus bs =
+          BuildIndexTree(old_meta, pk_names, true, true, &root);
+      if (!bs.ok())
+      {
+        return bs;
+      }
+      CatalogIndex ix;
+      ix.name = index_name;
+      ix.table = old_meta.name;
+      ix.columns = pk_names;
+      ix.column = ix.JoinedColumns();
+      ix.unique = true;
+      ix.root_page_id = root;
+      ix.created_at = static_cast<int64_t>(std::time(nullptr));
+      const DbStatus ws = catalog_->WriteIndexRow(ix);
+      if (!ws.ok())
+      {
+        return ws;
+      }
+      const DbStatus ms = catalog_->ReplaceTableMeta(old_meta.name, new_meta);
+      if (!ms.ok())
+      {
+        return ms;
+      }
+    }
+    out->tag = "ALTER TABLE " + old_meta.name + " ADD PRIMARY KEY (" +
+               JoinIndexColumns(pk_names) + ")";
+    DbLogInfo(logcat::kCatalog, out->tag);
+    return DbStatus::Ok();
+  }
+
+  // ALTER TABLE ... DROP PRIMARY KEY
+  // 只解除约束：删掉 <表>_pk 索引元数据 + 清掉的 primary_key 标志。
+  // NOT NULL 保留（MySQL 同样如此，避免「删主键顺手放宽空值」的意外）。
+  DbStatus Executor::AlterDropPrimaryKey(const CatalogTable &old_meta,
+                                         const std::vector<CatalogIndex> &indexes,
+                                         const cella::CELLA_Stmt &st, QueryResult *out)
+  {
+    (void)st;
+    if (old_meta.PrimaryKeyColumns().empty())
+    {
+      return DbStatus::Error(DbCode::kSqlError, "表 " + old_meta.name + " 没有主键");
+    }
+    CatalogTable new_meta = old_meta;
+    new_meta.columns = old_meta.columns;
+    for (CatalogColumn &c : new_meta.columns)
+    {
+      c.primary_key = false;
+    }
+    const std::string index_name = PrimaryIndexName(old_meta.name);
+    {
+      StorageGuard guard(storage_mutex_);
+      if (catalog_->FindIndex(index_name) != nullptr)
+      {
+        const DbStatus ds = catalog_->DeleteIndexRows(index_name);
+        if (!ds.ok())
+        {
+          return ds;
+        }
+      }
+      else
+      {
+        // 目录里没有 <表>_pk（历史库/手工索引）→ 兜底按主键列名找一条唯一索引删掉
+        for (const CatalogIndex &ix : indexes)
+        {
+          if (ix.unique && !ix.columns.empty())
+          {
+            bool same = ix.columns.size() == old_meta.PrimaryKeyColumns().size();
+            for (size_t i = 0; same && i < ix.columns.size(); ++i)
+            {
+              const int ci = old_meta.ColumnIndex(ix.columns[i]);
+              if (ci < 0 || ci != old_meta.PrimaryKeyColumns()[i])
+              {
+                same = false;
+              }
+            }
+            if (same)
+            {
+              const DbStatus ds = catalog_->DeleteIndexRows(ix.name);
+              if (!ds.ok())
+              {
+                return ds;
+              }
+            }
+          }
+        }
+      }
+      const DbStatus ms = catalog_->ReplaceTableMeta(old_meta.name, new_meta);
+      if (!ms.ok())
+      {
+        return ms;
+      }
+    }
+    out->tag = "ALTER TABLE " + old_meta.name + " DROP PRIMARY KEY";
+    DbLogInfo(logcat::kCatalog, out->tag);
+    return DbStatus::Ok();
+  }
+
+  // ═════════════════════════════════════════════════════════════
+  // TRUNCATE TABLE（P5.5）
+  // ═════════════════════════════════════════════════════════════
+  //
+  // 语义：清空全部行、**保留表结构与索引定义**。实现是「删物理表 + 按同 schema 重建」，
+  // 因此释放整棵数据页树是 O(1) 级的，比 `DELETE in t`（逐行删除 + 逐行维护索引）
+  // 快得多 —— 这正是 TRUNCATE 存在的理由。
+  // 索引的键指向行定位（页号 + 槽位），行没了必须重置 —— 每棵索引建一棵空树即可。
+  DbStatus Executor::ExecTruncateTable(const cella::CELLA_PlanNode &plan, const ExecContext &ctx,
+                                       QueryResult *out)
+  {
+    const cella::CELLA_Stmt *st = plan.stmt;
+    if (st == nullptr)
+    {
+      return DbStatus::Error(DbCode::kInternal, "TruncateTable 计划缺少语句信息");
+    }
+    const CatalogTable *found = catalog_->FindTable(st->tableName);
+    if (found == nullptr)
+    {
+      return DbStatus::Error(DbCode::kTableNotFound, "表不存在: " + st->tableName);
+    }
+    if (CatalogManager::IsProtectedSystemTable(found->name))
+    {
+      return DbStatus::Error(DbCode::kSystemTableProtected, "系统表禁止清空: " + found->name);
+    }
+    const DbStatus ls = LockTable(found->name, LockMode::kExclusive, ctx, TablePriv::kNone);
+    if (!ls.ok())
+    {
+      return ls;
+    }
+    const CatalogTable old_meta = *found;
+    std::vector<CatalogIndex> saved;
+    for (const CatalogIndex *ix : catalog_->IndexesOfTable(old_meta.name))
+    {
+      saved.push_back(*ix);
+    }
+
+    uint32_t first_page = 0;
+    {
+      StorageGuard guard(storage_mutex_);
+      // 空表重建：col_map 全为恒等（列集合不变），可复用的行数为 0
+      CatalogTable empty_meta = old_meta;
+      std::vector<int> col_map;
+      for (size_t i = 0; i < old_meta.columns.size(); ++i)
+      {
+        col_map.push_back(static_cast<int>(i));
+      }
+      const DbStatus rs = RebuildTableRows(old_meta, empty_meta, col_map, false, &first_page);
+      if (!rs.ok())
+      {
+        return rs;
+      }
+      CatalogTable persisted = empty_meta;
+      persisted.first_page_id = first_page;
+      const DbStatus ws = catalog_->ReplaceTableMeta(old_meta.name, persisted);
+      if (!ws.ok())
+      {
+        return ws;
+      }
+      const DbStatus is = RebuildTableIndexes(persisted, saved, "", "");
+      if (!is.ok())
+      {
+        return is;
+      }
+    }
+    out->tag = "TRUNCATE TABLE " + old_meta.name;
+    DbLogInfo(logcat::kCatalog, out->tag);
+    return DbStatus::Ok();
+  }
+
   // ── INSERT ──────────────────────────────────────────────────
 
   DbStatus Executor::ExecInsert(const cella::CELLA_PlanNode &plan, const ExecContext &ctx,
@@ -1116,8 +1996,11 @@ namespace cella::db
         u.kind = UndoRecord::Kind::kInsert;
         u.table = name;
         u.rid = rid;
+        u.after = rec; // P2：撤销这条插入时要写一条 kDelete，得知道被插入的内容
         ctx.txn->AddUndo(std::move(u));
       }
+      // ── P2.1：行变更入 WAL（前后像都在，重做/撤销都够用）──
+      AppendWalRow(ctx.txn_id, wal::RecordType::kInsert, name, rid, {}, rec.values());
       {
         const DbStatus is = IndexRowInsert(&indexes, *meta, rec.values(), rid);
         if (!is.ok())
@@ -2658,6 +3541,7 @@ namespace cella::db
         u.before = h.second; // 回滚时按内容重插
         ctx.txn->AddUndo(std::move(u));
       }
+      AppendWalRow(ctx.txn_id, wal::RecordType::kDelete, name, h.first, h.second.values(), {});
       ++removed;
     }
     out->affected = removed;
@@ -2850,6 +3734,7 @@ namespace cella::db
         u.table = name;
         u.rid = storage::Rid{}; // 新版本尚未插入，失败时只需重插旧内容
         u.before = h.second;
+        u.after = fresh;        // P2：撤销时要写一条反向 kUpdate
         update_undo = &ctx.txn->AddUndo(std::move(u));
       }
 
@@ -2865,6 +3750,8 @@ namespace cella::db
       {
         update_undo->rid = new_rid;
       }
+      AppendWalRow(ctx.txn_id, wal::RecordType::kUpdate, name, new_rid, h.second.values(),
+                   fresh.values());
       // ── P1.5：索引同步。行定位变了（删旧+插新），所以即便列值没变，
       //           叶子键也必须换成新 Rid；唯一性已在上面预检过。
       {
@@ -4054,6 +4941,284 @@ namespace cella::db
       out->rows.push_back(std::move(aligned));
     }
     return DbStatus::Ok();
+  }
+
+  // ═════════════════════════════════════════════════════════════
+  // WAL：行变更记录的写入（P2.1 / P2.2）
+  // ═════════════════════════════════════════════════════════════
+
+  void Executor::AppendWalRow(txn_id_t txn, wal::RecordType type, const std::string &table,
+                              const storage::Rid &rid,
+                              const std::vector<storage::Value> &before,
+                              const std::vector<storage::Value> &after)
+  {
+    if (wal_ == nullptr || txn == kInvalidTxnId)
+    {
+      return;
+    }
+    wal::WalRecord r;
+    r.type = type;
+    r.txn_id = txn;
+    r.table = table;
+    r.page_id = rid.page_id;
+    r.before = before;
+    r.after = after;
+    (void)wal_->Append(r);
+  }
+
+  // ── 恢复期索引处理：清空 / 重建（P2）────────────────────────
+
+  DbStatus Executor::ClearIndexes(const std::set<std::string> &tables)
+  {
+    StorageGuard guard(storage_mutex_);
+    for (const auto &t : tables)
+    {
+      const CatalogTable *meta = catalog_->FindTable(t);
+      if (meta == nullptr || CatalogManager::IsProtectedSystemTable(meta->name))
+      {
+        continue;
+      }
+      std::vector<IndexHandle> indexes;
+      const DbStatus os = OpenTableIndexes(*meta, &indexes);
+      if (!os.ok())
+      {
+        continue; // 索引打不开就算了，重建阶段会再试一次并真正报错
+      }
+      for (auto &ix : indexes)
+      {
+        if (ix.tree == nullptr)
+        {
+          continue;
+        }
+        std::vector<std::string> keys;
+        const storage::Status ss = ix.tree->ScanAll(&keys);
+        if (!ss.ok())
+        {
+          continue;
+        }
+        for (const auto &k : keys)
+        {
+          bool removed = false;
+          (void)ix.tree->Remove(k, &removed);
+        }
+      }
+    }
+    return DbStatus::Ok();
+  }
+
+  DbStatus Executor::RebuildIndexes(const std::set<std::string> &tables)
+  {
+    const DbStatus cs = ClearIndexes(tables); // 先清干净，再按表数据逐行重建
+    if (!cs.ok())
+    {
+      return cs;
+    }
+    StorageGuard guard(storage_mutex_);
+    for (const auto &t : tables)
+    {
+      const CatalogTable *meta = catalog_->FindTable(t);
+      if (meta == nullptr || CatalogManager::IsProtectedSystemTable(meta->name))
+      {
+        continue;
+      }
+      std::vector<IndexHandle> indexes;
+      const DbStatus os = OpenTableIndexes(*meta, &indexes);
+      if (!os.ok())
+      {
+        return os;
+      }
+      if (indexes.empty())
+      {
+        continue;
+      }
+      std::shared_ptr<storage::TableHeap> heap;
+      const storage::Status oh = storage_->open_table(meta->name, &heap);
+      if (!oh.ok())
+      {
+        return FromStorage(oh, "恢复后重建索引 " + meta->name);
+      }
+      for (auto it = heap->begin(); it != heap->end(); ++it)
+      {
+        const DbStatus is = IndexRowInsert(&indexes, *meta, it->values(), it.rid());
+        if (!is.ok())
+        {
+          return is;
+        }
+      }
+    }
+    return DbStatus::Ok();
+  }
+
+  // ═════════════════════════════════════════════════════════════
+  // 恢复期重放（P2.4 redo）
+  // ═════════════════════════════════════════════════════════════
+
+  bool Executor::LocateRowForRecovery(const CatalogTable &table,
+                                      const std::vector<storage::Value> &values,
+                                      storage::Rid *rid, storage::Record *row)
+  {
+    std::shared_ptr<storage::TableHeap> heap;
+    const storage::Status os = storage_->open_table(table.name, &heap);
+    if (!os.ok())
+    {
+      return false;
+    }
+    const int pk_idx = table.PrimaryKeyColumnIndex();
+    const bool by_pk = pk_idx >= 0 && static_cast<size_t>(pk_idx) < values.size();
+    for (auto it = heap->begin(); it != heap->end(); ++it)
+    {
+      const std::vector<storage::Value> &vals = it->values();
+      bool hit = false;
+      if (by_pk && static_cast<size_t>(pk_idx) < vals.size())
+      {
+        // 有主键：按主键定位 —— 主键在 UPDATE 前后通常不变，这是唯一可靠的逻辑身份
+        hit = wal::ValueEqual(vals[static_cast<size_t>(pk_idx)],
+                              values[static_cast<size_t>(pk_idx)]);
+      }
+      else
+      {
+        hit = wal::ValuesEqual(vals, values);
+      }
+      if (hit)
+      {
+        if (rid != nullptr)
+        {
+          *rid = it.rid();
+        }
+        if (row != nullptr)
+        {
+          *row = *it;
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  DbStatus Executor::RecoveryInsertRow(const std::string &table,
+                                       const std::vector<storage::Value> &values)
+  {
+    StorageGuard guard(storage_mutex_);
+    const CatalogTable *meta = catalog_->FindTable(table);
+    if (meta == nullptr)
+    {
+      return DbStatus::Error(DbCode::kTableNotFound, "恢复重做：表不存在 " + table);
+    }
+    if (CatalogManager::IsProtectedSystemTable(meta->name))
+    {
+      // 系统表（目录/索引元数据）不进 WAL —— DDL 后必定紧跟一次存盘点，它已经落盘了
+      return DbStatus::Ok();
+    }
+    storage::Rid dummy;
+    if (LocateRowForRecovery(*meta, values, &dummy, nullptr))
+    {
+      return DbStatus::Ok(); // 已经生效过，重放什么也不做
+    }
+    std::vector<IndexHandle> indexes;
+    const DbStatus os = OpenTableIndexes(*meta, &indexes);
+    if (!os.ok())
+    {
+      return os;
+    }
+    storage::Record rec;
+    for (const auto &v : values)
+    {
+      rec.AddValue(v);
+    }
+    storage::Rid new_rid;
+    const storage::Status s = storage_->insert_record(meta->name, rec, &new_rid);
+    if (!s.ok())
+    {
+      return FromStorage(s, "恢复重做插入 " + meta->name);
+    }
+    return IndexRowInsert(&indexes, *meta, rec.values(), new_rid);
+  }
+
+  DbStatus Executor::RecoveryDeleteRow(const std::string &table,
+                                       const std::vector<storage::Value> &before)
+  {
+    StorageGuard guard(storage_mutex_);
+    const CatalogTable *meta = catalog_->FindTable(table);
+    if (meta == nullptr)
+    {
+      return DbStatus::Error(DbCode::kTableNotFound, "恢复重做：表不存在 " + table);
+    }
+    if (CatalogManager::IsProtectedSystemTable(meta->name))
+    {
+      return DbStatus::Ok();
+    }
+    storage::Rid rid;
+    storage::Record row;
+    if (!LocateRowForRecovery(*meta, before, &rid, &row))
+    {
+      return DbStatus::Ok(); // 已经被删掉了（或后续还有记录会删它）→ 无需动作
+    }
+    std::vector<IndexHandle> indexes;
+    const DbStatus os = OpenTableIndexes(*meta, &indexes);
+    if (!os.ok())
+    {
+      return os;
+    }
+    const storage::Status s = storage_->delete_record(meta->name, rid);
+    if (!s.ok())
+    {
+      return FromStorage(s, "恢复重做删除 " + meta->name);
+    }
+    return IndexRowDelete(&indexes, *meta, row.values(), rid);
+  }
+
+  DbStatus Executor::RecoveryReplaceRow(const std::string &table,
+                                        const std::vector<storage::Value> &before,
+                                        const std::vector<storage::Value> &after)
+  {
+    StorageGuard guard(storage_mutex_);
+    const CatalogTable *meta = catalog_->FindTable(table);
+    if (meta == nullptr)
+    {
+      return DbStatus::Error(DbCode::kTableNotFound, "恢复重做：表不存在 " + table);
+    }
+    if (CatalogManager::IsProtectedSystemTable(meta->name))
+    {
+      return DbStatus::Ok();
+    }
+    // ① 已经是新版本 → 本次更新早就生效了
+    storage::Rid after_rid;
+    storage::Record after_row;
+    if (LocateRowForRecovery(*meta, after, &after_rid, &after_row) &&
+        wal::ValuesEqual(after_row.values(), after))
+    {
+      return DbStatus::Ok();
+    }
+    // ② 还是旧版本 → 删旧插新（与运行时 UPDATE 同一套动作 + 同一套索引维护）
+    storage::Rid old_rid;
+    if (!LocateRowForRecovery(*meta, before, &old_rid, nullptr))
+    {
+      // 两个版本都不在：这行后来被别的记录删掉了，跳过即可
+      return DbStatus::Ok();
+    }
+    std::vector<IndexHandle> indexes;
+    const DbStatus os = OpenTableIndexes(*meta, &indexes);
+    if (!os.ok())
+    {
+      return os;
+    }
+    const storage::Status ds = storage_->delete_record(meta->name, old_rid);
+    if (!ds.ok())
+    {
+      return FromStorage(ds, "恢复重做更新(删旧) " + meta->name);
+    }
+    storage::Record rec;
+    for (const auto &v : after)
+    {
+      rec.AddValue(v);
+    }
+    storage::Rid new_rid;
+    const storage::Status is = storage_->insert_record(meta->name, rec, &new_rid);
+    if (!is.ok())
+    {
+      return FromStorage(is, "恢复重做更新(插新) " + meta->name);
+    }
+    return IndexRowUpdate(&indexes, *meta, before, rec.values(), old_rid, new_rid);
   }
 
 } // namespace cella::db

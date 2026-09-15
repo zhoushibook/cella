@@ -395,7 +395,8 @@ export function initBottomPanel() {
 }
 
 // ── 结构面板 ────────────────────────────────────────────────
-export function renderStruct(container, tableName) {
+// actions 可选：传了就在工具条上多一个「设计表结构」入口（P5.6 的入口之一）
+export function renderStruct(container, tableName, actions) {
   const t = tableByName(tableName) || { name: tableName, columns: [], primaryKey: { columns: [] } };
   const pk = pkOf(t);
   container.innerHTML = `
@@ -403,6 +404,7 @@ export function renderStruct(container, tableName) {
       表 <b>${esc(t.name)}</b> · ${((t.columns) || []).length} 列 ·
       表号 ${t.tableId != null ? t.tableId : '—'}
       ${t.createdAt ? ' · 建表于 ' + new Date(t.createdAt * 1000).toLocaleString() : ''}
+      ${actions ? '<button class="btn" data-act="design" style="margin-left:10px">✎ 设计表结构</button>' : ''}
     </div>
     <div class="structgrid"><table class="grid">
       <thead><tr><th>#</th><th>列名</th><th>类型</th><th>非空</th><th>主键</th></tr></thead>
@@ -419,6 +421,10 @@ export function renderStruct(container, tableName) {
       <div style="font-size:12px;color:var(--text-dim);margin-bottom:6px">生成的 DDL（可复制到查询编辑器改）</div>
       <pre style="border:1px solid var(--border);border-radius:6px;padding:10px">${esc(ddlOf(t))}</pre>
     </div>`;
+  if (actions) {
+    const btn = container.querySelector('[data-act="design"]');
+    if (btn) btn.addEventListener('click', () => actions.openDesigner(t.name));
+  }
 }
 
 function ddlOf(t) {
