@@ -610,7 +610,7 @@ namespace cella::db
   //   * DROP TABLE 时被 DeleteIndexesOfTable 级联清理
   //   * DML 时被 ExecInsert/ExecUpdate/ExecDelete 的索引维护统一覆盖
   // 复合主键（表级 PRIMARY KEY (a, b)）同样建索引：键序 = 主键列**声明序**
-  //（系统约定，见 CatalogTable::PrimaryKeyColumns）。B+ 树键 = 各主键列
+  // （系统约定，见 CatalogTable::PrimaryKeyColumns）。B+ 树键 = 各主键列
   // 依次编码 + 行定位；唯一性由 IndexValueFree 的元组前缀比较保证。
   DbStatus Executor::CreatePrimaryIndex(const CatalogTable &table)
   {
@@ -717,8 +717,8 @@ namespace cella::db
       return ws;
     }
     DbLogInfo(logcat::kCatalog, "已为主键 " + table.name + "(" + entry.column +
-                                   ") 自动建索引 " + index_name +
-                                   "（回填 " + std::to_string(backfilled) + " 行）");
+                                    ") 自动建索引 " + index_name +
+                                    "（回填 " + std::to_string(backfilled) + " 行）");
     return DbStatus::Ok();
   }
 
@@ -955,7 +955,7 @@ namespace cella::db
       }
       out->tag = "CREATE INDEX " + entry.name;
       DbLogInfo(logcat::kCatalog, out->tag + " on " + entry.table + "(" + entry.column +
-                                        ")，回填 " + std::to_string(backfilled) + " 行");
+                                      ")，回填 " + std::to_string(backfilled) + " 行");
     }
     return DbStatus::Ok();
   }
@@ -1431,7 +1431,8 @@ namespace cella::db
     {
       return DbStatus::Error(DbCode::kSqlError,
                              "列 " + col->name + " 是主键列，不能直接删除；"
-                             "请先 ALTER TABLE " + old_meta.name + " DROP PRIMARY KEY");
+                                                 "请先 ALTER TABLE " +
+                                 old_meta.name + " DROP PRIMARY KEY");
     }
     const std::string drop_name = col->name;
     const std::string drop_key = cella::cella_toUpper(drop_name);
@@ -2201,7 +2202,7 @@ namespace cella::db
         continue;
       }
       // 复合适配：索引列清单逐列定位下标；任一列失效则整条索引跳过
-      //（报错会让整张表彻底无法写，代价远大于一条陈旧索引）。
+      // （报错会让整张表彻底无法写，代价远大于一条陈旧索引）。
       std::vector<int> cols;
       bool stale = false;
       for (const std::string &cn : m->columns)
@@ -2278,7 +2279,7 @@ namespace cella::db
     *busy = false;
     if (!ix.meta->unique)
     {
-      return DbStatus::Ok();  // 非唯一索引一律放行
+      return DbStatus::Ok(); // 非唯一索引一律放行
     }
     // 组装本索引的键值元组；任一列为 NULL → 不参与唯一判定（标准 SQL 语义：
     // NULL 表示「未知」，两个未知不相等。PK 列隐含 NOT NULL，不受影响）。
@@ -2288,12 +2289,12 @@ namespace cella::db
     {
       if (col < 0 || static_cast<size_t>(col) >= row_values.size())
       {
-        return DbStatus::Ok();  // 无法定位 → 保守放行
+        return DbStatus::Ok(); // 无法定位 → 保守放行
       }
       const storage::Value &v = row_values[static_cast<size_t>(col)];
       if (v.IsNull())
       {
-        return DbStatus::Ok();  // 含 NULL 的元组不参与唯一判定
+        return DbStatus::Ok(); // 含 NULL 的元组不参与唯一判定
       }
       tuple.push_back(v);
     }
@@ -2321,7 +2322,7 @@ namespace cella::db
       {
         continue;
       }
-      *busy = true;   // 前缀相同且 Rid 不同 → 同元组的另一行，冲突
+      *busy = true; // 前缀相同且 Rid 不同 → 同元组的另一行，冲突
       return DbStatus::Ok();
     }
     return DbStatus::Ok();
@@ -2590,7 +2591,7 @@ namespace cella::db
                                     const std::vector<storage::Value> &row_values,
                                     const storage::Rid &rid, bool *present)
   {
-    (void)table;  // 索引句柄已自带列定义，表仅用于调用方可读性
+    (void)table; // 索引句柄已自带列定义，表仅用于调用方可读性
     *present = true;
     for (const IndexHandle &ix : indexes)
     {
@@ -2808,7 +2809,7 @@ namespace cella::db
       sp.pred = carried;
       sp.need_rowid = with_rowid;
       out->push_back(sp);
-      return;  // 表访问节点没有子节点
+      return; // 表访问节点没有子节点
     }
     // Join 之下不再继承外层谓词：Join 的 ON 条件属于 Join 自己，把外层条件
     // 错算到某一张表上会导致区间失真；靠子树的 Filter 各自下推即可。
@@ -2843,14 +2844,19 @@ namespace cella::db
       using B = cella::CELLA_Expr::BinOp;
       switch (op)
       {
-      case B::LT: return B::GT;
-      case B::LE: return B::GE;
-      case B::GT: return B::LT;
-      case B::GE: return B::LE;
-      default: return op;  // EQ / NE 对称
+      case B::LT:
+        return B::GT;
+      case B::LE:
+        return B::GE;
+      case B::GT:
+        return B::LT;
+      case B::GE:
+        return B::LE;
+      default:
+        return op; // EQ / NE 对称
       }
     }
-  }  // namespace
+  } // namespace
 
   bool Executor::TryIndexRange(const CatalogTable &table, const CatalogIndex &index, int column,
                                const cella::CELLA_Expr *pred, AccessPathChoice *choice) const
@@ -2879,7 +2885,7 @@ namespace cella::db
     const B op = pred->bop;
     if (op != B::EQ && op != B::LT && op != B::LE && op != B::GT && op != B::GE)
     {
-      return false;  // 算术运算不是过滤条件
+      return false; // 算术运算不是过滤条件
     }
 
     // 识别 `列 op 常量` 与 `常量 op 列`
@@ -2924,7 +2930,7 @@ namespace cella::db
       const CatalogColumn &cc = table.columns[static_cast<size_t>(column)];
       storage::Value coerced;
       const DbStatus cs2 = CoerceValue(lit, cc.type, static_cast<uint16_t>(cc.len),
-                                      /*not_null=*/false, &coerced);
+                                       /*not_null=*/false, &coerced);
       if (cs2.ok())
       {
         lit = coerced;
@@ -2985,7 +2991,7 @@ namespace cella::db
                                       const std::vector<int> &columns,
                                       const cella::CELLA_Expr *pred, AccessPathChoice *choice) const
   {
-    (void)index;  // 元数据仅用于将来诊断输出；列信息由 columns 携带
+    (void)index; // 元数据仅用于将来诊断输出；列信息由 columns 携带
     if (pred == nullptr || columns.empty())
     {
       return false;
@@ -3001,7 +3007,7 @@ namespace cella::db
     {
       if (e == nullptr)
       {
-        return true;  // 空子树：无约束但也不破坏形状
+        return true; // 空子树：无约束但也不破坏形状
       }
       if (e->kind == Kind::BINARY && e->bop == B::AND)
       {
@@ -3030,12 +3036,12 @@ namespace cella::db
       if (col_side == nullptr || lit_side == nullptr ||
           lit_side->lit == cella::CELLA_LiteralKind::NULL_LIT)
       {
-        return true;  // 不是 `列 = 字面量`：跳过（NULL 等值不可下推）
+        return true; // 不是 `列 = 字面量`：跳过（NULL 等值不可下推）
       }
       const int ci = table.ColumnIndex(col_side->column);
       if (ci < 0)
       {
-        return true;  // 其它表的列：跳过
+        return true; // 其它表的列：跳过
       }
       storage::Value lit;
       if (!LiteralToValue(*lit_side, &lit))
@@ -3049,7 +3055,7 @@ namespace cella::db
                                        /*not_null=*/false, &coerced);
       if (!cs2.ok())
       {
-        return true;  // 类型不兼容 → 该约束作废（可能只剩 Filter 能过滤）
+        return true; // 类型不兼容 → 该约束作废（可能只剩 Filter 能过滤）
       }
       eqs[ci] = coerced;
       return true;
@@ -3067,12 +3073,12 @@ namespace cella::db
       const auto it = eqs.find(col);
       if (it == eqs.end())
       {
-        return false;  // 缺一列 → 不是全键等值（最左前缀规则，暂不服务）
+        return false; // 缺一列 → 不是全键等值（最左前缀规则，暂不服务）
       }
       tuple.push_back(it->second);
     }
     choice->eq_tuple = std::move(tuple);
-    choice->equality = true;  // 代价模型按「等值定位」计费
+    choice->equality = true; // 代价模型按「等值定位」计费
     return true;
   }
 
@@ -3112,22 +3118,22 @@ namespace cella::db
     {
       const storage::Status ss =
           tree->ScanRange(nullptr, nullptr, true,
-                         [&](const std::string &leaf) -> bool
-                         {
-                           if (!have_lo)
-                           {
-                             have_lo = storage::DecodeLeafKeyColumn(leaf, vt, &lo_v);
-                           }
-                           have_hi = storage::DecodeLeafKeyColumn(leaf, vt, &hi_v);
-                           return true;  // 需要拿到最后一个，故不能提前终止
-                         });
+                          [&](const std::string &leaf) -> bool
+                          {
+                            if (!have_lo)
+                            {
+                              have_lo = storage::DecodeLeafKeyColumn(leaf, vt, &lo_v);
+                            }
+                            have_hi = storage::DecodeLeafKeyColumn(leaf, vt, &hi_v);
+                            return true; // 需要拿到最后一个，故不能提前终止
+                          });
       if (!ss.ok() || !have_lo || !have_hi)
       {
         return 0.0;
       }
       if (lo_v.IsNull() || hi_v.IsNull())
       {
-        return 0.0;  // NULL 参与值域会让占比失真 → 退回经验值
+        return 0.0; // NULL 参与值域会让占比失真 → 退回经验值
       }
     }
     auto as_double = [](const storage::Value &v, double *out) -> bool
@@ -3158,7 +3164,7 @@ namespace cella::db
     }
     if (hi <= lo)
     {
-      return 0.0;  // 值域退化（全表同值）→ 经验值
+      return 0.0; // 值域退化（全表同值）→ 经验值
     }
     // 谓词区间的两端：缺省时用值域端点补全
     double plo = lo;
@@ -3218,7 +3224,7 @@ namespace cella::db
       row_count = CountTableRows(table);
       if (row_count == 0)
       {
-        indexes.clear();  // 空表：索引也省了，直接全表扫描（反正没有行）
+        indexes.clear(); // 空表：索引也省了，直接全表扫描（反正没有行）
       }
     }
 
@@ -3246,7 +3252,7 @@ namespace cella::db
       }
       if (!pushed)
       {
-        continue;  // 该索引下推不了这个谓词
+        continue; // 该索引下推不了这个谓词
       }
       // 覆盖扫描（index-only）：只读索引就能满足查询，不必回表。
       // 本项目索引键**只存被索引列的值**，所以 index-only 的前提是：
@@ -3396,7 +3402,7 @@ namespace cella::db
     constexpr double kRowsPerPage = 40.0;
     // 树高未知时的兜底值（正常情况都由 BPlusTree::Height 给出实测值）
     constexpr double kIndexHeightFallback = 1.0;
-  }  // namespace
+  } // namespace
 
   void Executor::EstimateAccessPath(const CatalogTable &table, size_t row_count,
                                     const IndexStats &ix, const AccessPathChoice &choice,
@@ -3615,8 +3621,6 @@ namespace cella::db
       ExplainNode(*c, child_pred, depth + 1, out);
     }
   }
-
-
 
   // ── DELETE ──────────────────────────────────────────────────
 
@@ -3880,7 +3884,7 @@ namespace cella::db
         u.table = name;
         u.rid = storage::Rid{}; // 新版本尚未插入，失败时只需重插旧内容
         u.before = h.second;
-        u.after = fresh;        // P2：撤销时要写一条反向 kUpdate
+        u.after = fresh; // P2：撤销时要写一条反向 kUpdate
         update_undo = &ctx.txn->AddUndo(std::move(u));
       }
 
@@ -4153,7 +4157,7 @@ namespace cella::db
           const storage::Status gs = heap->GetRecord(rid, &record);
           if (!gs.ok())
           {
-            continue;  // 悬空索引项（理论上不该有）：跳过而不是让查询失败
+            continue; // 悬空索引项（理论上不该有）：跳过而不是让查询失败
           }
           out->rows.push_back(ValuesWithRowid(record.values(), rid, ctx.with_rowid));
         }
@@ -4316,7 +4320,7 @@ namespace cella::db
     }
     if (node.op == "Join")
     {
-      return;  // 不下推（见上）
+      return; // 不下推（见上）
     }
     for (const auto &c : node.children)
     {
@@ -4361,7 +4365,7 @@ namespace cella::db
       CollectExprColumns(e->right.get(), out);
       CollectExprColumns(e->child.get(), out);
     }
-  }  // namespace
+  } // namespace
 
   void Executor::RegisterNeededColumns(const cella::CELLA_PlanNode &plan)
   {
@@ -5358,6 +5362,182 @@ namespace cella::db
   // 恢复期重放（P2.4 redo）
   // ═════════════════════════════════════════════════════════════
 
+  namespace
+  {
+    // 行定位键的编码原语。等价关系与 wal::ValueEqual 严格对齐：
+    //   * NULL == NULL                        → 只写类型标签；
+    //   * 浮点 ±0.0 相等                      → 归一到 +0，避免「本该命中却键不同」；
+    //   * 每个值带类型标签、字符串带长度前缀  → 拼接不产生歧义（INT 1 vs VARCHAR "1"、
+    //     不同列数都不会撞键）。
+    void AppendKeyBytes(std::string *out, const void *data, size_t n)
+    {
+      out->append(static_cast<const char *>(data), n);
+    }
+
+    void AppendKeyU32(std::string *out, uint32_t v)
+    {
+      char b[4];
+      for (int i = 0; i < 4; ++i)
+      {
+        b[i] = static_cast<char>((v >> (8 * i)) & 0xFF);
+      }
+      out->append(b, sizeof(b));
+    }
+
+    void AppendKeyValue(std::string *out, const storage::Value &v)
+    {
+      out->push_back(static_cast<char>(v.type));
+      switch (v.type)
+      {
+      case storage::ValueType::kNull:
+        break;
+      case storage::ValueType::kBool:
+        out->push_back(v.bool_val ? 1 : 0);
+        break;
+      case storage::ValueType::kInt32:
+        AppendKeyBytes(out, &v.int32_val, sizeof(v.int32_val));
+        break;
+      case storage::ValueType::kInt64:
+      case storage::ValueType::kDate:
+        AppendKeyBytes(out, &v.int64_val, sizeof(v.int64_val));
+        break;
+      case storage::ValueType::kFloat:
+      {
+        const float f = (v.float_val == 0.0f) ? 0.0f : v.float_val; // ±0 归一
+        AppendKeyBytes(out, &f, sizeof(f));
+        break;
+      }
+      case storage::ValueType::kDouble:
+      {
+        const double d = (v.double_val == 0.0) ? 0.0 : v.double_val; // ±0 归一
+        AppendKeyBytes(out, &d, sizeof(d));
+        break;
+      }
+      case storage::ValueType::kVarchar:
+      case storage::ValueType::kChar:
+        AppendKeyU32(out, static_cast<uint32_t>(v.str_val.size()));
+        out->append(v.str_val);
+        break;
+      }
+    }
+  } // namespace
+
+  // 进入/退出崩溃恢复。进入时清掉上一次的索引（同一进程内可能连跑多次恢复 ——
+  // 测试尤其如此），退出时释放：几 MB 的哈希表不该留给运行期。
+  void Executor::BeginRecoveryMode()
+  {
+    recovery_mode_ = true;
+    recovery_row_index_.clear();
+  }
+
+  void Executor::EndRecoveryMode()
+  {
+    recovery_mode_ = false;
+    recovery_row_index_.clear();
+  }
+
+  bool Executor::BuildRecoveryKey(bool by_pk, int pk_idx,
+                                  const std::vector<storage::Value> &values, std::string *out)
+  {
+    out->clear();
+    if (by_pk)
+    {
+      if (pk_idx < 0 || static_cast<size_t>(pk_idx) >= values.size())
+      {
+        return false; // 列数对不上（异常数据）→ 调用方退回线性扫描
+      }
+      AppendKeyValue(out, values[static_cast<size_t>(pk_idx)]);
+      return true;
+    }
+    AppendKeyU32(out, static_cast<uint32_t>(values.size())); // 行宽参与键，杜绝跨宽度撞键
+    for (const storage::Value &v : values)
+    {
+      AppendKeyValue(out, v);
+    }
+    return true;
+  }
+
+  // 懒构建：该表的行索引不存在时做一次全表扫描建好（O(N)），之后都是 O(1) 命中。
+  // 这是把「每条记录一次全表扫描」的 O(N²) 重放压回 O(N) 的关键一步。
+  const Executor::RecoveryRowIndex *Executor::EnsureRecoveryRowIndex(const CatalogTable &table,
+                                                                     storage::TableHeap *heap)
+  {
+    const auto found = recovery_row_index_.find(table.name);
+    if (found != recovery_row_index_.end())
+    {
+      return &found->second;
+    }
+    RecoveryRowIndex index;
+    index.pk_idx = table.PrimaryKeyColumnIndex();
+    index.by_pk = index.pk_idx >= 0;
+    for (auto it = heap->begin(); it != heap->end(); ++it)
+    {
+      std::string key;
+      if (BuildRecoveryKey(index.by_pk, index.pk_idx, it->values(), &key))
+      {
+        index.rows[key].push_back(it.rid());
+      }
+    }
+    return &recovery_row_index_.emplace(table.name, std::move(index)).first->second;
+  }
+
+  // 重放期间的插/删/改同步维护行索引：没维护就会「表里有、索引里没有」，
+  // 后续重放会误判成未生效而重复插入。
+  void Executor::RecoveryRowIndexAdd(const std::string &table_name,
+                                     const std::vector<storage::Value> &values,
+                                     const storage::Rid &rid)
+  {
+    if (!recovery_mode_)
+    {
+      return;
+    }
+    const auto found = recovery_row_index_.find(table_name);
+    if (found == recovery_row_index_.end())
+    {
+      return; // 没建过索引（该表没跑过定位）→ 它也不会被定位，不会分叉
+    }
+    std::string key;
+    if (BuildRecoveryKey(found->second.by_pk, found->second.pk_idx, values, &key))
+    {
+      found->second.rows[key].push_back(rid);
+    }
+  }
+
+  void Executor::RecoveryRowIndexRemove(const std::string &table_name,
+                                        const std::vector<storage::Value> &values,
+                                        const storage::Rid &rid)
+  {
+    if (!recovery_mode_)
+    {
+      return;
+    }
+    const auto found = recovery_row_index_.find(table_name);
+    if (found == recovery_row_index_.end())
+    {
+      return;
+    }
+    std::string key;
+    if (!BuildRecoveryKey(found->second.by_pk, found->second.pk_idx, values, &key))
+    {
+      return;
+    }
+    const auto bucket = found->second.rows.find(key);
+    if (bucket == found->second.rows.end())
+    {
+      return;
+    }
+    std::vector<storage::Rid> &rids = bucket->second;
+    const auto hit = std::find(rids.begin(), rids.end(), rid);
+    if (hit != rids.end())
+    {
+      rids.erase(hit);
+    }
+    if (rids.empty())
+    {
+      found->second.rows.erase(bucket); // 空桶立刻摘掉，避免「键在、行没了」的假命中
+    }
+  }
+
   bool Executor::LocateRowForRecovery(const CatalogTable &table,
                                       const std::vector<storage::Value> &values,
                                       storage::Rid *rid, storage::Record *row)
@@ -5370,6 +5550,37 @@ namespace cella::db
     }
     const int pk_idx = table.PrimaryKeyColumnIndex();
     const bool by_pk = pk_idx >= 0 && static_cast<size_t>(pk_idx) < values.size();
+
+    // 恢复期：走行哈希索引 —— O(1)，这是修复「重放退化成全表扫描」的关键。
+    if (recovery_mode_)
+    {
+      const RecoveryRowIndex *index = EnsureRecoveryRowIndex(table, heap.get());
+      std::string key;
+      if (index != nullptr && by_pk == index->by_pk &&
+          BuildRecoveryKey(by_pk, pk_idx, values, &key))
+      {
+        const auto hit = index->rows.find(key);
+        if (hit == index->rows.end() || hit->second.empty())
+        {
+          return false;
+        }
+        const storage::Rid found = hit->second.front();
+        if (rid != nullptr)
+        {
+          *rid = found;
+        }
+        if (row != nullptr)
+        {
+          // 调用方要拿原行比对整行内容 / 维护索引。理论上不会取不到；
+          // 真取不到就当作未命中，让下面的线性扫描兜底。
+          return heap->GetRecord(found, row).ok();
+        }
+        return true;
+      }
+      // 键构造失败或取值形态与索引不一致 → 落到下面的线性扫描，行为同修复前
+    }
+
+    // 运行期（以及恢复期的兜底路径）：保持原来的线性扫描
     for (auto it = heap->begin(); it != heap->end(); ++it)
     {
       const std::vector<storage::Value> &vals = it->values();
@@ -5436,7 +5647,13 @@ namespace cella::db
     {
       return FromStorage(s, "恢复重做插入 " + meta->name);
     }
-    return IndexRowInsert(&indexes, *meta, rec.values(), new_rid);
+    const DbStatus is = IndexRowInsert(&indexes, *meta, rec.values(), new_rid);
+    if (!is.ok())
+    {
+      return is;
+    }
+    RecoveryRowIndexAdd(meta->name, rec.values(), new_rid); // 恢复期行索引同步
+    return DbStatus::Ok();
   }
 
   DbStatus Executor::RecoveryDeleteRow(const std::string &table,
@@ -5469,6 +5686,7 @@ namespace cella::db
     {
       return FromStorage(s, "恢复重做删除 " + meta->name);
     }
+    RecoveryRowIndexRemove(meta->name, row.values(), rid); // 恢复期行索引同步
     return IndexRowDelete(&indexes, *meta, row.values(), rid);
   }
 
@@ -5512,6 +5730,7 @@ namespace cella::db
     {
       return FromStorage(ds, "恢复重做更新(删旧) " + meta->name);
     }
+    RecoveryRowIndexRemove(meta->name, before, old_rid); // 恢复期行索引同步
     storage::Record rec;
     for (const auto &v : after)
     {
@@ -5523,6 +5742,7 @@ namespace cella::db
     {
       return FromStorage(is, "恢复重做更新(插新) " + meta->name);
     }
+    RecoveryRowIndexAdd(meta->name, rec.values(), new_rid); // 恢复期行索引同步
     return IndexRowUpdate(&indexes, *meta, before, rec.values(), old_rid, new_rid);
   }
 
@@ -5629,7 +5849,7 @@ namespace cella::db
         cc.primaryKey = c.primary_key;
         t.columns.push_back(std::move(cc));
       }
-      (void)cat->addTable(std::move(t));  // 重名由语义层拦（SEM-356），这里静默跳过
+      (void)cat->addTable(std::move(t)); // 重名由语义层拦（SEM-356），这里静默跳过
     }
   }
 
@@ -5655,7 +5875,7 @@ namespace cella::db
     const auto cached = view_parse_cache_.find(key);
     if (cached != view_parse_cache_.end())
     {
-      return cached->second;  // nullptr 也缓存：避免同一条语句里反复解析坏定义
+      return cached->second; // nullptr 也缓存：避免同一条语句里反复解析坏定义
     }
     std::vector<cella::CELLA_Error> errors;
     const auto tokens = cella::cella_tokenize(v->query, errors);
@@ -6115,7 +6335,7 @@ namespace cella::db
           const storage::Value &v = in.rows[grp[k]][static_cast<size_t>(agg_col)];
           if (v.IsNull())
           {
-            continue;  // 聚合一律忽略 NULL（COUNT(*) 已在上面单独计数）
+            continue; // 聚合一律忽略 NULL（COUNT(*) 已在上面单独计数）
           }
           ++cnt;
           const bool integral = (v.type == ValueType::kInt32 || v.type == ValueType::kInt64);
@@ -6125,10 +6345,10 @@ namespace cella::db
           }
           const double d = (v.type == ValueType::kInt32)
                                ? static_cast<double>(v.int32_val)
-                               : (v.type == ValueType::kInt64)
-                                     ? static_cast<double>(v.int64_val)
-                                     : (v.type == ValueType::kFloat) ? static_cast<double>(v.float_val)
-                                                                     : v.double_val;
+                           : (v.type == ValueType::kInt64)
+                               ? static_cast<double>(v.int64_val)
+                           : (v.type == ValueType::kFloat) ? static_cast<double>(v.float_val)
+                                                           : v.double_val;
           fsum += d;
           isum += (v.type == ValueType::kInt32)
                       ? static_cast<int64_t>(v.int32_val)

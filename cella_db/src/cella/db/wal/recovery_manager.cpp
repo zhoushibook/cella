@@ -10,6 +10,30 @@
 namespace cella::db::wal
 {
 
+  namespace
+  {
+    // 恢复期间打开执行器的「行哈希索引」：重放定位从 O(表行数) 降到 O(1)。
+    // 修复前是逐条全表扫描 —— 「5.7 万条 INSERT × 5.7 万行表」实测永远跑不完，
+    // 表现为开库挂死（cella_web 端口从未监听）。
+    // 用 RAII 保证**所有**返回路径（空日志 / 分析失败 / 重做·撤销失败 / 正常结束）
+    // 都退出恢复模式并释放索引：它的生命周期与一次恢复严格一致。
+    struct RecoveryRowIndexScope
+    {
+      explicit RecoveryRowIndexScope(Executor *exec) : exec_(exec)
+      {
+        exec_->BeginRecoveryMode();
+      }
+      ~RecoveryRowIndexScope()
+      {
+        exec_->EndRecoveryMode();
+      }
+      RecoveryRowIndexScope(const RecoveryRowIndexScope &) = delete;
+      RecoveryRowIndexScope &operator=(const RecoveryRowIndexScope &) = delete;
+
+      Executor *exec_;
+    };
+  } // namespace
+
   std::string RecoveryStats::ToText() const
   {
     std::ostringstream os;
@@ -47,6 +71,8 @@ namespace cella::db::wal
 
   DbStatus RecoveryManager::Recover(RecoveryStats *out)
   {
+    // 整个恢复期间启用执行器侧的行哈希索引（重放定位 O(1)，见文件头注释）。
+    RecoveryRowIndexScope row_index_scope(exec_);
     const auto t0 = std::chrono::steady_clock::now();
     stats_ = RecoveryStats{};
     records_.clear();
