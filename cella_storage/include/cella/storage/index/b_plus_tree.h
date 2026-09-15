@@ -23,9 +23,9 @@ class BufferPoolManager;
 //   * 插入自底向上分裂；根分裂时树长高一层。
 //
 // 键是**变长**的字节串（见 index_key.h）。比较统一走 CompareIndexKey：
-//   - 叶子键 = 列值元组编码 + 行定位（5B）
+//   - 叶子键 = 列值元组编码 + 行定位（6B：页号 u32 + 槽号 u16）
 //   - 内部键 = 列值元组编码（无行定位）→ 与叶子键比较时用「前缀比较」。
-//     行定位恒在键尾 5 字节 → 去尾后仍是完整元组编码，前缀比较对复合键
+//     行定位恒在键尾 6 字节 → 去尾后仍是完整元组编码，前缀比较对复合键
 //     继续成立（StripLeafRowId 不需要知道列数）。
 //
 // 支持单列与多列复合键（KeySpec::columns）：单列是列数为 1 的特例，
@@ -63,7 +63,7 @@ class BPlusTree {
   BPlusTree(BufferPoolManager* bpm, KeySpec spec);
 
   // ── 键长上限（建索引时校验用）─────────────────────────────
-  // 最坏叶子键字节数 = NULL 位图（复合键）+ Σ(各列最大编码) + 行定位 5B。
+  // 最坏叶子键字节数 = NULL 位图（复合键）+ Σ(各列最大编码) + 行定位 6B。
   // VARCHAR 转义后最长 2n+2 —— 多个长 VARCHAR 组合可能撑爆一页，
   // 必须在建索引时拒绝，而不是等插入时才发现放不下。
   static size_t MaxLeafKeyBytes(const KeySpec& spec);

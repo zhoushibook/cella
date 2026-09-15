@@ -194,7 +194,7 @@ class IndexNode {
 
 // ── 每页最大键数估算 ─────────────────────────────────────────
 // 内部节点：每键最坏占 (4 槽 + 4 指针) = 8B 骨架 + 键本体；
-// 叶子节点：每键 4B 骨架 + 键本体 + 行定位 5B。
+// 叶子节点：每键 4B 骨架 + 键本体 + 行定位 6B。
 // 用「最大键长」保守估算，保证任何实际键都放得下。
 inline uint16_t MaxKeysPerIndexPage(uint32_t page_size, size_t max_key_bytes, bool internal) {
   const size_t avail = static_cast<size_t>(page_size) - kIndexDataBegin -

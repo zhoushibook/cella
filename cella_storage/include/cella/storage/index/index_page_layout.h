@@ -61,7 +61,7 @@ constexpr size_t kIndexNodeHeaderSize = 12;
 constexpr size_t kIndexDataBegin = kPageHeaderSize + kIndexNodeHeaderSize;
 
 // ── 行定位（叶子里的行指针）─────────────────────────────────
-// 5 字节打包：page_id:u32 + slot_id:u8（槽号上限 255，够 4KB 页用）
+// 6 字节打包：page_id:u32 + slot_id:u16（u16 与 slot_id_t 同宽，无 255 上限）
 struct IndexRowId {
   page_id_t page_id = kInvalidPageId;
   uint8_t   slot_id = 0;
