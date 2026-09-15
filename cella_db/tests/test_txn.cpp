@@ -405,12 +405,12 @@ MT_TEST(事务_UPDATE插入失败恢复旧行)
 MT_TEST(事务_DDL立即持久化)
 {
   Engine e("txn_ddl_durable");
-  // DDL 在自动提交后立刻存盘；随后的 DML 默认不存盘（checkpoint_on_commit=false）
+  // DDL 在自动提交后立刻存盘；随后的 DML 不刷数据页，但已提交记录会进入 WAL。
   MT_CHECK(e.Run("CREATE TABLE t(id INT NOT NULL, v VARCHAR(16));"
                  "INSERT INTO t VALUES (1,'a');")
                .all_ok());
 
-  // 不关闭引擎，直接把数据目录复制一份（等同于进程被强杀后拿磁盘上的文件来恢复）
+  // 不关闭引擎，直接把数据目录复制一份；副本重开时会走 WAL 恢复。
   const std::string copy_dir = testutil::FreshDir("txn_ddl_durable_copy");
   std::error_code ec;
   std::filesystem::copy(e.cfg.data_dir, copy_dir,
@@ -424,8 +424,8 @@ MT_TEST(事务_DDL立即持久化)
   ScriptReport r;
   (void)e2->default_session().Execute("get * in t;", &r);
   MT_CHECK(r.all_ok());
-  // 数据不在（DML 默认不存盘，属于设计内的持久性边界）
-  MT_EQ(testutil::RowsText(r.statements[0].result), std::string(""));
+  // 已提交 DML 虽未刷数据页，但 WAL redo 后必须可见。
+  MT_EQ(testutil::RowsText(r.statements[0].result), std::string("1|a"));
   e2->Close();
 }
 

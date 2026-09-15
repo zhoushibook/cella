@@ -219,7 +219,11 @@ namespace cella::db
       r.type = wal::RecordType::kCommit;
       r.txn_id = id;
       (void)wal_->Append(r);
-      wal_->Flush();
+      const DbStatus ws = wal_->FlushDurable();
+      if (!ws.ok())
+      {
+        return ws;
+      }
     }
 
     std::ostringstream os;
@@ -352,7 +356,7 @@ namespace cella::db
       r.type = wal::RecordType::kAbort;
       r.txn_id = id;
       (void)wal_->Append(r);
-      wal_->Flush();
+      (void)wal_->FlushDurable();
     }
     DbLogWarn(logcat::kTxn, os.str());
     return rb;
@@ -431,7 +435,7 @@ namespace cella::db
       end.type = wal::RecordType::kAbort;
       end.txn_id = id;
       (void)wal_->Append(end);
-      wal_->Flush();
+      (void)wal_->FlushDurable();
     }
     DbLogWarn(logcat::kTxn, "恢复期回滚 txn=" + std::to_string(id) + " 撤销=" +
                                 std::to_string(records.size()) + " 失败=" +

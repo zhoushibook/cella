@@ -136,12 +136,12 @@ Write-Output "--- integration tests: exit $($p.ExitCode) $sum ---"
 
 # ------------------------------------------------- 4.4 access control smoke test
 # 认证启用后：建表 / 建用户 / 列用户 / 授权 / 查看授权 / 提管理员 / 改口令应全部成功（退出码 0 即全绿）。
-# 登录用 stdin 喂「用户名 + 口令」——root 初始口令为空，避免空命令行参数被吞。
+# 通过显式参数登录；root 初始口令为空，避免 PowerShell 管道对空行的处理差异。
 $authDir  = Join-Path $BuildDir "auth_smoke"
 if (Test-Path $authDir) { Remove-Item -Recurse -Force $authDir }
 $authOut  = Join-Path $BuildDir "auth_smoke_out.txt"
-$authFeed = "root`n`nCREATE TABLE st(id INT);`nCREATE USER smoke IDENTIFIED BY 'p1';`nSHOW USERS;`nGRANT get, insert ON main.st TO smoke;`nSHOW GRANTS FOR smoke;`nGRANT admin TO smoke;`nSET PASSWORD = 'r2';`n\q`n"
-$authText = [string]($authFeed | & (Join-Path $dbDir "cella_db.exe") --data $authDir --auth --log off 2>&1 | Out-String)
+$authFeed = "CREATE TABLE st(id INT);`nCREATE USER smoke IDENTIFIED BY 'p1';`nSHOW USERS;`nGRANT get, insert ON main.st TO smoke;`nSHOW GRANTS FOR smoke;`nGRANT admin TO smoke;`nSET PASSWORD = 'r2';`n\q`n"
+$authText = [string]($authFeed | & (Join-Path $dbDir "cella_db.exe") --data $authDir --auth --user root --password= --log off 2>&1 | Out-String)
 $authCode = $LASTEXITCODE
 [IO.File]::WriteAllText($authOut, $authText, [Text.Encoding]::UTF8)
 $authOk  = Match1 $authText "成功 (\d+) 条"

@@ -714,7 +714,11 @@ namespace cella::db
     // ── ① WAL 规则：脏页落盘之前，日志必须先刷到当前 LSN ──
     if (wal_ != nullptr)
     {
-      wal_->Flush();
+      const DbStatus ws = wal_->FlushDurable();
+      if (!ws.ok())
+      {
+        return ws;
+      }
     }
 
     storage_->Close(); // 内部 FlushAllPages：目录页与脏数据页真正写盘
