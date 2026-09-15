@@ -14,6 +14,7 @@
 //   -h, --help        显示本帮助
 //
 // 安全：只监听 127.0.0.1；同一数据目录只允许一个服务进程（lock 文件，PLAN §6.5）。
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -22,6 +23,9 @@
 #include <fstream>
 #include <iostream>
 #include <thread>
+
+// windows.h 由 socket.h 引入（本模块唯一引入点，负责 undef DELETE/IN/OUT 宏）；
+// 本文件用到 OpenProcess / QueryFullProcessImageName / GetModuleFileName。
 
 #include "cella/client/net/http_server.h"
 #include "cella/client/server/api_service.h"
@@ -51,7 +55,10 @@ const char* const kUsage =
 
 // 单实例锁：同一 data_dir 只允许一个服务进程（IStorage 无文件锁，PLAN §6.5）。
 // 锁文件记录 pid=N；启动时校验持有者进程是否仍存活 —— 强制结束的进程不会执行析构、
-// 会留下陈旧锁，这里自动识别并清理后照常接管（pid 复用导致的误判方向是保守的：拒绝启动）。
+// 会留下陈旧锁，这里自动识别并清理后照常接管。
+// 存活判定除了「PID 存在」还要核对**进程映像名**：Windows 会复用 PID，若旧 pid
+// 被一个无关进程拿到，只查存活会把陈旧锁误判成「真有进程在跑」而拒绝启动
+//（2026-09-15 实际发生过）。名字查不到时保守当作存活（方向与旧逻辑一致）。
 class InstanceLock {
  public:
   explicit InstanceLock(const std::string& data_dir) : path_(data_dir + "/cella-client.lock") {
@@ -95,18 +102,54 @@ class InstanceLock {
         return false;
       }
 #if defined(_WIN32)
-      HANDLE h = ::OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
+      // 需要 QUERY_LIMITED_INFORMATION 才能读映像名；SYNCHRONIZE 用于探测终止状态
+      HANDLE h = ::OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                               static_cast<DWORD>(pid));
       if (h == nullptr) {
-        return false;  // 进程已不存在
+        return false;  // ① 进程对象已不存在
       }
+      // ② 信号态探测：即使内核对象还在（有句柄未释放的「僵尸」进程，
+      //    tasklist 看不到、名字查不到），WaitForSingleObject(h, 0) 返回
+      //    WAIT_OBJECT_0 即已终止 —— 这是比 OpenProcess 可靠的判活（实测踩坑）。
+      if (::WaitForSingleObject(h, 0) == WAIT_OBJECT_0) {
+        ::CloseHandle(h);
+        return false;  // ③ 进程已终止
+      }
+      // ④ PID 复用防误判：存活但映像名与当前可执行文件不同 → 是无关进程，视为死锁
+      const bool alive = ProcessImageMatches(h);
       ::CloseHandle(h);
-      return true;
+      return alive;
 #else
       return kill(static_cast<pid_t>(pid), 0) == 0 || errno != ESRCH;
 #endif
     }
     return false;
   }
+
+#if defined(_WIN32)
+  // 持有者进程的映像基名是否与当前进程相同（大小写不敏感）。
+  // 查询失败（权限/过早退出）→ 返回 true，保守维持「存活」判定。
+  static bool ProcessImageMatches(HANDLE h) {
+    char holder_path[MAX_PATH] = {0};
+    DWORD size = MAX_PATH;
+    if (::QueryFullProcessImageNameA(h, 0, holder_path, &size) == FALSE) {
+      return true;
+    }
+    char self_path[MAX_PATH] = {0};
+    if (::GetModuleFileNameA(nullptr, self_path, MAX_PATH) == 0) {
+      return true;
+    }
+    const std::filesystem::path holder(holder_path);
+    const std::filesystem::path self(self_path);
+    std::string a = holder.filename().string();
+    std::string b = self.filename().string();
+    std::transform(a.begin(), a.end(), a.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(b.begin(), b.end(), b.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return a == b;
+  }
+#endif
 
   std::string path_;
   bool held_ = false;
