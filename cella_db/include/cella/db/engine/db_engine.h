@@ -203,6 +203,7 @@ class DbEngine {
   // 诊断文本
   std::string StatsText();
   std::string LockText() const;
+  std::string LockStatsText() const;  // 并发/锁指标（授予/等待/超时/死锁/平均等待）
   std::string WaitForGraphText() const;
   std::string TxnText() const;
 

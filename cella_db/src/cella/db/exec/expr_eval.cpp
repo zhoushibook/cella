@@ -35,6 +35,34 @@ bool IsIntegralValue(const Value& v) {
   return v.type == ValueType::kInt32 || v.type == ValueType::kInt64;
 }
 
+// ── SQL LIKE 通配匹配 ──────────────────────────────────────────
+//   '%' 匹配任意长度（含空）子串；'_' 匹配任意单个字符；其余字符按字面比较。
+// 本系统不提供 ESCAPE 子句，因此 '%'/'_' 无法转义为字面量（已记入已知边界）。
+// 算法：单星号回溯（迭代版），最坏 O(|s|·|p|)，无递归深度风险。
+bool LikeMatch(const std::string& s, const std::string& p) {
+  size_t si = 0, pi = 0;
+  size_t star = std::string::npos;  // 最近一个 '%' 在模式中的位置
+  size_t star_s = 0;                // 该 '%' 当前已吞掉的字符串位置
+  while (si < s.size()) {
+    if (pi < p.size() && (p[pi] == '_' || p[pi] == s[si])) {
+      ++si;
+      ++pi;
+    } else if (pi < p.size() && p[pi] == '%') {
+      star = pi++;
+      star_s = si;
+    } else if (star != std::string::npos) {
+      pi = star + 1;  // 回退到上一个 '%' 之后，让它多吞一个字符
+      si = ++star_s;
+    } else {
+      return false;
+    }
+  }
+  while (pi < p.size() && p[pi] == '%') {
+    ++pi;  // 尾部剩余的 '%' 匹配空串
+  }
+  return pi == p.size();
+}
+
 // 表达式里的数值字面量在语义阶段已确认可比较（SEM-309/310），
 // 这里只做运行期兜底：两侧族不同即报错，避免静默给出错误结果。
 DbStatus CheckComparable(const Value& a, const Value& b) {
@@ -294,6 +322,24 @@ DbStatus ExprEval::Eval(const cella::CELLA_Expr& expr, const EvalRow& row, stora
     }
     default:
       break;
+  }
+
+  // 通配匹配在比较运算之前分流：它不参与「可比性」检查，规则是纯文本的。
+  if (expr.bop == cella::CELLA_Expr::BinOp::LIKE ||
+      expr.bop == cella::CELLA_Expr::BinOp::NOT_LIKE) {
+    if (a.IsNull() || b.IsNull()) {
+      *out = Value::Null();  // UNKNOWN：NULL 不匹配任何模式
+      return DbStatus::Ok();
+    }
+    if (!IsTextual(a.type) || !IsTextual(b.type)) {
+      return DbStatus::Error(DbCode::kTypeMismatch,
+                             std::string("运算符 ") +
+                                 (expr.bop == cella::CELLA_Expr::BinOp::LIKE ? "LIKE" : "NOT LIKE") +
+                                 " 需要文本操作数");
+    }
+    const bool matched = LikeMatch(a.str_val, b.str_val);
+    *out = Value::Bool(expr.bop == cella::CELLA_Expr::BinOp::LIKE ? matched : !matched);
+    return DbStatus::Ok();
   }
 
   // 比较运算

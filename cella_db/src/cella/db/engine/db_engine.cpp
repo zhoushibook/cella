@@ -1252,6 +1252,11 @@ namespace cella::db
 
   std::string DbEngine::LockText() const { return locks_ ? locks_->Dump() : "(引擎未打开)"; }
 
+  std::string DbEngine::LockStatsText() const
+  {
+    return locks_ ? locks_->StatsText() : "(引擎未打开)";
+  }
+
   std::string DbEngine::WaitForGraphText() const
   {
     return locks_ ? locks_->DumpWaitForGraph() : "(引擎未打开)";

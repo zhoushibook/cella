@@ -42,6 +42,10 @@ namespace cella
                 return "AND";
             case CELLA_Expr::BinOp::OR:
                 return "OR";
+            case CELLA_Expr::BinOp::LIKE:
+                return "LIKE";
+            case CELLA_Expr::BinOp::NOT_LIKE:
+                return "NOT LIKE";
             }
             return "?";
         }
@@ -69,6 +73,8 @@ namespace cella
                 case CELLA_Expr::BinOp::LE:
                 case CELLA_Expr::BinOp::GT:
                 case CELLA_Expr::BinOp::GE:
+                case CELLA_Expr::BinOp::LIKE:
+                case CELLA_Expr::BinOp::NOT_LIKE:
                     return 3;
                 case CELLA_Expr::BinOp::PLUS:
                 case CELLA_Expr::BinOp::MINUS:

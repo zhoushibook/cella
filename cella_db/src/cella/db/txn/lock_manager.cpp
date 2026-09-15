@@ -1,6 +1,7 @@
 #include "cella/db/txn/lock_manager.h"
 
 #include <sstream>
+#include <utility>
 
 #include "cella/db/common/db_logger.h"
 
@@ -11,6 +12,46 @@ const char* ToString(LockMode m) { return m == LockMode::kShared ? "S" : "X"; }
 LockManager::LockManager(std::chrono::milliseconds timeout) : timeout_(timeout) {}
 
 LockManager::~LockManager() = default;
+
+// ── 公平调度辅助 ───────────────────────────────────────────────
+
+bool LockManager::ContainsWaiter(const Entry& e, txn_id_t txn) {
+  for (txn_id_t w : e.waiters) {
+    if (w == txn) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void LockManager::EraseWaiter(Entry* e, txn_id_t txn) {
+  for (auto it = e->waiters.begin(); it != e->waiters.end(); ++it) {
+    if (*it == txn) {
+      e->waiters.erase(it);
+      return;
+    }
+  }
+}
+
+// 已经持有满足本次请求的锁 → 属于重入（重复申请 / 同一事务再次访问同一张表）。
+// 必须短路放行：否则「队首不是它」的公平规则会把重入判成冲突，把事务自己卡死。
+bool LockManager::AlreadyHoldsLocked(const Entry& e, txn_id_t txn, LockMode mode) {
+  if (e.exclusive == txn) {
+    return true;  // 已持 X：任何请求都已被满足
+  }
+  return mode == LockMode::kShared && e.shared.count(txn) != 0;
+}
+
+// 公平性：队列非空且队首不是它 → 必须排队，哪怕相容性上可以立即满足。
+// 这条规则消除了写饥饿：读者不断到来时，早就在等的写者仍然排在前面。
+bool LockManager::MustQueueLocked(const Entry& e, txn_id_t txn) {
+  if (e.waiters.empty()) {
+    return false;
+  }
+  return e.waiters.front() != txn;
+}
+
+// ── 锁表原语 ───────────────────────────────────────────────────
 
 LockManager::Entry* LockManager::GetOrCreateLocked(const std::string& resource) {
   auto it = entries_.find(resource);
@@ -43,7 +84,7 @@ void LockManager::GrantLocked(Entry* e, txn_id_t txn, LockMode mode) {
   } else if (e->exclusive != txn) {
     e->shared.insert(txn);
   }
-  e->waiters.erase(txn);
+  EraseWaiter(e, txn);
 }
 
 void LockManager::ForfeitLocked(Entry* e, txn_id_t txn) {
@@ -51,7 +92,7 @@ void LockManager::ForfeitLocked(Entry* e, txn_id_t txn) {
   if (e->exclusive == txn) {
     e->exclusive = kInvalidTxnId;
   }
-  e->waiters.erase(txn);
+  EraseWaiter(e, txn);
 }
 
 std::set<txn_id_t> LockManager::BlockersLocked(txn_id_t txn) const {
@@ -74,6 +115,15 @@ std::set<txn_id_t> LockManager::BlockersLocked(txn_id_t txn) const {
         out.insert(s);
       }
     }
+  }
+  // 公平调度带来的第二类阻塞：我排在 FIFO 队列里，前面的等待者不拿到锁我就动不了。
+  // 不把这条边算进来，「持 S 者想升级 X，同时另一个 X 已排在它前面」这种互等
+  // 就会漏判 —— 表现为双方都干等到 5s 超时，而不是立刻选出牺牲者。
+  for (txn_id_t w : e.waiters) {
+    if (w == txn) {
+      break;  // 只算排在我前面的
+    }
+    out.insert(w);
   }
   return out;
 }
@@ -106,28 +156,51 @@ DbStatus LockManager::Acquire(txn_id_t txn, const std::string& resource, LockMod
   std::unique_lock<std::mutex> lk(mutex_);
   Entry* e = GetOrCreateLocked(resource);
 
+  bool waited_before = false;  // 本次请求是否已经排过队（用于区分「直接授予」与「等待后授予」）
+  auto grant = [&]() {
+    GrantLocked(e, txn, mode);
+    held_[txn].insert(resource);
+    pending_.erase(txn);
+    if (waited_before) {
+      ++stats_.granted_after_wait;
+    } else {
+      ++stats_.granted;
+    }
+    DbLogDebug(logcat::kLock, "授予 " + std::string(ToString(mode)) + " 锁 txn=" +
+                                  std::to_string(txn) + " 资源=" + resource +
+                                  (waited_before ? "（等待后）" : ""));
+    return DbStatus::Ok();
+  };
+
   for (;;) {
-    if (CompatibleLocked(*e, txn, mode)) {
-      GrantLocked(e, txn, mode);
-      held_[txn].insert(resource);
-      pending_.erase(txn);
-      DbLogDebug(logcat::kLock, "授予 " + std::string(ToString(mode)) + " 锁 txn=" +
-                                    std::to_string(txn) + " 资源=" + resource);
-      return DbStatus::Ok();
+    // ① 重入 / 重复申请：已经持有满足本次请求的锁 → 直接放行（不走公平队列）
+    if (AlreadyHoldsLocked(*e, txn, mode)) {
+      return grant();
+    }
+    // ② 相容且未被公平规则挡住（无等待者，或它就是队首）→ 立即授予
+    if (!MustQueueLocked(*e, txn) && CompatibleLocked(*e, txn, mode)) {
+      return grant();
     }
 
-    // 记录未满足请求 → 推导等待边 → 环检测
+    // ③ 排队：记录未满足请求（同一次请求重复入队时不重复刷新排队序号）
     Pending p;
     p.resource = resource;
     p.mode = mode;
     pending_[txn] = p;
+    if (!ContainsWaiter(*e, txn)) {
+      e->waiters.push_back(txn);
+      ++stats_.waited;
+      waited_before = true;
+    }
 
+    // 推导等待边 → 环检测（牺牲者 = 当前请求者，与既有语义一致）
     std::set<txn_id_t> on_path;
     std::vector<txn_id_t> path;
     if (FindCycleLocked(txn, txn, &on_path, &path)) {
       pending_.erase(txn);
-      e->waiters.erase(txn);
+      EraseWaiter(e, txn);
       ++deadlock_count_;
+      ++stats_.deadlocks;
       std::ostringstream os;
       os << "检测到死锁，事务 txn=" << txn << " 被选为牺牲者；等待环: ";
       for (size_t i = 0; i < path.size(); ++i) {
@@ -138,24 +211,28 @@ DbStatus LockManager::Acquire(txn_id_t txn, const std::string& resource, LockMod
       return DbStatus::Error(DbCode::kDeadlock, msg);
     }
 
-    e->waiters.insert(txn);
     DbLogDebug(logcat::kLock, "等待 " + std::string(ToString(mode)) + " 锁 txn=" +
                                   std::to_string(txn) + " 资源=" + resource);
+    const auto t0 = std::chrono::steady_clock::now();
     const std::cv_status st = e->cv.wait_for(lk, timeout_);
+    stats_.wait_us_total += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0)
+            .count());
     if (st == std::cv_status::timeout) {
-      if (CompatibleLocked(*e, txn, mode)) {
-        GrantLocked(e, txn, mode);
-        held_[txn].insert(resource);
-        pending_.erase(txn);
-        return DbStatus::Ok();
+      // 超时前再抢一次（期间可能刚好被释放），否则放弃并清掉等待状态
+      if (AlreadyHoldsLocked(*e, txn, mode) ||
+          (!MustQueueLocked(*e, txn) && CompatibleLocked(*e, txn, mode))) {
+        return grant();
       }
       pending_.erase(txn);
-      e->waiters.erase(txn);
+      EraseWaiter(e, txn);
+      ++stats_.timeouts;
       const std::string msg = "等待锁超时: txn=" + std::to_string(txn) + " 资源=" + resource;
       DbLogWarn(logcat::kLock, msg);
       return DbStatus::Error(DbCode::kLockConflict, msg);
     }
-    // 被唤醒：重新评估相容性（可能已被释放，也可能被别的等待者抢先）
+    // 被唤醒：重新评估（可能已被释放，也可能队首换了人或被别人抢先）
   }
 }
 
@@ -172,6 +249,12 @@ void LockManager::ReleaseAll(txn_id_t txn) {
     held_.erase(hit);
   }
   pending_.erase(txn);
+  // 该事务可能正排在某条资源的 FIFO 队里（例如它作为死锁牺牲者被别的线程回滚）。
+  // 队列里留下「永远不会再来的事务」会把队首堵死，后来的等待者全部干等到超时，
+  // 所以这里必须把它从所有等待队列里摘掉。
+  for (auto& kv : entries_) {
+    EraseWaiter(kv.second.get(), txn);
+  }
   // 释放可能同时唤醒多个资源上的等待者；表数量有限，逐个通知即可
   for (auto& kv : entries_) {
     kv.second->cv.notify_all();
@@ -211,6 +294,55 @@ void LockManager::SetTimeout(std::chrono::milliseconds t) {
   timeout_ = t;
 }
 
+std::chrono::milliseconds LockManager::Timeout() const {
+  std::unique_lock<std::mutex> lk(mutex_);
+  return timeout_;
+}
+
+LockStats LockManager::Stats() const {
+  std::unique_lock<std::mutex> lk(mutex_);
+  LockStats s = stats_;
+  s.deadlocks = static_cast<uint64_t>(deadlock_count_);
+  s.current_waiters = pending_.size();
+  size_t held = 0;
+  for (const auto& kv : held_) {
+    held += kv.second.size();
+  }
+  s.held_locks = held;
+  return s;
+}
+
+std::string LockManager::StatsText() const {
+  std::unique_lock<std::mutex> lk(mutex_);
+  LockStats s = stats_;
+  s.deadlocks = static_cast<uint64_t>(deadlock_count_);
+  s.current_waiters = pending_.size();
+  size_t held = 0;
+  for (const auto& kv : held_) {
+    held += kv.second.size();
+  }
+  s.held_locks = held;
+
+  uint64_t waiters_touched = s.granted_after_wait + s.timeouts;
+  const double avg_ms =
+      waiters_touched == 0
+          ? 0.0
+          : (static_cast<double>(s.wait_us_total) / 1000.0) / static_cast<double>(waiters_touched);
+
+  std::ostringstream os;
+  os << "并发/锁指标（表级 S/X 锁 + 公平 FIFO 调度）:\n";
+  os << "  锁超时阈值        : " << timeout_.count() << " ms\n";
+  os << "  当前持有锁        : " << held << " 条（事务 × 资源）\n";
+  os << "  当前等待中的事务  : " << s.current_waiters << "\n";
+  os << "  直接授予          : " << s.granted << " 次\n";
+  os << "  进入等待          : " << s.waited << " 次\n";
+  os << "  等待后授予        : " << s.granted_after_wait << " 次\n";
+  os << "  等待超时放弃      : " << s.timeouts << " 次\n";
+  os << "  死锁检出/牺牲     : " << s.deadlocks << " 次\n";
+  os << "  平均等待时长      : " << avg_ms << " ms\n";
+  return os.str();
+}
+
 std::string LockManager::Dump() const {
   std::unique_lock<std::mutex> lk(mutex_);
   std::ostringstream os;
@@ -227,6 +359,8 @@ std::string LockManager::Dump() const {
       os << "[S txn=" << s << "]";
     }
     if (!kv.second->waiters.empty()) {
+      // 保持「等待: a,b,c」既有格式：客户端的结构化解析按逗号切分，
+      // 而这里按 FIFO 顺序输出，因此解析结果天然就是队列顺序（队首在前）。
       os << " 等待: ";
       bool first = true;
       for (txn_id_t w : kv.second->waiters) {

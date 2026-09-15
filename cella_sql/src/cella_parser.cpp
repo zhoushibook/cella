@@ -28,6 +28,15 @@ namespace cella
             return e;
         }
 
+        // 聚合函数关键字总表（收尾补齐：COUNT/SUM/AVG/MIN/MAX）。
+        // 集中一处判定，避免 parsePrimary 与 parseAggregate 分头写死函数名。
+        bool isAggregateKeyword(CELLA_Keyword kw)
+        {
+            return kw == CELLA_Keyword::COUNT || kw == CELLA_Keyword::SUM ||
+                   kw == CELLA_Keyword::AVG || kw == CELLA_Keyword::MIN ||
+                   kw == CELLA_Keyword::MAX;
+        }
+
         std::unique_ptr<CELLA_Expr> makeUnary(CELLA_Expr::UnOp op, const CELLA_Token &t,
                                               std::unique_ptr<CELLA_Expr> child)
         {
@@ -1044,6 +1053,36 @@ namespace cella
                                              : CELLA_Expr::UnOp::IS_NULL,
                                      isTok, std::move(l));
                 }
+                // 通配比较：x LIKE 'p' / x NOT LIKE 'p'。与 = / < 同级的二元比较符，
+                // 所以 NOT LIKE 在解析期就合成单个 NOT_LIKE 节点 —— 若留给前缀 NOT 处理，
+                // `x NOT LIKE p` 会因为 NOT 出现在中缀位置而解析失败。
+                {
+                    const CELLA_Token &cur = peek();
+                    bool negated = false;
+                    bool matched = false;
+                    if (cur.keyword == CELLA_Keyword::LIKE)
+                    {
+                        matched = true;
+                    }
+                    else if (cur.keyword == CELLA_Keyword::NOT &&
+                             peek(1).keyword == CELLA_Keyword::LIKE)
+                    {
+                        matched = true;
+                        negated = true;
+                        advance(); // 吃掉 NOT
+                    }
+                    if (matched)
+                    {
+                        const CELLA_Token likeTok = peek();
+                        advance(); // 吃掉 LIKE
+                        auto r = parseAdd();
+                        if (!r)
+                            return nullptr;
+                        return makeBinary(negated ? CELLA_Expr::BinOp::NOT_LIKE
+                                                  : CELLA_Expr::BinOp::LIKE,
+                                          likeTok, std::move(l), std::move(r));
+                    }
+                }
                 const CELLA_Token &t = peek();
                 CELLA_Expr::BinOp op = CELLA_Expr::BinOp::EQ;
                 bool hasOp = false;
@@ -1163,7 +1202,7 @@ namespace cella
                 {
                     return parseLiteral();
                 }
-                if (t.type == CELLA_TokenType::KEYWORD && t.keyword == CELLA_Keyword::COUNT)
+                if (t.type == CELLA_TokenType::KEYWORD && isAggregateKeyword(t.keyword))
                 {
                     return parseAggregate();
                 }
@@ -1197,7 +1236,10 @@ namespace cella
                 return nullptr;
             }
 
-            // 聚合函数调用：COUNT ( * ) | COUNT ( [表.]列 )
+            // 聚合函数调用：<fn> ( * ) | <fn> ( [表.]列 )
+            // fn ∈ { COUNT, SUM, AVG, MIN, MAX }；函数名原文（大写）写入 aggFunc，
+            // 后续语义/计划/打印/执行全部按该字符串参数化分派。
+            // "*" 只在解析层放行，是否合法由语义阶段判定（只有 COUNT(*) 合法）。
             std::unique_ptr<CELLA_Expr> parseAggregate()
             {
                 const CELLA_Token &fn = peek();
@@ -1205,7 +1247,7 @@ namespace cella
                 e->kind = CELLA_Expr::Kind::AGGREGATE;
                 e->line = fn.line;
                 e->col = fn.col;
-                e->aggFunc = "COUNT";
+                e->aggFunc = cella_keywordText(fn.keyword);
                 advance(); // 吃掉函数名
                 if (!expectDelim("("))
                     return nullptr;

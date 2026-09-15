@@ -99,7 +99,12 @@ namespace cella
         DATETIME,
         INDEX,   // CREATE INDEX / DROP INDEX
         UNIQUE,  // CREATE UNIQUE INDEX
-        COUNT    // 聚合函数 COUNT(*) / COUNT(col)
+        COUNT,   // 聚合函数 COUNT(*) / COUNT(col)
+        SUM,     // 聚合函数 SUM(col)（数值列求和）
+        AVG,     // 聚合函数 AVG(col)（数值列求平均，结果恒为 DOUBLE）
+        MIN,     // 聚合函数 MIN(col)（可比列最小值，保持原列类型）
+        MAX,     // 聚合函数 MAX(col)（可比列最大值，保持原列类型）
+        LIKE     // 字符串通配比较：x LIKE 'A%' / x NOT LIKE 'A_'
     };
 
     // 内部别名：防止后续头文件再次定义 NULL 宏导致使用处被展开
@@ -239,6 +244,16 @@ namespace cella
             return "UNIQUE";
         case CELLA_Keyword::COUNT:
             return "COUNT";
+        case CELLA_Keyword::SUM:
+            return "SUM";
+        case CELLA_Keyword::AVG:
+            return "AVG";
+        case CELLA_Keyword::MIN:
+            return "MIN";
+        case CELLA_Keyword::MAX:
+            return "MAX";
+        case CELLA_Keyword::LIKE:
+            return "LIKE";
         }
         return "";
     }
@@ -304,6 +319,11 @@ namespace cella
             {"INDEX", CELLA_Keyword::INDEX},
             {"UNIQUE", CELLA_Keyword::UNIQUE},
             {"COUNT", CELLA_Keyword::COUNT},
+            {"SUM", CELLA_Keyword::SUM},
+            {"AVG", CELLA_Keyword::AVG},
+            {"MIN", CELLA_Keyword::MIN},
+            {"MAX", CELLA_Keyword::MAX},
+            {"LIKE", CELLA_Keyword::LIKE},
         };
         auto it = table.find(cella_toUpper(lexeme));
         return it == table.end() ? CELLA_Keyword::NONE : it->second;

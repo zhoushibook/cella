@@ -172,6 +172,10 @@ namespace cella
                 return "AND";
             case CELLA_Expr::BinOp::OR:
                 return "OR";
+            case CELLA_Expr::BinOp::LIKE:
+                return "LIKE";
+            case CELLA_Expr::BinOp::NOT_LIKE:
+                return "NOT LIKE";
             }
             return "?";
         }
@@ -381,6 +385,25 @@ namespace cella
                     }
                     t = promoteNumeric(lt, rt);
                     break;
+                case CELLA_Expr::BinOp::LIKE:
+                case CELLA_Expr::BinOp::NOT_LIKE:
+                {
+                    // 通配匹配只在文本上定义；NULL 参与不报错（求值退化为 UNKNOWN）
+                    const bool lok = isStringType(lt) || isDateTimeType(lt) ||
+                                     lt == CELLA_ValueType::NULL_T;
+                    const bool rok = isStringType(rt) || isDateTimeType(rt) ||
+                                     rt == CELLA_ValueType::NULL_T;
+                    if (!lok || !rok)
+                    {
+                        errors.push_back(cella_makeError(
+                            CELLA_Phase::SEM, "SEM-325", e.line, e.col,
+                            "操作符 '" + binOpText(e.bop) + "' 只支持文本操作数，实际为 " +
+                                valueTypeName(lt) + " 与 " + valueTypeName(rt)));
+                        return false;
+                    }
+                    t = CELLA_ValueType::BOOL;
+                    break;
+                }
                 default: // 比较运算
                 {
                     bool ok = (isNumericType(lt) && isNumericType(rt)) ||
@@ -404,11 +427,50 @@ namespace cella
             }
             case CELLA_Expr::Kind::AGGREGATE:
             {
-                // COUNT(*) 不牵扯任何列；COUNT(col) 需要列存在
+                const std::string fn = e.aggFunc.empty() ? "COUNT" : e.aggFunc;
+                const bool is_count = (fn == "COUNT");
+                // 通配参数只有 COUNT(*) 一种合法形式
+                if (e.aggStar && !is_count)
+                {
+                    errors.push_back(cella_makeError(
+                        CELLA_Phase::SEM, "SEM-323", e.line, e.col,
+                        fn + "(*) 不合法：'*' 参数只对 COUNT 有意义"));
+                    return false;
+                }
+                // COUNT(*) 不牵扯任何列；其余形式必须给出存在的列
                 if (!e.aggStar &&
                     !resolveColumn(e.table, e.column, e.line, e.col, scope, cat, errors))
                     return false;
-                t = CELLA_ValueType::INT; // 计数结果恒为整数
+                CELLA_ValueType colType = CELLA_ValueType::UNKNOWN;
+                if (!e.aggStar)
+                {
+                    const CELLA_Column *c = scopeFindColumn(scope, cat, e.table, e.column);
+                    if (c != nullptr)
+                        colType = dataTypeToValue(c->type);
+                }
+                if (is_count || e.aggStar)
+                {
+                    t = CELLA_ValueType::INT; // 计数结果恒为整数
+                }
+                else if (fn == "SUM" || fn == "AVG")
+                {
+                    if (colType != CELLA_ValueType::UNKNOWN && !isNumericType(colType))
+                    {
+                        errors.push_back(cella_makeError(
+                            CELLA_Phase::SEM, "SEM-324", e.line, e.col,
+                            fn + " 需要数值列，实际为 " + valueTypeName(colType) + "（列 " +
+                                e.column + "）"));
+                        return false;
+                    }
+                    // AVG 恒为 DOUBLE（即使整数列也可能除不尽）；SUM 整数列 → INT，否则 DOUBLE
+                    t = (fn == "AVG") ? CELLA_ValueType::DOUBLE
+                                      : ((colType == CELLA_ValueType::INT) ? CELLA_ValueType::INT
+                                                                           : CELLA_ValueType::DOUBLE);
+                }
+                else // MIN / MAX：保持原列类型
+                {
+                    t = (colType == CELLA_ValueType::UNKNOWN) ? CELLA_ValueType::INT : colType;
+                }
                 break;
             }
             }

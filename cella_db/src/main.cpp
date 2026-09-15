@@ -370,7 +370,8 @@ namespace
                  "  \\l                列出所有数据库\n"
                  "  \\plan <SQL>       只编译并打印计划（优化前/后对比）\n"
                  "  \\stats            缓冲池统计（命中率/淘汰/钉住）\n"
-                 "  \\locks            当前锁表\n"
+                 "  \\locks            当前锁表（等待队列按 FIFO 顺序）\n"
+                 "  \\lockstats        并发/锁指标（授予/等待/超时/死锁/平均等待）\n"
                  "  \\waitfor          等待图（死锁检测依据）\n"
                  "  \\txn              事务表\n"
                  "  \\clear            清除屏幕（\\cls 同义）\n"
@@ -451,6 +452,10 @@ namespace
         else if (trimmed == "\\WAITFOR")
         {
           std::cout << engine.WaitForGraphText();
+        }
+        else if (trimmed == "\\LOCKSTATS")
+        {
+          std::cout << engine.LockStatsText();
         }
         else if (trimmed == "\\TXN")
         {
