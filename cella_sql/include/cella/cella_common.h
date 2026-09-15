@@ -92,4 +92,64 @@ namespace cella
         return true;
     }
 
+    // ── 标量 / 窗口函数规格表 ────────────────────────────────────
+    // 语义阶段（cella_sql）与执行阶段（cella_db）共用同一份定义，
+    // 避免「编译器放行、执行器不认」或反过来的漂移。
+    // 约定：name 为大写；minArgs/maxArgs 为实参个数区间（-1 表示不限）。
+    struct CELLA_FuncSpec
+    {
+        const char *name;
+        int minArgs;
+        int maxArgs;
+        bool windowOnly; // 仅可用于窗口上下文（必须有 OVER 子句）
+        const char *note;
+    };
+
+    inline const CELLA_FuncSpec *cella_findFunc(const std::string &upperName)
+    {
+        static const CELLA_FuncSpec kFuncs[] = {
+            // 字符串函数
+            {"UPPER", 1, 1, false, "转为大写"},
+            {"LOWER", 1, 1, false, "转为小写"},
+            {"LENGTH", 1, 1, false, "字符数"},
+            {"CHAR_LENGTH", 1, 1, false, "字符数（LENGTH 别名）"},
+            {"SUBSTR", 2, 3, false, "取子串：SUBSTR(s, start[, len])"},
+            {"SUBSTRING", 2, 3, false, "SUBSTR 别名"},
+            {"TRIM", 1, 1, false, "去掉首尾空白"},
+            {"LTRIM", 1, 1, false, "去掉左侧空白"},
+            {"RTRIM", 1, 1, false, "去掉右侧空白"},
+            {"REPLACE", 3, 3, false, "替换：REPLACE(s, from, to)"},
+            {"CONCAT", 1, 8, false, "拼接（NULL 视作空串）"},
+            // 数值函数
+            {"ABS", 1, 1, false, "绝对值"},
+            {"ROUND", 1, 2, false, "四舍五入：ROUND(x[, n])"},
+            {"CEIL", 1, 1, false, "向上取整"},
+            {"FLOOR", 1, 1, false, "向下取整"},
+            // 日期函数（日期以 YYYY-MM-DD 文本存储，函数内部换算为天数运算）
+            {"YEAR", 1, 1, false, "取年份"},
+            {"MONTH", 1, 1, false, "取月份"},
+            {"DAY", 1, 1, false, "取日"},
+            {"DATEDIFF", 2, 2, false, "相差天数：DATEDIFF(a, b) = a - b"},
+            {"DATE_ADD", 2, 2, false, "日期加减天数：DATE_ADD(d, n)"},
+            {"DATE_SUB", 2, 2, false, "日期减天数：DATE_SUB(d, n)"},
+            // 窗口函数（必须有 OVER 子句）
+            {"ROW_NUMBER", 0, 0, true, "分区内行号（1 起）"},
+            {"RANK", 0, 0, true, "分区内排名（并列跳号）"},
+            {"DENSE_RANK", 0, 0, true, "分区内排名（并列不跳号）"},
+        };
+        for (const auto &f : kFuncs)
+        {
+            if (upperName == f.name)
+                return &f;
+        }
+        return nullptr;
+    }
+
+    // 窗口聚合函数（OVER 子句内可用的聚合名）
+    inline bool cella_isWindowAggName(const std::string &upperName)
+    {
+        return upperName == "COUNT" || upperName == "SUM" || upperName == "AVG" ||
+               upperName == "MIN" || upperName == "MAX";
+    }
+
 } // namespace cella

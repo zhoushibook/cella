@@ -347,6 +347,28 @@ namespace cella
             case CELLA_Stmt::Kind::GET:
                 node = buildGet(st);
                 break;
+            case CELLA_Stmt::Kind::CREATE_VIEW:
+            {
+                node = makeNode("CreateView", "", st.line, st.col);
+                node->stmt = &st;   // 执行期：视图名 + 定义查询
+                node->extra.push_back("view: " + st.viewName);
+                break;
+            }
+            case CELLA_Stmt::Kind::DROP_VIEW:
+            {
+                node = makeNode("DropView", "", st.line, st.col);
+                node->stmt = &st;
+                node->extra.push_back("view: " + st.viewName);
+                break;
+            }
+            case CELLA_Stmt::Kind::WITH:
+            {
+                node = makeNode("With", "", st.line, st.col);
+                node->stmt = &st;   // 执行期：CTE 名/定义查询 + 主语句
+                for (const auto &n : st.cteNames)
+                    node->extra.push_back("cte: " + n);
+                break;
+            }
             default:
                 errors.push_back(cella_makeError(CELLA_Phase::PLN, "PLN-401", st.line, st.col,
                                                  "不支持的语句类型"));

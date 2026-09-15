@@ -73,6 +73,11 @@ struct IndexRowId {
   bool operator!=(const IndexRowId& o) const { return !(*this == o); }
 };
 
-constexpr size_t kIndexRowIdSize = 5;   // page_id(4) + slot_id(1)
+constexpr size_t kIndexRowIdSize = 6;   // page_id(4) + slot_id(2)
+// 槽号为什么必须 2 字节：slot_id_t 是 uint16_t，页内槽数没有 255 的上限
+// （实测 (INT,INT) 记录在 4KB 页上能放 270 行）。早先按 1 字节编码时，
+// 槽号 ≥ 256 会被截断成 0..，与同页低槽号的键**逐字节相同**，插入时被
+// 当成「完全重复键」静默丢弃 —— 表现为「表里明明有这行，按索引列点查却
+// 返回 0 行」（每张表页最后 14 行查不到，见 docs/演示评估与改进建议.md D1）。
 
 }  // namespace cella::storage

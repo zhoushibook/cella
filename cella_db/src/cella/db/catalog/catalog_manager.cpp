@@ -66,6 +66,7 @@ const char* CatalogTypeName(cella::CELLA_DataType t) {
     case cella::CELLA_DataType::DATE:     return "DATE";
     case cella::CELLA_DataType::TIME:     return "TIME";
     case cella::CELLA_DataType::DATETIME: return "DATETIME";
+    case cella::CELLA_DataType::BOOL:     return "BOOL";
   }
   return "VARCHAR";
 }
@@ -84,6 +85,8 @@ bool CatalogTypeFromName(const std::string& name, cella::CELLA_DataType* out) {
       {"DATE", cella::CELLA_DataType::DATE},
       {"TIME", cella::CELLA_DataType::TIME},
       {"DATETIME", cella::CELLA_DataType::DATETIME},
+      {"BOOL", cella::CELLA_DataType::BOOL},
+      {"BOOLEAN", cella::CELLA_DataType::BOOL},
   };
   for (const auto& p : kPairs) {
     if (u == p.n) {

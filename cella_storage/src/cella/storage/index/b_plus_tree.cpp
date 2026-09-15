@@ -70,7 +70,7 @@ size_t ChildIndexFor(const IndexNode& node, const std::string& target) {
 BPlusTree::BPlusTree(BufferPoolManager* bpm, KeySpec spec) : bpm_(bpm), spec_(spec) {}
 
 // ── 键长上限（建索引时校验用）───────────────────────────────
-// 最坏叶子键 = NULL 位图（复合键）+ Σ(各列最大编码) + 行定位 5B。
+// 最坏叶子键 = NULL 位图（复合键）+ Σ(各列最大编码) + 行定位 6B。
 size_t BPlusTree::MaxLeafKeyBytes(const KeySpec& spec) {
   size_t total = NullBitmapBytes(spec.columns.size());
   for (const Column& c : spec.columns) {

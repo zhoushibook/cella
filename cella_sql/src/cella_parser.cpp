@@ -49,6 +49,19 @@ namespace cella
             return e;
         }
 
+        // 标量函数调用节点（UPPER/LENGTH/SUBSTR/DATEDIFF...）与窗口函数共用
+        std::unique_ptr<CELLA_Expr> makeFunction(const CELLA_Token &nameTok, std::string name,
+                                                 std::vector<std::unique_ptr<CELLA_Expr>> args)
+        {
+            auto e = std::make_unique<CELLA_Expr>();
+            e->kind = CELLA_Expr::Kind::FUNCTION;
+            e->line = nameTok.line;
+            e->col = nameTok.col;
+            e->funcName = std::move(name);
+            e->args = std::move(args);
+            return e;
+        }
+
         class CELLA_ParserImpl
         {
         public:
@@ -93,6 +106,11 @@ namespace cella
                 return t;
             }
             bool atEnd() const { return peek().type == CELLA_TokenType::EOF_T; }
+
+            // 回溯支持：用于「'(' 后到底是子查询还是括起表达式」这类需要前瞻的分支。
+            // 注意：reset 只回退游标，不回退 errors —— 试探路径不得产生诊断。
+            size_t mark() const { return pos; }
+            void reset(size_t m) { pos = m; }
 
             bool matchKw(CELLA_Keyword kw)
             {
@@ -242,6 +260,9 @@ namespace cella
                             (peek(1).keyword == CELLA_Keyword::INDEX ||
                              peek(1).keyword == CELLA_Keyword::UNIQUE))
                             return parseCreateIndex();
+                        if (peek(1).type == CELLA_TokenType::KEYWORD &&
+                            peek(1).keyword == CELLA_Keyword::VIEW)
+                            return parseCreateView();
                         return parseCreateTable();
                     case CELLA_Keyword::INSERT:
                         return parseInsert();
@@ -255,16 +276,21 @@ namespace cella
                         if (peek(1).type == CELLA_TokenType::KEYWORD &&
                             peek(1).keyword == CELLA_Keyword::INDEX)
                             return parseDropIndex();
+                        if (peek(1).type == CELLA_TokenType::KEYWORD &&
+                            peek(1).keyword == CELLA_Keyword::VIEW)
+                            return parseDropView();
                         return parseDropTable();
                     case CELLA_Keyword::ALTER:
                         return parseAlterTable();
                     case CELLA_Keyword::TRUNCATE:
                         return parseTruncateTable();
+                    case CELLA_Keyword::WITH:
+                        return parseWith();
                     default:
                         break;
                     }
                 }
-                synError(t, "CREATE/INSERT/GET/DELETE/UPDATE/DROP/ALTER/TRUNCATE");
+                synError(t, "CREATE/INSERT/GET/DELETE/UPDATE/DROP/ALTER/TRUNCATE/WITH");
                 return nullptr;
             }
 
@@ -319,6 +345,94 @@ namespace cella
                         return st;
                     }
 
+                    // 表级 CHECK：( expr )
+                    if (peek().keyword == CELLA_Keyword::CHECK)
+                    {
+                        const CELLA_Token &ck = peek();
+                        advance();
+                        CELLA_TableCheck tc;
+                        tc.line = ck.line;
+                        tc.col = ck.col;
+                        if (!expectDelim("("))
+                            return nullptr;
+                        tc.expr = parseExpr();
+                        if (!tc.expr)
+                            return nullptr;
+                        if (!expectDelim(")"))
+                            return nullptr;
+                        st->tableChecks.push_back(std::move(tc));
+                        if (matchDelim(","))
+                            continue;
+                        break;
+                    }
+                    // 表级 UNIQUE：( a [, b]* )
+                    if (peek().keyword == CELLA_Keyword::UNIQUE)
+                    {
+                        const CELLA_Token &uk = peek();
+                        advance();
+                        CELLA_TableUnique tu;
+                        tu.line = uk.line;
+                        tu.col = uk.col;
+                        if (!expectDelim("("))
+                            return nullptr;
+                        do
+                        {
+                            std::string c;
+                            if (!expectIdent(c))
+                                return nullptr;
+                            tu.columns.push_back(std::move(c));
+                        } while (matchDelim(","));
+                        if (!expectDelim(")"))
+                            return nullptr;
+                        st->tableUniques.push_back(std::move(tu));
+                        if (matchDelim(","))
+                            continue;
+                        break;
+                    }
+                    // 表级外键：FOREIGN KEY ( a [, b]* ) REFERENCES t [ ( c [, d]* ) ] [ON DELETE ...]
+                    if (peek().keyword == CELLA_Keyword::FOREIGN)
+                    {
+                        const CELLA_Token &fk = peek();
+                        advance();
+                        if (!expectKw(CELLA_Keyword::KEY))
+                            return nullptr;
+                        CELLA_ForeignKey f;
+                        f.line = fk.line;
+                        f.col = fk.col;
+                        if (!expectDelim("("))
+                            return nullptr;
+                        do
+                        {
+                            std::string c;
+                            if (!expectIdent(c))
+                                return nullptr;
+                            f.columns.push_back(std::move(c));
+                        } while (matchDelim(","));
+                        if (!expectDelim(")"))
+                            return nullptr;
+                        if (!expectKw(CELLA_Keyword::REFERENCES))
+                            return nullptr;
+                        if (!expectIdent(f.refTable))
+                            return nullptr;
+                        if (matchDelim("("))
+                        {
+                            do
+                            {
+                                std::string c;
+                                if (!expectIdent(c))
+                                    return nullptr;
+                                f.refColumns.push_back(std::move(c));
+                            } while (matchDelim(","));
+                            if (!expectDelim(")"))
+                                return nullptr;
+                        }
+                        parseOnDelete(f.onDelete);
+                        st->foreignKeys.push_back(std::move(f));
+                        if (matchDelim(","))
+                            continue;
+                        break;
+                    }
+
                     CELLA_ColumnDef cd;
                     if (!parseColumnDef(cd))
                         return nullptr;
@@ -339,7 +453,7 @@ namespace cella
                 const CELLA_Token &t = peek();
                 if (t.type != CELLA_TokenType::KEYWORD)
                 {
-                    synError(t, "数据类型 INT/FLOAT/DOUBLE/CHAR/VARCHAR/TEXT/DATE/TIME/DATETIME");
+                    synError(t, "数据类型 INT/FLOAT/DOUBLE/CHAR/VARCHAR/TEXT/DATE/TIME/DATETIME/BOOL");
                     return false;
                 }
                 switch (t.keyword)
@@ -372,8 +486,12 @@ namespace cella
                 case CELLA_Keyword::DATETIME:
                     out = CELLA_DataType::DATETIME;
                     break;
+                case CELLA_Keyword::BOOL:
+                case CELLA_Keyword::BOOLEAN:
+                    out = CELLA_DataType::BOOL;
+                    break;
                 default:
-                    synError(t, "数据类型 INT/FLOAT/DOUBLE/CHAR/VARCHAR/TEXT/DATE/TIME/DATETIME");
+                    synError(t, "数据类型 INT/FLOAT/DOUBLE/CHAR/VARCHAR/TEXT/DATE/TIME/DATETIME/BOOL");
                     return false;
                 }
                 advance();
@@ -412,7 +530,9 @@ namespace cella
                     if (!expectDelim(")"))
                         return false;
                 }
-                // 列约束：NOT NULL / PRIMARY KEY，可任意顺序、可重复出现
+                // 列约束：NOT NULL / PRIMARY KEY / UNIQUE / DEFAULT <lit> / CHECK ( expr ) /
+                //           REFERENCES t [ ( col ) ] [ ON DELETE CASCADE|RESTRICT ]
+                // 可任意顺序、可重复出现（重复由语义阶段判定）。
                 bool more_constraints = true;
                 while (more_constraints)
                 {
@@ -428,12 +548,88 @@ namespace cella
                             return false;
                         cd.primaryKey = true;
                     }
+                    else if (matchKw(CELLA_Keyword::UNIQUE))
+                    {
+                        cd.unique = true;
+                    }
+                    else if (matchKw(CELLA_Keyword::DEFAULT))
+                    {
+                        cd.hasDefault = true;
+                        cd.defaultExpr = parseLiteral();
+                        if (!cd.defaultExpr)
+                            return false;
+                    }
+                    else if (matchKw(CELLA_Keyword::CHECK))
+                    {
+                        cd.hasCheck = true;
+                        if (!expectDelim("("))
+                            return false;
+                        cd.checkExpr = parseExpr();
+                        if (!cd.checkExpr)
+                            return false;
+                        if (!expectDelim(")"))
+                            return false;
+                    }
+                    else if (matchKw(CELLA_Keyword::REFERENCES))
+                    {
+                        cd.hasReferences = true;
+                        if (!expectIdent(cd.refTable))
+                            return false;
+                        if (matchDelim("("))
+                        {
+                            for (;;)
+                            {
+                                std::string rc;
+                                if (!expectIdent(rc))
+                                    return false;
+                                cd.refColumns.push_back(std::move(rc));
+                                if (matchDelim(","))
+                                    continue;
+                                break;
+                            }
+                            if (!expectDelim(")"))
+                                return false;
+                        }
+                        parseOnDelete(cd.onDelete);
+                    }
                     else
                     {
                         more_constraints = false;
                     }
                 }
                 return true;
+            }
+
+            // [ ON DELETE CASCADE | RESTRICT ]（省略 = RESTRICT）
+            void parseOnDelete(std::string &out)
+            {
+                const size_t save = mark();
+                if (!matchKw(CELLA_Keyword::ON))
+                {
+                    reset(save);
+                    return;
+                }
+                if (!matchKw(CELLA_Keyword::DELETE))
+                {
+                    reset(save);
+                    return;
+                }
+                const CELLA_Token &t = peek();
+                if (t.type == CELLA_TokenType::IDENTIFIER && cella_toUpper(t.lexeme) == "CASCADE")
+                {
+                    out = "CASCADE";
+                    advance();
+                }
+                else if (t.type == CELLA_TokenType::IDENTIFIER && cella_toUpper(t.lexeme) == "RESTRICT")
+                {
+                    out = "RESTRICT";
+                    advance();
+                }
+                else
+                {
+                    // 只写了 ON DELETE 却没给动作：保留为 RESTRICT 并放行（宽容处理）
+                    out = "RESTRICT";
+                }
             }
 
             // INSERT INTO name [ '(' cols ')' ] VALUES row { ',' row } ';'
@@ -469,10 +665,26 @@ namespace cella
                     std::vector<std::unique_ptr<CELLA_Expr>> row;
                     for (;;)
                     {
-                        auto e = parseLiteral();
-                        if (!e)
-                            return nullptr;
-                        row.push_back(std::move(e));
+                        // VALUES ( DEFAULT )：显式要求取该列默认值（无默认值时语义阶段报错）
+                        if (peek().type == CELLA_TokenType::KEYWORD &&
+                            peek().keyword == CELLA_Keyword::DEFAULT)
+                        {
+                            const CELLA_Token mk = peek();
+                            advance();
+                            auto d = std::make_unique<CELLA_Expr>();
+                            d->kind = CELLA_Expr::Kind::LITERAL;
+                            d->lit = CELLA_LiteralKind::DEFAULT_LIT;
+                            d->line = mk.line;
+                            d->col = mk.col;
+                            row.push_back(std::move(d));
+                        }
+                        else
+                        {
+                            auto e = parseLiteral();
+                            if (!e)
+                                return nullptr;
+                            row.push_back(std::move(e));
+                        }
                         if (matchDelim(","))
                             continue;
                         break;
@@ -973,6 +1185,88 @@ namespace cella
                 return st;
             }
 
+            // ---------------- 视图与 CTE ----------------
+
+            // 子查询：以 get 开头、不带结尾分号的查询体
+            bool parseSubquery(std::unique_ptr<CELLA_Stmt> *out)
+            {
+                const CELLA_Token &g = peek();
+                if (!(g.type == CELLA_TokenType::KEYWORD && g.keyword == CELLA_Keyword::GET))
+                {
+                    synError(g, "关键字 GET（子查询）");
+                    return false;
+                }
+                advance();
+                auto st = makeStmt(CELLA_Stmt::Kind::GET, g);
+                if (!parseGetBody(*st))
+                    return false;
+                *out = std::move(st);
+                return true;
+            }
+
+            // CREATE VIEW name AS <get>
+            std::unique_ptr<CELLA_Stmt> parseCreateView()
+            {
+                const CELLA_Token &t = advance(); // CREATE
+                auto st = makeStmt(CELLA_Stmt::Kind::CREATE_VIEW, t);
+                if (!expectKw(CELLA_Keyword::VIEW))
+                    return nullptr;
+                if (!expectIdent(st->viewName))
+                    return nullptr;
+                if (!expectKw(CELLA_Keyword::AS))
+                    return nullptr;
+                if (!parseSubquery(&st->viewQuery))
+                    return nullptr;
+                if (!expectSemicolon())
+                    return nullptr;
+                return st;
+            }
+
+            // DROP VIEW name
+            std::unique_ptr<CELLA_Stmt> parseDropView()
+            {
+                const CELLA_Token &t = advance(); // DROP
+                auto st = makeStmt(CELLA_Stmt::Kind::DROP_VIEW, t);
+                if (!expectKw(CELLA_Keyword::VIEW))
+                    return nullptr;
+                if (!expectIdent(st->viewName))
+                    return nullptr;
+                if (!expectSemicolon())
+                    return nullptr;
+                return st;
+            }
+
+            // WITH n1 AS ( get ... ) [, n2 AS ( get ... )] <主语句>
+            std::unique_ptr<CELLA_Stmt> parseWith()
+            {
+                const CELLA_Token &t = advance(); // WITH
+                auto st = makeStmt(CELLA_Stmt::Kind::WITH, t);
+                for (;;)
+                {
+                    std::string name;
+                    if (!expectIdent(name))
+                        return nullptr;
+                    if (!expectKw(CELLA_Keyword::AS))
+                        return nullptr;
+                    if (!expectDelim("("))
+                        return nullptr;
+                    std::unique_ptr<CELLA_Stmt> q;
+                    if (!parseSubquery(&q))
+                        return nullptr;
+                    if (!expectDelim(")"))
+                        return nullptr;
+                    st->cteNames.push_back(std::move(name));
+                    st->cteQueries.push_back(std::move(q));
+                    if (matchDelim(","))
+                        continue;
+                    break;
+                }
+                st->cteMain = parseStatement();
+                if (!st->cteMain)
+                    return nullptr;
+                return st;
+            }
+
             // ---------------- 表达式（任务书 2.4 节） ----------------
 
             std::unique_ptr<CELLA_Expr> parseExpr() { return parseOr(); }
@@ -1014,6 +1308,21 @@ namespace cella
                 if (matchKw(CELLA_Keyword::NOT))
                 {
                     const CELLA_Token &op = toks[pos - 1];
+                    // NOT EXISTS (...) 合成单个 negated 节点。若留给通用前缀 NOT，
+                    // 会变成 NOT(EXISTS(...)) 双层，打印与求值都要额外处理。
+                    if (peek().keyword == CELLA_Keyword::EXISTS)
+                    {
+                        auto c = parsePrimary();
+                        if (!c)
+                            return nullptr;
+                        if (c->kind == CELLA_Expr::Kind::EXISTS_Q)
+                        {
+                            c->negated = !c->negated;
+                            c->line = op.line;
+                            c->col = op.col;
+                            return c;
+                        }
+                    }
                     auto c = parseNot();
                     if (!c)
                         return nullptr;
@@ -1081,6 +1390,62 @@ namespace cella
                         return makeBinary(negated ? CELLA_Expr::BinOp::NOT_LIKE
                                                   : CELLA_Expr::BinOp::LIKE,
                                           likeTok, std::move(l), std::move(r));
+                    }
+                }
+                // 集合判定：x [NOT] IN ( v1, v2, ... ) / x [NOT] IN ( get ... )
+                // 消歧关键：本方言用 "GET ... IN <表>" 表示 FROM，所以只有 IN 后面
+                // 紧跟 '(' 时才当成集合判定，否则把 IN 留给上层子句处理。
+                {
+                    bool negated = false;
+                    bool matched = false;
+                    const CELLA_Token &cur = peek();
+                    if (cur.keyword == CELLA_Keyword::IN && peek(1).type == CELLA_TokenType::DELIMITER &&
+                        peek(1).lexeme == "(")
+                    {
+                        matched = true;
+                    }
+                    else if (cur.keyword == CELLA_Keyword::NOT &&
+                             peek(1).keyword == CELLA_Keyword::IN &&
+                             peek(2).type == CELLA_TokenType::DELIMITER && peek(2).lexeme == "(")
+                    {
+                        matched = true;
+                        negated = true;
+                        advance(); // 吃掉 NOT
+                    }
+                    if (matched)
+                    {
+                        const CELLA_Token inTok = peek();
+                        advance(); // 吃掉 IN
+                        auto e = std::make_unique<CELLA_Expr>();
+                        e->kind = CELLA_Expr::Kind::IN_LIST;
+                        e->line = inTok.line;
+                        e->col = inTok.col;
+                        e->negated = negated;
+                        e->left = std::move(l);
+                        if (!expectDelim("("))
+                            return nullptr;
+                        if (peek().type == CELLA_TokenType::KEYWORD && peek().keyword == CELLA_Keyword::GET)
+                        {
+                            e->kind = CELLA_Expr::Kind::IN_QUERY;
+                            if (!parseSubquery(&e->subquery))
+                                return nullptr;
+                        }
+                        else
+                        {
+                            for (;;)
+                            {
+                                auto v = parseExpr();
+                                if (!v)
+                                    return nullptr;
+                                e->inList.push_back(std::move(v));
+                                if (matchDelim(","))
+                                    continue;
+                                break;
+                            }
+                        }
+                        if (!expectDelim(")"))
+                            return nullptr;
+                        return e;
                     }
                 }
                 const CELLA_Token &t = peek();
@@ -1187,6 +1552,115 @@ namespace cella
                 return parsePrimary();
             }
 
+            // 窗口子句：OVER ( [PARTITION [BY] c1, ...] [ORDERED [BY] c1 [ASC|DESC], ...] )
+            // 方言里 BY 可省略（与 grouped / ordered 保持一致），故此处按可选词处理。
+            bool parseWindowSpec(CELLA_Expr &e)
+            {
+                if (!expectDelim("("))
+                    return false;
+                if (peek().keyword == CELLA_Keyword::PARTITION)
+                {
+                    advance();
+                    if (peek().keyword == CELLA_Keyword::BY)
+                        advance();
+                    for (;;)
+                    {
+                        CELLA_ColName cn;
+                        const CELLA_Token &ct = peek();
+                        cn.line = ct.line;
+                        cn.col = ct.col;
+                        if (!expectIdent(cn.column))
+                            return false;
+                        if (matchOp("."))
+                        {
+                            cn.table = cn.column;
+                            if (!expectIdent(cn.column))
+                                return false;
+                        }
+                        e.winPartition.push_back(cn);
+                        if (matchDelim(","))
+                            continue;
+                        break;
+                    }
+                }
+                if (peek().keyword == CELLA_Keyword::ORDERED)
+                {
+                    advance();
+                    if (peek().keyword == CELLA_Keyword::BY)
+                        advance();
+                    for (;;)
+                    {
+                        CELLA_ColName cn;
+                        const CELLA_Token &ct = peek();
+                        cn.line = ct.line;
+                        cn.col = ct.col;
+                        if (!expectIdent(cn.column))
+                            return false;
+                        if (matchOp("."))
+                        {
+                            cn.table = cn.column;
+                            if (!expectIdent(cn.column))
+                                return false;
+                        }
+                        e.winOrder.push_back(cn);
+                        bool asc = true;
+                        if (peek().keyword == CELLA_Keyword::DESC)
+                        {
+                            asc = false;
+                            advance();
+                        }
+                        else if (peek().keyword == CELLA_Keyword::ASC)
+                        {
+                            advance();
+                        }
+                        e.winOrderAsc.push_back(asc);
+                        if (matchDelim(","))
+                            continue;
+                        break;
+                    }
+                }
+                return expectDelim(")");
+            }
+
+            // 通用函数调用：name ( [arg[, arg]...] ) [ OVER ( ... ) ]
+            // 命中函数表才当成函数调用，否则回退为列引用 —— 这样把函数名的判定
+            // 收敛到 cella_common.h 的单一规格表，不会出现「解析器认、执行器不认」。
+            std::unique_ptr<CELLA_Expr> parseFunctionCall()
+            {
+                const CELLA_Token fn = peek();
+                auto e = std::make_unique<CELLA_Expr>();
+                e->kind = CELLA_Expr::Kind::FUNCTION;
+                e->line = fn.line;
+                e->col = fn.col;
+                e->funcName = cella_toUpper(fn.lexeme);
+                advance(); // 函数名
+                if (!expectDelim("("))
+                    return nullptr;
+                if (!matchDelim(")"))
+                {
+                    for (;;)
+                    {
+                        auto a = parseExpr();
+                        if (!a)
+                            return nullptr;
+                        e->args.push_back(std::move(a));
+                        if (matchDelim(","))
+                            continue;
+                        break;
+                    }
+                    if (!expectDelim(")"))
+                        return nullptr;
+                }
+                if (peek().keyword == CELLA_Keyword::OVER)
+                {
+                    advance();
+                    if (!parseWindowSpec(*e))
+                        return nullptr;
+                    e->kind = CELLA_Expr::Kind::WINDOW;
+                }
+                return e;
+            }
+
             std::unique_ptr<CELLA_Expr> parsePrimary()
             {
                 const CELLA_Token &t = peek();
@@ -1204,7 +1678,41 @@ namespace cella
                 }
                 if (t.type == CELLA_TokenType::KEYWORD && isAggregateKeyword(t.keyword))
                 {
-                    return parseAggregate();
+                    auto agg = parseAggregate();
+                    if (!agg)
+                        return nullptr;
+                    // 聚合 + OVER → 窗口聚合：保留 aggFunc/column，只改 kind
+                    if (peek().keyword == CELLA_Keyword::OVER)
+                    {
+                        advance();
+                        if (!parseWindowSpec(*agg))
+                            return nullptr;
+                        agg->kind = CELLA_Expr::Kind::WINDOW;
+                    }
+                    return agg;
+                }
+                // EXISTS ( get ... )
+                if (t.type == CELLA_TokenType::KEYWORD && t.keyword == CELLA_Keyword::EXISTS)
+                {
+                    advance();
+                    auto e = std::make_unique<CELLA_Expr>();
+                    e->kind = CELLA_Expr::Kind::EXISTS_Q;
+                    e->line = t.line;
+                    e->col = t.col;
+                    if (!expectDelim("("))
+                        return nullptr;
+                    if (!parseSubquery(&e->subquery))
+                        return nullptr;
+                    if (!expectDelim(")"))
+                        return nullptr;
+                    return e;
+                }
+                // 函数调用优先于列引用：name 后紧跟 '(' 且 name 在函数规格表里。
+                // 未命中则按普通标识符走列引用分支，因此不会误伤同名列。
+                if (t.type == CELLA_TokenType::IDENTIFIER && peek(1).type == CELLA_TokenType::DELIMITER &&
+                    peek(1).lexeme == "(" && cella_findFunc(cella_toUpper(t.lexeme)) != nullptr)
+                {
+                    return parseFunctionCall();
                 }
                 if (t.type == CELLA_TokenType::IDENTIFIER)
                 {
@@ -1225,6 +1733,20 @@ namespace cella
                 if (t.type == CELLA_TokenType::DELIMITER && t.lexeme == "(")
                 {
                     advance();
+                    // 标量子查询：( get ... ) —— 必须抢在普通括号表达式之前判定，
+                    // 否则 GET 会被当成缺失操作数报 SYN-201。
+                    if (peek().type == CELLA_TokenType::KEYWORD && peek().keyword == CELLA_Keyword::GET)
+                    {
+                        auto e = std::make_unique<CELLA_Expr>();
+                        e->kind = CELLA_Expr::Kind::SCALAR_Q;
+                        e->line = t.line;
+                        e->col = t.col;
+                        if (!parseSubquery(&e->subquery))
+                            return nullptr;
+                        if (!expectDelim(")"))
+                            return nullptr;
+                        return e;
+                    }
                     auto e = parseExpr();
                     if (!e)
                         return nullptr;

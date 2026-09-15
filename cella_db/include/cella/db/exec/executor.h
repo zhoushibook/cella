@@ -426,6 +426,17 @@ class Executor : public wal::IUndoApplier {
                           const std::vector<storage::Value>& row_values, const storage::Rid& rid,
                           bool* present);
 
+  // 把「因根分裂而变化了的根页号」回写系统表 cella_index。
+  //
+  // 为什么必须有这一步：B+ 树的根页号只持久化在 cella_index.root_page_id 这一处，
+  // 而 Insert 在根分裂时会换根（BPlusTree::Insert 里 `root_ = new_root`），
+  // 这个新根号只活在内存对象里。OpenTableIndexes 每次都按目录里的 root_page_id
+  // 重新 Attach，所以一旦分裂后不回写，下一次打开索引就会从**旧根**下降 ——
+  // 分裂出去的那半棵树直接不可达，表现为「大表按索引列/主键等值查询返回 0 行」。
+  // （实测：250 行表漏查 108 行，从第 109 行起 —— 正是单叶子页装满、首次分裂的位置。）
+  // 调用点：每次索引写操作收尾（含回滚路径），因为它们都可能是触发分裂的那一次。
+  DbStatus PersistIndexRoots(std::vector<IndexHandle>* indexes);
+
   // undo 钩子的内部实现：按表名重新打开索引句柄再做维护（回滚路径上没有
   // 现成的句柄可用，且可能要撤销多张表的改动）。
   void UndoIndexDropRow(const std::string& table, const storage::Rid& rid);

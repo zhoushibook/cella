@@ -1,5 +1,6 @@
 #include "cella/db/common/value_bridge.h"
 
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -79,6 +80,8 @@ namespace cella::db
       return ValueType::kVarchar;
     case cella::CELLA_DataType::DATETIME:
       return ValueType::kVarchar;
+    case cella::CELLA_DataType::BOOL:
+      return ValueType::kBool;
     }
     return ValueType::kVarchar;
   }
@@ -236,6 +239,42 @@ namespace cella::db
       }
       *out = Value::Double(AsDouble(in));
       return DbStatus::Ok();
+    }
+    case cella::CELLA_DataType::BOOL:
+    {
+      // 接受 BOOL 字面量、数值（0 为假）、以及 TRUE/T/YES/1 之类的文本
+      if (src == ValueType::kBool)
+      {
+        *out = in;
+        return DbStatus::Ok();
+      }
+      if (src_num)
+      {
+        *out = Value::Bool(AsDouble(in) != 0.0);
+        return DbStatus::Ok();
+      }
+      if (src_text)
+      {
+        std::string u = AsText(in);
+        for (char& ch : u)
+        {
+          ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        }
+        if (u == "TRUE" || u == "T" || u == "YES" || u == "Y" || u == "1")
+        {
+          *out = Value::Bool(true);
+          return DbStatus::Ok();
+        }
+        if (u == "FALSE" || u == "F" || u == "NO" || u == "N" || u == "0" || u.empty())
+        {
+          *out = Value::Bool(false);
+          return DbStatus::Ok();
+        }
+        return DbStatus::Error(DbCode::kTypeMismatch,
+                               "无法把文本 \"" + AsText(in) + "\" 解释为 BOOLEAN");
+      }
+      return DbStatus::Error(DbCode::kTypeMismatch,
+                             "期望布尔值，实际为 " + std::string(storage::ToString(src)));
     }
     default:
       break;

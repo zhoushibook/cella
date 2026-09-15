@@ -22,7 +22,8 @@ namespace cella
         TEXT,
         DATE,
         TIME,
-        DATETIME
+        DATETIME,
+        BOOL
     };
 
     inline std::string cella_typeName(CELLA_DataType t)
@@ -47,6 +48,8 @@ namespace cella
             return "TIME";
         case CELLA_DataType::DATETIME:
             return "DATETIME";
+        case CELLA_DataType::BOOL:
+            return "BOOL";
         }
         return "?";
     }

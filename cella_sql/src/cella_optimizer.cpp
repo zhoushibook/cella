@@ -116,6 +116,26 @@ namespace cella
                 e.kind == CELLA_Expr::Kind::AGGREGATE)
                 return cella_cloneExpr(e);
 
+            // 子查询类节点：不参与编译期折叠（结果依赖运行时数据），原样深拷贝。
+            // 必须显式拦截 —— 否则会落到下面的 BINARY 分支解引用空 left/right。
+            if (e.kind == CELLA_Expr::Kind::IN_LIST || e.kind == CELLA_Expr::Kind::IN_QUERY ||
+                e.kind == CELLA_Expr::Kind::EXISTS_Q || e.kind == CELLA_Expr::Kind::SCALAR_Q ||
+                e.kind == CELLA_Expr::Kind::WINDOW)
+                return cella_cloneExpr(e);
+
+            // 标量函数：实参可继续折叠（如 UPPER('a') 不折叠，但 UPPER(1+1) 的实参要折叠）
+            if (e.kind == CELLA_Expr::Kind::FUNCTION)
+            {
+                auto n = std::make_unique<CELLA_Expr>();
+                n->kind = CELLA_Expr::Kind::FUNCTION;
+                n->line = e.line;
+                n->col = e.col;
+                n->funcName = e.funcName;
+                for (const auto &a : e.args)
+                    n->args.push_back(optimizeExpr(*a, hits));
+                return n;
+            }
+
             if (e.kind == CELLA_Expr::Kind::UNARY)
             {
                 auto child = optimizeExpr(*e.child, hits);
