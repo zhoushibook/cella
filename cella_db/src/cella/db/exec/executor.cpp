@@ -3302,12 +3302,9 @@ namespace cella::db
     {
       return 0;
     }
-    size_t n = 0;
-    for (auto it = heap->begin(); it != heap->end(); ++it)
-    {
-      ++n;
-    }
-    return n;
+    // P1.6：行数由存储层的 TableHeap 惰性统计 + 增量维护（首查扫一遍，
+    // 之后 O(1)），替代原先「每次查询全表迭代数行数」的统计税。
+    return heap->RowCount();
   }
 
   // ── 代价估算 ────────────────────────────────────────────────

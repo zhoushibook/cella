@@ -73,6 +73,9 @@ Status TableHeap::InsertRecord(const Record& record, Rid* out) {
       pg.MarkDirty();                 // 页被改过，标记脏
       *out = Rid{page_id, slot};      // 记录定位：页号 + 槽号
       fsm_.update_hint(page_id);      // 记住这页，下次从这里开始
+      if (row_count_known_) {
+        ++row_count_;                 // 行数增量维护（未知态保持未知，等懒扫描）
+      }
       return Status::OK();
     }
     if (s.code() != StatusCode::kPageFull) {
@@ -131,9 +134,17 @@ Status TableHeap::DeleteRecord(const Rid& rid) {
     return Status::Error(StatusCode::kPageNotFound, "页不存在");
   }
   SlottedPageLayout layout(pg.get());
+  // 先探活再删：对墓碑重复删时 DeleteRecord 语义不变（仍返回 OK），
+  // 但行数只能对「真的活行」递减一次。
+  const char* probe_data = nullptr;
+  uint16_t probe_len = 0;
+  const bool was_live = layout.GetRecord(rid.slot_id, &probe_data, &probe_len).ok();
   Status s = layout.DeleteRecord(rid.slot_id);   // 标记删除（槽 len 置 0）
   if (s.ok()) {
     pg.MarkDirty();
+    if (row_count_known_ && was_live) {
+      --row_count_;
+    }
   }
   return s;
 }
@@ -145,6 +156,20 @@ TableIterator TableHeap::begin() {
 
 TableIterator TableHeap::end() {
   return TableIterator();             // 默认构造 = end 哨兵
+}
+
+size_t TableHeap::RowCount() {
+  if (!row_count_known_) {
+    // 懒扫描：沿链表数一遍活行（TableIterator 自动跳过墓碑），
+    // 之后由 InsertRecord/DeleteRecord 增量维护，本进程内 O(1)。
+    size_t n = 0;
+    for (auto it = begin(); it != end(); ++it) {
+      ++n;
+    }
+    row_count_ = n;
+    row_count_known_ = true;
+  }
+  return row_count_;
 }
 
 }  // namespace cella::storage
