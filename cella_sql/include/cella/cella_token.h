@@ -48,6 +48,9 @@ namespace cella
         PRIMARY,
         KEY,
         ALTER,
+        ADD,
+        COLUMN,
+        TO,
         DROP,
         TRUNCATE,
         RENAME,
@@ -132,6 +135,12 @@ namespace cella
             return "KEY";
         case CELLA_Keyword::ALTER:
             return "ALTER";
+        case CELLA_Keyword::ADD:
+            return "ADD";
+        case CELLA_Keyword::COLUMN:
+            return "COLUMN";
+        case CELLA_Keyword::TO:
+            return "TO";
         case CELLA_Keyword::DROP:
             return "DROP";
         case CELLA_Keyword::TRUNCATE:
@@ -243,6 +252,9 @@ namespace cella
             {"PRIMARY", CELLA_Keyword::PRIMARY},
             {"KEY", CELLA_Keyword::KEY},
             {"ALTER", CELLA_Keyword::ALTER},
+            {"ADD", CELLA_Keyword::ADD},
+            {"COLUMN", CELLA_Keyword::COLUMN},
+            {"TO", CELLA_Keyword::TO},
             {"DROP", CELLA_Keyword::DROP},
             {"TRUNCATE", CELLA_Keyword::TRUNCATE},
             {"RENAME", CELLA_Keyword::RENAME},

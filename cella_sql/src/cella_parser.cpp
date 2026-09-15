@@ -247,11 +247,15 @@ namespace cella
                             peek(1).keyword == CELLA_Keyword::INDEX)
                             return parseDropIndex();
                         return parseDropTable();
+                    case CELLA_Keyword::ALTER:
+                        return parseAlterTable();
+                    case CELLA_Keyword::TRUNCATE:
+                        return parseTruncateTable();
                     default:
                         break;
                     }
                 }
-                synError(t, "CREATE/INSERT/GET/DELETE/UPDATE/DROP");
+                synError(t, "CREATE/INSERT/GET/DELETE/UPDATE/DROP/ALTER/TRUNCATE");
                 return nullptr;
             }
 
@@ -307,55 +311,8 @@ namespace cella
                     }
 
                     CELLA_ColumnDef cd;
-                    const CELLA_Token &idTok = peek();
-                    if (!expectIdent(cd.name))
+                    if (!parseColumnDef(cd))
                         return nullptr;
-                    cd.line = idTok.line;
-                    cd.col = idTok.col;
-                    if (!parseDataType(cd.type))
-                        return nullptr;
-                    // 仅 CHAR/VARCHAR 允许 '(n)'
-                    if ((cd.type == CELLA_DataType::CHAR || cd.type == CELLA_DataType::VARCHAR) &&
-                        matchDelim("("))
-                    {
-                        const CELLA_Token &lenTok = peek();
-                        if (lenTok.type == CELLA_TokenType::CONST &&
-                            lenTok.valueType == CELLA_TokenValueType::NUMBER &&
-                            lenTok.lexeme.find('.') == std::string::npos)
-                        {
-                            advance();
-                            cd.hasLen = true;
-                            cd.len = static_cast<int>(lenTok.numValue);
-                        }
-                        else
-                        {
-                            synError(lenTok, "非负整数");
-                            return nullptr;
-                        }
-                        if (!expectDelim(")"))
-                            return nullptr;
-                    }
-                    // 列约束：NOT NULL / PRIMARY KEY，可任意顺序、可重复出现
-                    bool more_constraints = true;
-                    while (more_constraints)
-                    {
-                        if (matchKw(CELLA_Keyword::NOT))
-                        {
-                            if (!expectKw(CELLA_KW_NULL))
-                                return nullptr;
-                            cd.notNull = true;
-                        }
-                        else if (matchKw(CELLA_Keyword::PRIMARY))
-                        {
-                            if (!expectKw(CELLA_Keyword::KEY))
-                                return nullptr;
-                            cd.primaryKey = true;
-                        }
-                        else
-                        {
-                            more_constraints = false;
-                        }
-                    }
                     st->columns.push_back(std::move(cd));
                     if (matchDelim(","))
                         continue;
@@ -411,6 +368,62 @@ namespace cella
                     return false;
                 }
                 advance();
+                return true;
+            }
+
+            // 列定义：<col> <type> [ '(' len ')' ] { NOT NULL | PRIMARY KEY }
+            // CREATE TABLE 与 ALTER TABLE ADD COLUMN 共用同一段（保证两处的列语义永不漂移）。
+            bool parseColumnDef(CELLA_ColumnDef &cd)
+            {
+                const CELLA_Token &idTok = peek();
+                if (!expectIdent(cd.name))
+                    return false;
+                cd.line = idTok.line;
+                cd.col = idTok.col;
+                if (!parseDataType(cd.type))
+                    return false;
+                // 仅 CHAR/VARCHAR 允许 '(n)'
+                if ((cd.type == CELLA_DataType::CHAR || cd.type == CELLA_DataType::VARCHAR) &&
+                    matchDelim("("))
+                {
+                    const CELLA_Token &lenTok = peek();
+                    if (lenTok.type == CELLA_TokenType::CONST &&
+                        lenTok.valueType == CELLA_TokenValueType::NUMBER &&
+                        lenTok.lexeme.find('.') == std::string::npos)
+                    {
+                        advance();
+                        cd.hasLen = true;
+                        cd.len = static_cast<int>(lenTok.numValue);
+                    }
+                    else
+                    {
+                        synError(lenTok, "非负整数");
+                        return false;
+                    }
+                    if (!expectDelim(")"))
+                        return false;
+                }
+                // 列约束：NOT NULL / PRIMARY KEY，可任意顺序、可重复出现
+                bool more_constraints = true;
+                while (more_constraints)
+                {
+                    if (matchKw(CELLA_Keyword::NOT))
+                    {
+                        if (!expectKw(CELLA_KW_NULL))
+                            return false;
+                        cd.notNull = true;
+                    }
+                    else if (matchKw(CELLA_Keyword::PRIMARY))
+                    {
+                        if (!expectKw(CELLA_Keyword::KEY))
+                            return false;
+                        cd.primaryKey = true;
+                    }
+                    else
+                    {
+                        more_constraints = false;
+                    }
+                }
                 return true;
             }
 
@@ -827,6 +840,124 @@ namespace cella
                 if (!expectKw(CELLA_Keyword::INDEX))
                     return nullptr;
                 if (!expectIdent(st->indexName))
+                    return nullptr;
+                if (!expectSemicolon())
+                    return nullptr;
+                return st;
+            }
+
+            // ALTER TABLE name <action> ';'
+            //   ADD [COLUMN] col type [ '(' len ')' ] [ NOT NULL ]
+            //   DROP [COLUMN] col
+            //   RENAME TO new_name
+            //   RENAME COLUMN old TO new
+            //   ADD PRIMARY KEY ( col { ',' col } )
+            //   DROP PRIMARY KEY
+            //
+            // 一次只允许一个动作：标准 SQL 也允许多动作，但那会让「部分成功」的语义
+            // 变得难以界定（本项目的 DDL 不做事务回滚），故按最小集合实现。
+            // COLUMN 关键字可有可无（与 MySQL 兼容）；RENAME 后面必须跟 TO 或 COLUMN，
+            // 便于把「表改名」与「列改名」区分开。
+            std::unique_ptr<CELLA_Stmt> parseAlterTable()
+            {
+                const CELLA_Token &t = advance(); // ALTER
+                auto st = makeStmt(CELLA_Stmt::Kind::ALTER_TABLE, t);
+                if (!expectKw(CELLA_Keyword::TABLE))
+                    return nullptr;
+                if (!expectIdent(st->tableName))
+                    return nullptr;
+
+                if (matchKw(CELLA_Keyword::ADD))
+                {
+                    if (matchKw(CELLA_Keyword::PRIMARY))
+                    {
+                        if (!expectKw(CELLA_Keyword::KEY))
+                            return nullptr;
+                        st->alterAction = CELLA_Stmt::AlterAction::ADD_PRIMARY_KEY;
+                        if (!parsePkColumnList(st->pkColumns))
+                            return nullptr;
+                    }
+                    else
+                    {
+                        (void)matchKw(CELLA_Keyword::COLUMN); // COLUMN 可省略
+                        st->alterAction = CELLA_Stmt::AlterAction::ADD_COLUMN;
+                        if (!parseColumnDef(st->newColumn))
+                            return nullptr;
+                    }
+                }
+                else if (matchKw(CELLA_Keyword::DROP))
+                {
+                    if (matchKw(CELLA_Keyword::PRIMARY))
+                    {
+                        if (!expectKw(CELLA_Keyword::KEY))
+                            return nullptr;
+                        st->alterAction = CELLA_Stmt::AlterAction::DROP_PRIMARY_KEY;
+                    }
+                    else
+                    {
+                        (void)matchKw(CELLA_Keyword::COLUMN); // COLUMN 可省略
+                        st->alterAction = CELLA_Stmt::AlterAction::DROP_COLUMN;
+                        if (!expectIdent(st->alterColumnName))
+                            return nullptr;
+                    }
+                }
+                else if (matchKw(CELLA_Keyword::RENAME))
+                {
+                    if (matchKw(CELLA_Keyword::TO))
+                    {
+                        st->alterAction = CELLA_Stmt::AlterAction::RENAME_TABLE;
+                        if (!expectIdent(st->newName))
+                            return nullptr;
+                    }
+                    else if (matchKw(CELLA_Keyword::COLUMN))
+                    {
+                        st->alterAction = CELLA_Stmt::AlterAction::RENAME_COLUMN;
+                        if (!expectIdent(st->alterColumnName))
+                            return nullptr;
+                        if (!expectKw(CELLA_Keyword::TO))
+                            return nullptr;
+                        if (!expectIdent(st->newName))
+                            return nullptr;
+                    }
+                    else
+                    {
+                        synError(peek(), "关键字 TO（表改名）或 COLUMN（列改名）");
+                        return nullptr;
+                    }
+                }
+                else
+                {
+                    synError(peek(), "ALTER TABLE 的动作 ADD / DROP / RENAME");
+                    return nullptr;
+                }
+                if (!expectSemicolon())
+                    return nullptr;
+                return st;
+            }
+
+            // '(' col { ',' col } ')' —— 表级主键（CREATE TABLE）与 ADD PRIMARY KEY 共用
+            bool parsePkColumnList(std::vector<std::string> &out)
+            {
+                if (!expectDelim("("))
+                    return false;
+                do
+                {
+                    std::string col;
+                    if (!expectIdent(col))
+                        return false;
+                    out.push_back(std::move(col));
+                } while (matchDelim(","));
+                return expectDelim(")");
+            }
+
+            // TRUNCATE TABLE name ';'
+            std::unique_ptr<CELLA_Stmt> parseTruncateTable()
+            {
+                const CELLA_Token &t = advance(); // TRUNCATE
+                auto st = makeStmt(CELLA_Stmt::Kind::TRUNCATE_TABLE, t);
+                if (!expectKw(CELLA_Keyword::TABLE))
+                    return nullptr;
+                if (!expectIdent(st->tableName))
                     return nullptr;
                 if (!expectSemicolon())
                     return nullptr;

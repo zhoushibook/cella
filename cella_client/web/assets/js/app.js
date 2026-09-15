@@ -2,11 +2,12 @@
 // 约定（PLAN §5.4.1）：组件间不互相调用，一律通过 store 交互。
 
 import { Api, ApiError, setToken, Auth, Conn } from './api.js';
-import { state$, set, subscribe, tableByName, pkOf } from './store.js';
+import { state$, set, subscribe, tableByName, pkOf, tableNameOf } from './store.js';
 import { createEditor, formatSql } from './editor.js';
 import { createGrid } from './grid.js';
 import { createTree } from './tree.js';
 import { initBottomPanel, renderStruct } from './panels.js';
+import { createDesigner, columnsFromCatalog, newColumn, diffSchema, typeSql } from './designer.js';
 import { recordRun, chipHtml, liveChipHtml, fmtMs, speedClass } from './timing.js';
 import { loadNum, saveNum, makeSplitter, setVar } from './ui.js';
 
@@ -193,6 +194,7 @@ function renderTabBody() {
     if (tab.type === 'query') mountQueryTab(tab.el, tab);
     else if (tab.type === 'data') mountDataTab(tab.el, tab);
     else if (tab.type === 'struct') mountStructTab(tab.el, tab);
+    else if (tab.type === 'design') mountDesignTab(tab.el, tab);
   }
   tab.el.style.display = '';
   if (tab.type === 'query' && tab.ui && tab.ui.editor) {
@@ -332,7 +334,38 @@ async function runSql(tab, sql) {
 // ── 结构标签 ────────────────────────────────────────────────
 function mountStructTab(pane, tab) {
   pane.style.overflow = 'auto';
-  renderStruct(pane, tab.table);
+  renderStruct(pane, tab.table, actions);
+}
+
+// ── 设计标签（P5.6 表设计器）──────────────────────────────────
+// 编辑列清单 → 实时差分出一串 ALTER TABLE → 一次提交。
+// 执行成功后目录会变：先刷新目录，再把同表的数据/结构标签作废（下次激活时按新结构重挂）。
+function mountDesignTab(pane, tab) {
+  pane.style.overflow = 'hidden';
+  tab.ui = createDesigner(pane, tab, {
+    onMessage: (m) => {
+      if (m.bad && m.bad.length) {
+        const e0 = m.bad[0].error || {};
+        toast('表设计器：' + m.bad.length + ' 条失败', 'err', e0.message || '');
+      } else {
+        toast('表设计已应用（' + m.data.statements.length + ' 条语句）', 'ok');
+      }
+    },
+    onApplied: async () => {
+      const name = tab.table.name;
+      await refreshCatalog();
+      // 结构与数据都变了 → 关掉这两个标签（保留设计标签本身）
+      const s = state$();
+      const doomed = s.tabs.filter((t) => t.type !== 'design' && tableNameOf(t) === name.toLowerCase());
+      doomed.forEach(disposeTab);
+      if (doomed.length) {
+        set({ tabs: s.tabs.filter((t) => !doomed.includes(t)) });
+        renderTabs();
+      }
+      const fresh = await Api.tableInfo(name);
+      if (tab.ui && tab.ui.reload) tab.ui.reload(fresh);
+    },
+  });
 }
 
 // ── 数据标签（浏览 + 编辑）──────────────────────────────────
@@ -1048,6 +1081,20 @@ const actions = {
     if (exist) { activateTab(exist.id); return; }
     addTab({ type: 'struct', title: name + ' ⚙', table: name });
   },
+  // 表设计器（P5.6）：要拿到完整列清单（含主键标记）才能差分，故先取一次 tableInfo
+  async openDesigner(name) {
+    const s = state$();
+    const exist = s.tabs.find(
+      (t) => t.type === 'design' && t.table && String(t.table.name).toLowerCase() === name.toLowerCase()
+    );
+    if (exist) { activateTab(exist.id); return; }
+    try {
+      const info = await Api.tableInfo(name);
+      addTab({ type: 'design', title: name + ' ✎', table: info });
+    } catch (e) {
+      toast(e.message, 'err', e.detail);
+    }
+  },
   newQueryFor(name) {
     // 注意：`get rowid, * in t` 是语法错误（`*` 必须独占整条 select 列表）→ 显式列全
     const t = tableByName(name);
@@ -1066,7 +1113,8 @@ const actions = {
       await Api.query(`drop table ${name};`);
       toast('已删除表 ' + name, 'ok');
       const s = state$();
-      const doomed = s.tabs.filter((t) => t.table && t.table.toLowerCase() === name.toLowerCase());
+      // 设计标签的 table 是完整表对象（不是名字）→ 统一走 tableNameOf() 取名字
+      const doomed = s.tabs.filter((t) => tableNameOf(t) === name.toLowerCase());
       doomed.forEach(disposeTab);
       set({ tabs: s.tabs.filter((t) => !doomed.includes(t)) });
       if (!state$().tabs.find((t) => t.id === state$().activeTab)) {
@@ -1369,6 +1417,7 @@ async function boot() {
 // 调试/自测句柄（web/_selftest/*.html 依赖；正常使用无副作用）
 window.__cella = {
   state$, actions, newQueryTab, closeTab, fullRefresh,
+  designer: { columnsFromCatalog, newColumn, diffSchema, typeSql },
   layout: {
     SIDEBAR_W, PANEL_H,
     applySidebarW, applyPanelH,

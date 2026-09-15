@@ -37,7 +37,9 @@ INT INTEGER FLOAT DOUBLE CHAR VARCHAR TEXT DATE TIME DATETIME
 ```
 program          := { statement } EOF ;
 statement        := create_table_stmt | insert_stmt | get_stmt
-                  | delete_stmt | update_stmt | drop_table_stmt ;
+                  | delete_stmt | update_stmt | drop_table_stmt
+                  | alter_table_stmt | truncate_table_stmt
+                  | create_index_stmt | drop_index_stmt ;
 
 create_table_stmt := CREATE TABLE table_name '(' column_def { ',' column_def }
                      [ table_primary_key ] ')' ';' ;
@@ -76,6 +78,19 @@ delete_stmt       := DELETE in table_name [ LIMIT expr ] ';' ;  % v3.6: FROM →
 update_stmt       := UPDATE table_name SET col_name '=' expr
                      { ',' col_name '=' expr } [ LIMIT expr ] ';' ;
 drop_table_stmt   := DROP TABLE table_name ';' ;
+
+alter_table_stmt  := ALTER TABLE table_name alter_action ';' ;
+                     % 一次只做一个动作（引擎侧无「一次改多列」的落点，见 GAP_ANALYSIS P5）
+alter_action      := ADD [ COLUMN ] column_def            % 老行补 NULL；NOT NULL 且表非空 → 执行期拒绝
+                   | DROP [ COLUMN ] column_name          % 主键列 → SEM-326；最后一列 → SEM-323
+                   | ADD PRIMARY KEY '(' column_name { ',' column_name } ')'
+                                                          % 表已有主键 → SEM-327
+                   | DROP PRIMARY KEY                     % 表没有主键 → SEM-328
+                   | RENAME TO table_name                 % 表已存在 → SEM-302
+                   | RENAME COLUMN column_name TO column_name ;
+                   % ADD COLUMN 不接受 PRIMARY KEY（SEM-325）：新列无法为已有行补出主键值，
+                   % 要设主键请用独立的 ADD PRIMARY KEY 动作
+truncate_table_stmt := TRUNCATE TABLE table_name ';' ;    % 清空数据 + 重建索引
 
 table_name        := IDENTIFIER ;
 column_name       := IDENTIFIER ;
@@ -175,15 +190,32 @@ const_expr  := NUMBER | STRING | DATE | NULL | TRUE | FALSE ;
   `LiteralExpr{lit,text,num,boolVal}`、`ColumnRefExpr{table?,column}`、
   `UnaryExpr{uop∈{NEG,NOT},child}`、`BinaryExpr{bop∈{EQ,NE,LT,LE,GT,GE,PLUS,MINUS,MUL,DIV,AND,OR},left,right}`、
   `AggregateExpr{aggFunc,aggStar,table?,column?}`（P4；`aggStar=true` 表示 `COUNT(*)`）。
+- ALTER 相关字段（`CELLA_Stmt` 内）：`AlterAction alterAction ∈ {ADD_COLUMN, DROP_COLUMN,
+  RENAME_TABLE, RENAME_COLUMN, ADD_PRIMARY_KEY, DROP_PRIMARY_KEY}`、`newColumn`（`ADD COLUMN`
+  复用 `CELLA_ColumnDef`）、`alterColumnName`（DROP/RENAME COLUMN 的源列）、`newName`
+  （`RENAME TO` 的新表名 / `RENAME COLUMN` 的新列名）、`pkColumns[]`（`ADD PRIMARY KEY` 的列清单）。
 - 每个节点携带源位置（行:列，1 起），供语义错误与诊断定位。
 
 ## 7. Plan 节点结构
 
 - `CELLA_PlanNode{op, detail, extra[], line, col, pred?, onExpr?, joinKind?, children[]}`。
 - 算子：`CreateTable` `Insert` `Delete(filter)` `SeqScan` `Filter(pred)` `Project` `Sort` `Limit`
-  `Page(page,size,offset)` `Aggregate(grouped, aggs)` `Join(kind,on)` `Union` `Distinct` `Update` `DropTable`。
+  `Page(page,size,offset)` `Aggregate(grouped, aggs)` `Join(kind,on)` `Union` `Distinct` `Update` `DropTable`
+  `AlterTable(action)` `TruncateTable`。
   `Aggregate` 的 `detail` 形如 `(grouped: region) aggs: COUNT(*), COUNT(amount)`；
   无分组键时 `detail` 为 `(no group key)`。
+- `AlterTable` / `TruncateTable` 的打印形态（`extra` 逐行）：
+
+  ```
+  AlterTable                    TruncateTable
+    table: student                table: student
+    action: ADD COLUMN
+    column: note VARCHAR(10) NOT NULL
+  ```
+
+  `action` 取 `ADD COLUMN` / `DROP COLUMN` / `RENAME COLUMN` / `RENAME TO` /
+  `ADD PRIMARY KEY` / `DROP PRIMARY KEY`；`RENAME COLUMN` 另带 `new_name:`，
+  `ADD PRIMARY KEY` 的列清单打印为 `columns: a, b`。
 - 转换规则：`get ... in t limit c` → `Project → Filter(c) → SeqScan(t)`；
   无条件 `delete` → `Delete → SeqScan`；`get *` 省略 Project；
   查询自下而上：SeqScan → Join → Filter(limit) → Aggregate → Filter(having) → Project → Distinct → Sort → Limit(among) → Union。
@@ -199,7 +231,9 @@ const_expr  := NUMBER | STRING | DATE | NULL | TRUE | FALSE ;
 
 | 非终结符 | FIRST |
 |---|---|
-| statement | CREATE, INSERT, GET, DELETE, UPDATE, DROP |
+| statement | CREATE, INSERT, GET, DELETE, UPDATE, DROP, ALTER, TRUNCATE |
+| alter_action | ADD, DROP, RENAME |
+| alter 的 RENAME 之后 | TO（表改名）/ COLUMN（列改名） |
 | expr / or / and / not | NOT, IDENTIFIER, CONST, `(`, `-` |
 | comparison 之后 | `= == != <> < <= > >=` |
 | select_list | `*`, NOT, IDENTIFIER, CONST, `(`, `-` |

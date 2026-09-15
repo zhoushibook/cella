@@ -57,6 +57,9 @@ namespace cella
         CELLA_DataType type = CELLA_DataType::INT;
         int len = 0; // CHAR/VARCHAR 长度（非字符类型为 0）
         bool notNull = false;
+        // 主键列（P5）。编译器侧只用于「至多一个主键 / 已有主键」这类判断，
+        // 不参与打印，因此不影响任何既有输出。权威来源仍是 cella_catalog 的列编码。
+        bool primaryKey = false;
     };
 
     // 二级索引（P1.2）：语义层的轻量登记，真实元数据落在 cella_db 的 cella_index 系统表
@@ -113,6 +116,24 @@ namespace cella
         }
 
         bool dropTable(const std::string &name) { return tables.erase(cella_toUpper(name)) > 0; }
+
+        // 表改名（P5）：键与表内 name 一起改。新名已存在返回 false。
+        bool renameTable(const std::string &oldName, const std::string &newName)
+        {
+            const std::string oldKey = cella_toUpper(oldName);
+            const std::string newKey = cella_toUpper(newName);
+            auto it = tables.find(oldKey);
+            if (it == tables.end() || tables.count(newKey) != 0)
+                return false;
+            CELLA_Table moved = std::move(it->second);
+            tables.erase(it);
+            moved.name = newName;
+            // 索引元数据里的 table 也指向新名（语义层靠它做索引归属判断）
+            for (auto &ix : moved.indexes)
+                ix.table = newName;
+            tables.emplace(newKey, std::move(moved));
+            return true;
+        }
 
         // 只读遍历（语义层用于全局索引名查重 / 反查所属表）
         const std::map<std::string, CELLA_Table> &allTables() const { return tables; }

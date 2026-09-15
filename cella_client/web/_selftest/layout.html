@@ -1,18 +1,21 @@
 <!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>layout splitter test</title>
-<style>iframe{width:1240px;height:820px;border:1px solid #ccc}pre{font:12px monospace}</style>
+<style>iframe{width:1240px;height:820px;border:1px solid #ccc}pre{font:12px monospace;white-space:pre-wrap}</style>
 </head><body>
 <iframe id="f" src="/"></iframe>
 <pre id="out">RUNNING</pre>
 <script type="module">
 import { loadNum, saveNum, makeSplitter } from '/assets/js/ui.js';
 const L = [];
-const ok = (n, c) => L.push((c ? 'PASS ' : 'FAIL ') + n);
+const outEl = document.getElementById('out');
+// 断言结果**立即回写**：中途抛异常时页面里留下的是「跑到哪儿了」而不是一句 RUNNING
+const flush = () => { outEl.textContent = L.join('\n'); };
+const ok = (n, c) => { L.push((c ? 'PASS ' : 'FAIL ') + n); flush(); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function until(fn, ms = 8000) {
   const t0 = Date.now();
   for (;;) {
-    try { const v = fn(); if (v) return v; } catch (e) { /* 继续等 */ }
+    try { const v = await fn(); if (v) return v; } catch (e) { /* 继续等 */ }
     if (Date.now() - t0 > ms) return null;
     await sleep(100);
   }
@@ -44,7 +47,23 @@ ok('loadNum 缺省值', loadNum('__t', 42, 0, 999) === 42);
 // ── ③ 真实页面里的四条可拖拽边 ───────────────────────────
 const f = document.getElementById('f');
 let started = false;
-f.addEventListener('load', async () => { if (!started) { started = true; await run(); } });
+async function boot() {
+  if (started) return;
+  started = true;
+  try {
+    // 不能信 iframe 的 readyState（src 还没开始加载时里面的 about:blank 就是 complete），
+    // 直接轮询 app 的调试句柄；load 可能在模块脚本注册监听前就已触发，故另加兜底定时器。
+    const w = await until(() => (f.contentWindow && f.contentWindow.__cella) || null, 20000);
+    ok('iframe 已加载出 app（__cella 就绪）', !!w);
+    if (!w) { flush(); return; }
+    await run();
+  } catch (e) {
+    L.push('FAIL [异常] ' + (e && e.stack ? e.stack.split('\n').slice(0, 3).join(' | ') : e));
+    flush();
+  }
+}
+f.addEventListener('load', boot);
+setTimeout(boot, 3000);
 
 const dragSeq = (target, doc, steps) => {          // steps: [[dx,dy],...] 相对按下点的累计位移
   target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: 200, clientY: 200 }));
@@ -62,7 +81,22 @@ const cssVar = (doc, name) => doc.documentElement.style.getPropertyValue(name).t
 
 async function run() {
   const w = f.contentWindow, d = f.contentDocument;
-  await until(() => d.querySelector('.treenode.tbl'));
+
+  // 自建一张有数据的表再开测。原来直接点树里第一个表节点，隐含假设「数据目录里
+  // 恰好有一张有数据的表」—— 空库时行网格里一条记录都没有，下面取
+  // tr[data-r="0"] 会拿到 null 直接抛异常，整套断言连一条都出不来。
+  const seed = 'lay_seed';
+  await fetch('/api/query', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    body: JSON.stringify({
+      sql: `drop table ${seed};create table ${seed}(id INT PRIMARY KEY, v INT);` +
+           `insert into ${seed} values (1, 10);insert into ${seed} values (2, 20);`,
+    }),
+  });
+  await w.__cella.fullRefresh();
+  await until(() => [...d.querySelectorAll('.treenode.tbl')].some((n) => n.textContent === seed));
+
   w.confirm = () => true;
   const lay = w.__cella.layout;
   lay.reset();                                     // 先回到默认，避免上一轮偏好串场
@@ -128,14 +162,22 @@ async function run() {
   dbl(ed.querySelector('.edresize'), d);
   ok('编辑器复位 168', ed.style.height === '168px');
 
+  // /api/query 要等命令返回后再往下（上面没 await 会在建表完成前就刷新目录）
+  await until(() => d.querySelector('.treenode.tbl'));
+  await until(() => [...d.querySelectorAll('.treenode.tbl')].some((n) => n.textContent === seed));
+
   // 网格行高 / 行号列宽（在数据标签里）
-  d.querySelector('.treenode.tbl').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  [...d.querySelectorAll('.treenode.tbl')].find((n) => n.textContent === seed)
+    .dispatchEvent(new MouseEvent('click', { bubbles: true }));
   await until(() => d.querySelector('.databar td, .databar'));
-  await until(() => d.querySelectorAll('td.ck input[data-ck]').length > 0);
+  await until(() => d.querySelectorAll('tr[data-r="0"]').length > 0);
   const grid = w.__cella.state$().tabs.find((t) => t.type === 'data').ui.grid;
   grid.resetLayout();
   const table = d.querySelector('.gridwrap table.grid');
-  const h0 = d.querySelector('tr[data-r="0"]').offsetHeight;
+  const row0 = await until(() => d.querySelector('tr[data-r="0"]'));
+  ok('种子表的数据行已渲染', !!row0);
+  if (!row0) { flush(); return; }
+  const h0 = row0.offsetHeight;
   ok('行高默认 26（实测行高 ' + h0 + 'px）', Math.abs(h0 - 26) <= 1);
   drag(d.querySelector('th.rownum .rowresize'), d, 0, 14);
   const h1 = d.querySelector('tr[data-r="0"]').offsetHeight;
@@ -156,7 +198,14 @@ async function run() {
     ['sidebarW', 'panelH', 'editorH', 'rowH', 'rownumW']
       .every((k) => w.localStorage.getItem('cella.ui.' + k) !== null));
 
-  document.getElementById('out').textContent = L.join('\n');
+  flush();
+
+  // 收尾：种子表用完即删
+  await fetch('/api/query', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    body: JSON.stringify({ sql: `drop table ${seed};` }),
+  });
 }
 </script>
 </body></html>

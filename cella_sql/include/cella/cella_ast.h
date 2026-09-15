@@ -174,13 +174,27 @@ namespace cella
             UPDATE,
             DROP_TABLE,
             CREATE_INDEX,
-            DROP_INDEX
+            DROP_INDEX,
+            ALTER_TABLE,    // ALTER TABLE（P5：加列/删列/改名/主键）
+            TRUNCATE_TABLE  // TRUNCATE TABLE（P5：快速清空）
+        };
+
+        // ALTER TABLE 的动作子类（P5）。一个语句只带一个动作 —— 与标准 SQL 一致，
+        // 也让解析器不必为「多个逗号分隔动作」设计回滚语义。
+        enum class AlterAction
+        {
+            ADD_COLUMN,       // ADD [COLUMN] <col> <type> [(len)] [NOT NULL]
+            DROP_COLUMN,      // DROP [COLUMN] <col>
+            RENAME_TABLE,     // RENAME TO <new_table>
+            RENAME_COLUMN,    // RENAME COLUMN <old> TO <new>
+            ADD_PRIMARY_KEY,  // ADD PRIMARY KEY ( <col> [, <col>]* )
+            DROP_PRIMARY_KEY  // DROP PRIMARY KEY
         };
 
         Kind kind = Kind::CREATE_TABLE;
         int line = 0, col = 0;
 
-        // CREATE TABLE / DELETE / UPDATE / DROP TABLE 共用
+        // CREATE TABLE / DELETE / UPDATE / DROP TABLE / ALTER TABLE / TRUNCATE TABLE 共用
         std::string tableName;
 
         // CREATE TABLE
@@ -222,6 +236,13 @@ namespace cella
         std::string indexColumn; // 被索引的列（单列 = 列名；复合 = "a,b" 逗号拼接，
                                  // 兼容既有打印/golden 输出；新代码请用 indexColumns）
         std::vector<std::string> indexColumns; // 复合索引的列清单（按声明序，≥1 项）
+
+        // ── ALTER TABLE（P5）────────────────────────────────────
+        AlterAction alterAction = AlterAction::ADD_COLUMN;
+        CELLA_ColumnDef newColumn;            // ADD COLUMN：新列定义（复用列定义解析）
+        std::string alterColumnName;          // DROP COLUMN / RENAME COLUMN 的源列名
+        std::string newName;                  // RENAME TO 的新表名 / RENAME COLUMN 的新列名
+        std::vector<std::string> pkColumns;   // ADD PRIMARY KEY ( ... ) 的主键列清单
     };
 
     struct CELLA_Program

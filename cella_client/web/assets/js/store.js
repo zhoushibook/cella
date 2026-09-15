@@ -40,3 +40,11 @@ export function pkOf(table) {
   if (!table) return [];
   return (table.primaryKey && table.primaryKey.columns) || [];
 }
+
+// 标签归属的表名（小写；空串 = 这个标签不绑定表）。
+// 两种引用形态要统一：数据/结构标签存**名字**，设计标签（P5.6）存**完整表对象**。
+export function tableNameOf(tab) {
+  const t = tab && tab.table;
+  if (!t) return '';
+  return String(typeof t === 'string' ? t : t.name || '').toLowerCase();
+}

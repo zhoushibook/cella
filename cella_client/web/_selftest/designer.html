@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>designer test</title>
+<style>body{display:block;overflow:auto}iframe{position:fixed;left:-2000px;top:0;width:1240px;height:820px;border:0}pre{font:12px monospace;padding:12px}</style>
+</head><body>
+<iframe id="f" src="/"></iframe>
+<pre id="out">RUNNING</pre>
+<script type="module">
+// designer.html —— 表设计器（P5.6）自测。
+//
+// 分两层：
+//   ① 纯函数层：直接 import diffSchema/typeSql/deleteColumn，断言「编辑 → 语句序列」的
+//      差分正确性（顺序约束、改名识别、墓碑行的删列、能力边界报错、新建表形态）。
+//   ② 集成层：在 iframe 里驱动真实页面 —— 打开设计器 → 改列名/加列 → 点「执行改动」→
+//      用 /api/catalog 校验真实结构已经变了，并且老数据还在。
+import { diffSchema, typeSql, columnsFromCatalog, newColumn, deleteColumn } from '/assets/js/designer.js';
+
+const L = [];
+const outEl = document.getElementById('out');
+// 断言结果**立即回写**：任何一步抛异常时，页面里留下的也是「已跑到哪儿」，
+// 而不是一句无信息量的 RUNNING（headless 抓 DOM 排查全靠这个）。
+const flush = () => { outEl.textContent = L.join('\n'); };
+const ok = (n, c) => { L.push((c ? 'PASS ' : 'FAIL ') + n); flush(); };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 8000) {
+  const t0 = Date.now();
+  for (;;) {
+    try { const v = await fn(); if (v) return v; } catch (e) { /* 继续等 */ }
+    if (Date.now() - t0 > ms) return null;
+    await sleep(100);
+  }
+}
+
+// 造一个「目录形态」的表对象（与 /api/catalog/{t} 的字段一致）
+const tbl = (name, cols) => ({
+  name,
+  columns: cols.map((c, i) => ({
+    name: c.name,
+    type: c.type,
+    len: c.len || 0,
+    notNull: !!c.notNull,
+    primaryKey: !!c.primaryKey,
+    ordinal: i + 1,
+  })),
+});
+
+// 由「目录列清单」造出设计器模型，然后按 patch 覆盖（模拟用户在界面上改）
+function edit(table, patch) {
+  const cols = columnsFromCatalog(table);
+  for (const p of patch || []) Object.assign(cols[p.i], p.set);
+  return cols;
+}
+// 按列名删（墓碑），返回模型
+function drop(table, names) {
+  const cols = columnsFromCatalog(table);
+  for (const n of names) {
+    const i = cols.findIndex((c) => c.name.toLowerCase() === n.toLowerCase());
+    if (i >= 0) deleteColumn(cols, i);
+  }
+  return cols;
+}
+
+// ── ① 纯函数：类型文本 ───────────────────────────────────
+ok('typeSql INT 无长度', typeSql({ type: 'INT', len: 0 }) === 'INT');
+ok('typeSql VARCHAR 默认 255', typeSql({ type: 'VARCHAR' }) === 'VARCHAR(255)');
+ok('typeSql CHAR 用声明长度', typeSql({ type: 'CHAR', len: 8 }) === 'CHAR(8)');
+
+// ── ② 无变化 → 不产出语句 ────────────────────────────────
+{
+  const t = tbl('s', [{ name: 'id', type: 'INT', primaryKey: true }, { name: 'v', type: 'INT' }]);
+  const d = diffSchema('s', edit(t));
+  ok('结构未变 → 0 条语句', d.statements.length === 0 && d.errors.length === 0);
+}
+
+// ── ③ 加列 / 删列 ────────────────────────────────────────
+{
+  const t = tbl('s', [{ name: 'id', type: 'INT', primaryKey: true }, { name: 'v', type: 'INT' }]);
+  let cols = drop(t, ['v']);                       // 删 v
+  const nc = newColumn('name');
+  nc.type = 'VARCHAR'; nc.len = 20;
+  cols.push(nc);                                   // 加 name VARCHAR(20)
+  const d = diffSchema('s', cols);
+  ok('删列 + 加列 → 2 条语句', d.statements.length === 2);
+  ok('DROP COLUMN 用原列名', d.statements[0].sql === 'ALTER TABLE s DROP COLUMN v;');
+  ok('ADD COLUMN 带类型长度', d.statements[1].sql === 'ALTER TABLE s ADD COLUMN name VARCHAR(20);');
+}
+
+// 删了又撤销 → 回到「无变化」
+{
+  const t = tbl('s', [{ name: 'id', type: 'INT', primaryKey: true }, { name: 'v', type: 'INT' }]);
+  const cols = drop(t, ['v']);
+  cols[1].deleted = false;
+  ok('撤销删除后无语句', diffSchema('s', cols).statements.length === 0);
+}
+
+// 加列 NOT NULL → 带 NOT NULL 且给出「非空表会失败」的告警
+{
+  const t = tbl('s', [{ name: 'id', type: 'INT', primaryKey: true }]);
+  const cols = edit(t);
+  const nc = newColumn('age');
+  nc.notNull = true;
+  cols.push(nc);
+  const d = diffSchema('s', cols);
+  ok('ADD COLUMN NOT NULL 文本正确', d.statements[0].sql === 'ALTER TABLE s ADD COLUMN age INT NOT NULL;');
+  ok('ADD COLUMN NOT NULL 有告警', d.warnings.some((w) => w.includes('已有数据')));
+}
+
+// ── ④ 改名（按行身份识别，不是 DROP+ADD）─────────────────
+{
+  const t = tbl('s', [{ name: 'id', type: 'INT', primaryKey: true }, { name: 'name', type: 'VARCHAR', len: 20 }]);
+  const cols = edit(t, [{ i: 1, set: { name: 'sname' } }]);
+  const d = diffSchema('s', cols);
+  ok('改名只产出一条 RENAME（不会被误当成 DROP+ADD）', d.statements.length === 1 &&
+    d.statements[0].sql === 'ALTER TABLE s RENAME COLUMN name TO sname;');
+}
+
+// 改名链 a→b, b→c：拓扑排序后必须能全部执行（而不是卡在「目标名被占」）
+{
+  const t = tbl('s', [{ name: 'a', type: 'INT' }, { name: 'b', type: 'INT' }]);
+  const cols = edit(t, [{ i: 0, set: { name: 'b' } }, { i: 1, set: { name: 'c' } }]);
+  const d = diffSchema('s', cols);
+  ok('改名链无错且 2 条', d.errors.length === 0 && d.statements.length === 2);
+  ok('改名链先腾出 b 再占 b', d.statements[0].sql === 'ALTER TABLE s RENAME COLUMN b TO c;' &&
+    d.statements[1].sql === 'ALTER TABLE s RENAME COLUMN a TO b;');
+}
+
+// 改名成环 a→b, b→a：报错而不是发出一条注定失败的语句
+{
+  const t = tbl('s', [{ name: 'a', type: 'INT' }, { name: 'b', type: 'INT' }]);
+  const cols = edit(t, [{ i: 0, set: { name: 'b' } }, { i: 1, set: { name: 'a' } }]);
+  const d = diffSchema('s', cols);
+  ok('改名互换 → 报错', d.errors.some((e) => e.includes('分两次执行')));
+}
+
+// ── ⑤ 主键差异 ───────────────────────────────────────────
+{
+  const t = tbl('s', [{ name: 'id', type: 'INT', primaryKey: true }, { name: 'v', type: 'INT' }]);
+  // 主键列改名 → 主键没变，不该产出 DROP/ADD PRIMARY KEY（引擎会随改名同步索引）
+  const d1 = diffSchema('s', edit(t, [{ i: 0, set: { name: 'uid' } }]));
+  ok('主键列改名不触发主键重建', d1.statements.length === 1 &&
+    d1.statements[0].sql === 'ALTER TABLE s RENAME COLUMN id TO uid;');
+
+  // 换成另一列做主键 → DROP PRIMARY KEY 在 ADD 之前
+  const moved = edit(t, [{ i: 0, set: { primaryKey: false, notNull: true } }, { i: 1, set: { primaryKey: true, notNull: true } }]);
+  const d2 = diffSchema('s', moved);
+  ok('换主键 → DROP PRIMARY KEY + ADD PRIMARY KEY',
+    d2.statements.map((s) => s.kind).join(',') === 'DROP PRIMARY KEY,ADD PRIMARY KEY');
+  ok('ADD PRIMARY KEY 列出新列',
+    d2.statements[1].sql === 'ALTER TABLE s ADD PRIMARY KEY (v);');
+
+  // 去掉主键 → 只有 DROP
+  const d3 = diffSchema('s', edit(t, [{ i: 0, set: { primaryKey: false } }]));
+  ok('去掉主键 → 只有 DROP PRIMARY KEY', d3.statements.length === 1 &&
+    d3.statements[0].sql === 'ALTER TABLE s DROP PRIMARY KEY;');
+
+  // 无主键表加主键 → 只有 ADD
+  const t2 = tbl('u', [{ name: 'id', type: 'INT' }, { name: 'v', type: 'INT' }]);
+  const d4 = diffSchema('u', edit(t2, [{ i: 0, set: { primaryKey: true, notNull: true } }]));
+  ok('无主键表加主键 → 只有 ADD PRIMARY KEY', d4.statements.length === 1 &&
+    d4.statements[0].sql === 'ALTER TABLE u ADD PRIMARY KEY (id);');
+  ok('加主键给出唯一性告警', d4.warnings.some((w) => w.includes('无重复')));
+}
+
+// 删主键列：DROP PRIMARY KEY 必须排在 DROP COLUMN 前面（否则引擎会拒绝）
+{
+  const t = tbl('s', [{ name: 'id', type: 'INT', primaryKey: true }, { name: 'v', type: 'INT' }]);
+  const d = diffSchema('s', drop(t, ['id']));
+  ok('删主键列：先 DROP PRIMARY KEY 后 DROP COLUMN',
+    d.errors.length === 0 &&
+    d.statements.map((s) => s.kind).join(',') === 'DROP PRIMARY KEY,DROP COLUMN');
+}
+
+// ── ⑥ 能力边界与校验 ─────────────────────────────────────
+{
+  const t = tbl('s', [{ name: 'id', type: 'INT', primaryKey: true }, { name: 'v', type: 'INT' }]);
+  ok('改已有列类型 → 报错（引擎不支持）',
+    diffSchema('s', edit(t, [{ i: 1, set: { type: 'VARCHAR', len: 10 } }]))
+      .errors.some((e) => e.includes('不支持修改列的类型')));
+  ok('把已有列改成 NOT NULL → 报错',
+    diffSchema('s', edit(t, [{ i: 1, set: { notNull: true } }]))
+      .errors.some((e) => e.includes('不支持把已有列改成 NOT NULL')));
+  ok('列名重复 → 报错',
+    diffSchema('s', edit(t, [{ i: 1, set: { name: 'ID' } }])).errors.some((e) => e.includes('列名重复')));
+  ok('rowid 作列名 → 报错',
+    diffSchema('s', edit(t, [{ i: 1, set: { name: 'rowid' } }])).errors.some((e) => e.includes('rowid')));
+  ok('非法列名 → 报错',
+    diffSchema('s', edit(t, [{ i: 1, set: { name: '1bad' } }])).errors.some((e) => e.includes('非法')));
+  ok('删到剩一列不报错（表仍有一列）',
+    diffSchema('s', drop(t, ['v'])).errors.length === 0);
+  ok('删光所有列 → 报错',
+    diffSchema('s', drop(t, ['v', 'id'])).errors.some((e) => e.includes('至少要有一列')));
+}
+
+// ── ⑦ 新建表形态：没有任何已有列 → CREATE TABLE ──────────
+{
+  const cols = [newColumn('id'), newColumn('name')];
+  cols[0].primaryKey = true; cols[0].notNull = true;
+  cols[1].type = 'VARCHAR'; cols[1].len = 32;
+  const d = diffSchema('t_new', cols);
+  ok('全新增 → CREATE TABLE', d.statements.length === 1 && d.statements[0].kind === 'CREATE TABLE');
+  ok('CREATE TABLE 展开列定义', d.statements[0].sql ===
+    'CREATE TABLE t_new(\n  id INT PRIMARY KEY,\n  name VARCHAR(32)\n);');
+}
+
+// ─────────────────────────────────────────────────────────
+// 集成层：真实页面 + 真实引擎
+// ─────────────────────────────────────────────────────────
+const NS = 'dsg_demo';
+async function q(sql) {
+  const r = await fetch('/api/query', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    body: JSON.stringify({ sql }),
+  });
+  const j = await r.json();
+  return j.data;
+}
+// /api/catalog/{t} 的 data 就是表对象本身（api.js 的 call 已解出 data）
+async function catalog(t) {
+  const r = await fetch('/api/catalog/' + encodeURIComponent(t));
+  return (await r.json()).data;
+}
+const colNames = (t) => (t.columns || []).map((c) => c.name).join(',');
+const colOf = (t, n) => (t.columns || []).find((c) => c.name.toLowerCase() === n.toLowerCase());
+const fire = (el, type) => el.dispatchEvent(new Event(type, { bubbles: true }));
+
+const f = document.getElementById('f');
+let started = false;
+async function boot() {
+  if (started) return;
+  started = true;
+  try {
+    // 不能信 iframe 的 readyState：src 还没开始加载时，里面的 about:blank 就已经是
+    // complete 了，照着它跑只会拿到一个空文档（__cella / 树节点全都没有）。
+    // 所以直接轮询真正需要的东西 —— app 的调试句柄。
+    const w = await until(() => (f.contentWindow && f.contentWindow.__cella) || null, 20000);
+    ok('iframe 已加载出 app（__cella 就绪）', !!w);
+    if (!w) { flush(); return; }
+    await run();
+  } catch (e) {
+    L.push('FAIL [异常] ' + (e && e.stack ? e.stack.split('\n').slice(0, 3).join(' | ') : e));
+    flush();
+  }
+}
+f.addEventListener('load', boot);
+// 兜底：load 可能在模块脚本注册监听前就已经触发过（模块是 defer 的）
+setTimeout(boot, 3000);
+
+async function run() {
+  const w = f.contentWindow, d = f.contentDocument;
+
+  // headless 下 alert 会挂住页面 —— 换成记录，顺便把设计器报的错留在结果里
+  w.alert = (m) => { L.push('INFO [alert] ' + String(m).split('\n')[0]); flush(); };
+
+  // 造一张有数据的表（隔离用：前缀 dsg_）
+  await q(`drop table ${NS};`);
+  await q(`create table ${NS} (id INT PRIMARY KEY, name VARCHAR(20) NOT NULL);`);
+  await q(`insert into ${NS} values (1, 'amy'), (2, 'bob');`);
+
+  await until(() => d.querySelector('.treenode.tbl'));
+  ok('表树里能看到新建的 dsg_demo', !!d.querySelector('.treenode.tbl'));
+
+  // 打开设计器（走真实入口）
+  await w.__cella.fullRefresh();
+  await w.__cella.actions.openDesigner(NS);
+  const pane = await until(() => d.querySelector('#tabbody .designer'));
+  ok('打开设计表结构标签', !!pane);
+  if (!pane) { flush(); return; }
+  ok('设计器列出两列', pane.querySelectorAll('.dsggrid tbody tr').length === 2);
+  ok('初始无改动 → 执行按钮禁用', pane.querySelector('[data-act="apply"]').disabled === true);
+  ok('初始预览显示「没有结构变化」',
+    pane.querySelector('.dsgsql').textContent.includes('没有结构变化'));
+
+  // 改第二列名字 name → sname
+  const nameIn = pane.querySelectorAll('.dsggrid tbody tr')[1].querySelector('input[data-f="name"]');
+  nameIn.value = 'sname';
+  fire(nameIn, 'input');
+  await sleep(50);
+  ok('改名后预览出现 RENAME COLUMN',
+    pane.querySelector('.dsgsql').textContent.includes('RENAME COLUMN name TO sname'));
+  ok('改名后执行按钮可用', pane.querySelector('[data-act="apply"]').disabled === false);
+
+  // 再加一列 age INT（改完名字再输一遍，因为 select 变更会重绘行）
+  pane.querySelector('[data-act="add"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await sleep(50);
+  const rows2 = pane.querySelectorAll('.dsggrid tbody tr');
+  ok('新增列后变为三行', rows2.length === 3);
+  const newName = rows2[rows2.length - 1].querySelector('input[data-f="name"]');
+  newName.value = 'age';
+  fire(newName, 'input');
+  await sleep(80);
+
+  // 执行。注意「执行完成」的判据不是「3 行」—— 加过列之后本来就有 3 行，那样的
+  // 等待会立刻满足并拿到**执行前**的旧面板。真正的终态是：列名已按新结构重载 +
+  // 预览归零 + 按钮禁用（onApplied → reload → renderRows → refresh 跑完）。
+  pane.querySelector('[data-act="apply"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  const settled = await until(() => {
+    const p = d.querySelector('#tabbody .designer');
+    if (!p) return null;
+    const names = [...p.querySelectorAll('input[data-f="name"]')].map((i) => i.value).join(',');
+    const done = names === 'id,sname,age' &&
+      p.querySelector('[data-act="apply"]').disabled &&
+      p.querySelector('.dsgsql').textContent.includes('没有结构变化');
+    return done ? p : null;
+  }, 12000);
+  ok('执行后设计器按新结构重载（id, sname, age 且预览归零）', !!settled);
+
+  const after = await catalog(NS);
+  ok('目录里的结构就是 id, sname, age', colNames(after) === 'id,sname,age');
+  if (after) {
+    // 值是 JSON 形态：NULL 到这里就是 null，直接 join 会变成空串 → 显式归一成 NULL 再比
+    const norm = (rows) =>
+      rows.map((r) => r.map((v) => (v === null || v === undefined ? 'NULL' : v)).join('|')).join('\n');
+    ok('老数据仍在且改名后取值正确',
+      norm((await q(`get * in ${NS} ordered id asc;`)).statements[0].rows) === '1|amy|NULL\n2|bob|NULL');
+    ok('主键标记保留', !!colOf(after, 'id').primaryKey);
+    ok('新列可空', colOf(after, 'age').notNull === false);
+  }
+
+  const reloaded = settled;
+  if (reloaded) {
+    ok('重载后列名就是新结构（id, sname, age）',
+      [...reloaded.querySelectorAll('input[data-f="name"]')].map((i) => i.value).join(',') === 'id,sname,age');
+    ok('重载后无待执行改动（按钮回到禁用）', reloaded.querySelector('[data-act="apply"]').disabled === true);
+    ok('重载后预览显示「没有结构变化」',
+      reloaded.querySelector('.dsgsql').textContent.includes('没有结构变化'));
+  }
+
+  // 能力边界：界面上把已有列改成 NOT NULL → 立刻给出错误提示且禁止执行
+  if (reloaded) {
+    const tr = reloaded.querySelectorAll('.dsggrid tbody tr')[2];
+    const nn = tr.querySelector('input[data-f="notNull"]');
+    nn.checked = true;
+    fire(nn, 'change');
+    await sleep(80);
+    ok('已有列改 NOT NULL → 显示错误并禁用执行',
+      reloaded.querySelectorAll('.dsgerr').length === 1 &&
+      reloaded.querySelector('[data-act="apply"]').disabled === true);
+    // 重置
+    reloaded.querySelector('[data-act="reset"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await sleep(80);
+    ok('重置后错误消失、按钮禁用（无改动）',
+      reloaded.querySelectorAll('.dsgerr').length === 0 &&
+      reloaded.querySelector('[data-act="apply"]').disabled === true);
+  }
+
+  // 删除一列 → 预览出现 DROP COLUMN，界面上该行被划掉
+  if (reloaded) {
+    const r3 = reloaded.querySelectorAll('.dsggrid tbody tr');
+    r3[2].querySelector('.dsgdel').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await sleep(80);
+    ok('点删除 → 预览出现 DROP COLUMN',
+      reloaded.querySelector('.dsgsql').textContent.includes('DROP COLUMN age'));
+    const r4 = reloaded.querySelectorAll('.dsggrid tbody tr');
+    ok('删除行仍在表里且被标记', r4.length === 3 && r4[2].classList.contains('del'));
+    // 撤销
+    r4[2].querySelector('.dsgdel').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await sleep(80);
+    ok('撤销删除后回到「无变化」',
+      reloaded.querySelector('.dsgsql').textContent.includes('没有结构变化'));
+  }
+
+  // 通过「查看结构」面板的按钮也能进设计器
+  await w.__cella.actions.openStruct(NS);
+  await until(() => d.querySelector('.structmeta'));
+  const dbtn = await until(() => d.querySelector('[data-act="design"]'), 4000);
+  ok('结构面板带「设计表结构」入口', !!dbtn);
+
+  // 清理
+  await q(`drop table ${NS};`);
+  await w.__cella.fullRefresh();
+
+  flush();
+}
+</script>
+</body></html>

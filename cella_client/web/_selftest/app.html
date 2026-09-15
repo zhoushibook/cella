@@ -233,14 +233,15 @@ async function run() {
   ok('数据工具条带取数耗时（' + (dataChip ? dataChip.textContent.trim() : '无') + '）',
     !!dataChip && /⏱/.test(dataChip.textContent) && /ms/.test(dataChip.textContent));
 
-  // ⑩ 右键表名 → 菜单 6 项（含「生成 SELECT」）
+  // ⑩ 右键表名 → 菜单 7 项（含「设计表结构」与「生成 SELECT」）
   const tn = [...d.querySelectorAll('.treenode.tbl')].find((t) => t.textContent === scratch);
   tn.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 60, clientY: 120 }));
   await sleep(150);
   const menu = d.querySelector('.ctxmenu');
-  ok('右键菜单弹出且 6 项含「生成 SELECT」',
-    !!menu && menu.children.length === 6 && menu.textContent.includes('生成 SELECT'));
-  if (menu) menu.children[3].dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  ok('右键菜单弹出且 7 项含「设计表结构」+「生成 SELECT」',
+    !!menu && menu.children.length === 7 && menu.textContent.includes('设计表结构') &&
+    menu.textContent.includes('生成 SELECT'));
+  if (menu) menu.children[4].dispatchEvent(new MouseEvent('click', { bubbles: true }));
   await sleep(250);
   ok('「生成 SELECT」新建了查询标签', d.querySelectorAll('#tabbar .tab').length >= tabs0 + 1);
 

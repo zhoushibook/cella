@@ -74,6 +74,10 @@ namespace cella::db
         return "CREATE INDEX";
       case cella::CELLA_Stmt::Kind::DROP_INDEX:
         return "DROP INDEX";
+      case cella::CELLA_Stmt::Kind::ALTER_TABLE:
+        return "ALTER TABLE";
+      case cella::CELLA_Stmt::Kind::TRUNCATE_TABLE:
+        return "TRUNCATE TABLE";
       }
       return "?";
     }
@@ -1960,6 +1964,21 @@ namespace cella::db
       {
         ps = CheckDbPrivilege(Priv::kDrop, "DROP INDEX");
       }
+      else if (sk == cella::CELLA_Stmt::Kind::ALTER_TABLE)
+      {
+        // ALTER 按动作分档，与该动作用到的建/删能力对齐（与 CREATE/DROP INDEX 的
+        // kCreate / kDrop 约定一致）：加/改/改名 → kCreate；删（列/主键）→ kDrop。
+        const cella::CELLA_Stmt::AlterAction aa = program->statements[0]->alterAction;
+        const bool destructive =
+            (aa == cella::CELLA_Stmt::AlterAction::DROP_COLUMN ||
+             aa == cella::CELLA_Stmt::AlterAction::DROP_PRIMARY_KEY);
+        ps = CheckDbPrivilege(destructive ? Priv::kDrop : Priv::kCreate, "ALTER TABLE");
+      }
+      else if (sk == cella::CELLA_Stmt::Kind::TRUNCATE_TABLE)
+      {
+        // TRUNCATE 清空数据 → 与 DELETE 同级，要求 kDelete（且是库级，代价更大）
+        ps = CheckDbPrivilege(Priv::kDelete, "TRUNCATE TABLE");
+      }
       if (!ps.ok())
       {
         // 语义阶段可能已把这张（不存在的）表登记进编译器目录副本 → 必须复位，
@@ -1983,11 +2002,13 @@ namespace cella::db
     }
 
     // ── ④ 事务上下文：显式事务优先，否则为单语句开自动提交事务 ──
-    // DDL 例外：建表/删表/建删索引会立即改写目录（元数据无法回滚），故按 MySQL 惯例
-    // 先隐式提交前置事务，再以自动提交方式执行 DDL，避免出现「目录已改、事务回滚」
-    // 造成的元数据与数据不一致。
+    // DDL 例外：建表/删表/建删索引/ALTER/TRUNCATE 都会立即改写目录或重建物理表
+    // （元数据无法回滚），故按 MySQL 惯例先隐式提交前置事务，再以自动提交方式
+    // 执行 DDL，避免出现「目录已改、事务回滚」造成的元数据与数据不一致。
+    // TRUNCATE 也归入 DDL：它的语义就是「不可回滚的快速清空」（MySQL 亦然）。
     const bool is_ddl = (out->kind == "CREATE TABLE" || out->kind == "DROP TABLE" ||
-                         out->kind == "CREATE INDEX" || out->kind == "DROP INDEX");
+                         out->kind == "CREATE INDEX" || out->kind == "DROP INDEX" ||
+                         out->kind == "ALTER TABLE" || out->kind == "TRUNCATE TABLE");
     if (is_ddl && in_transaction())
     {
       const txn_id_t prev = txn_;

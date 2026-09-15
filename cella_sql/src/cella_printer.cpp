@@ -351,6 +351,44 @@ namespace cella
                 os << indent(level) << "DropIndexStmt @" << st.line << ":" << st.col
                    << "  name=" << st.indexName << "\n";
                 break;
+            case CELLA_Stmt::Kind::ALTER_TABLE:
+                os << indent(level) << "AlterTableStmt @" << st.line << ":" << st.col
+                   << "  table=" << st.tableName;
+                switch (st.alterAction)
+                {
+                case CELLA_Stmt::AlterAction::ADD_COLUMN:
+                    os << "  action=ADD COLUMN  column=" << st.newColumn.name << " "
+                       << columnTypeText(st.newColumn) << "\n";
+                    break;
+                case CELLA_Stmt::AlterAction::DROP_COLUMN:
+                    os << "  action=DROP COLUMN  column=" << st.alterColumnName << "\n";
+                    break;
+                case CELLA_Stmt::AlterAction::RENAME_TABLE:
+                    os << "  action=RENAME TO  new_name=" << st.newName << "\n";
+                    break;
+                case CELLA_Stmt::AlterAction::RENAME_COLUMN:
+                    os << "  action=RENAME COLUMN  column=" << st.alterColumnName
+                       << "  new_name=" << st.newName << "\n";
+                    break;
+                case CELLA_Stmt::AlterAction::ADD_PRIMARY_KEY:
+                    os << "  action=ADD PRIMARY KEY  columns=[";
+                    for (size_t i = 0; i < st.pkColumns.size(); i++)
+                    {
+                        if (i)
+                            os << ",";
+                        os << st.pkColumns[i];
+                    }
+                    os << "]\n";
+                    break;
+                case CELLA_Stmt::AlterAction::DROP_PRIMARY_KEY:
+                    os << "  action=DROP PRIMARY KEY\n";
+                    break;
+                }
+                break;
+            case CELLA_Stmt::Kind::TRUNCATE_TABLE:
+                os << indent(level) << "TruncateTableStmt @" << st.line << ":" << st.col
+                   << "  table=" << st.tableName << "\n";
+                break;
             }
         }
 

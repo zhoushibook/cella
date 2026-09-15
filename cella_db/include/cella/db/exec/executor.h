@@ -244,6 +244,10 @@ class Executor : public wal::IUndoApplier {
   DbStatus ExecCreateIndex(const cella::CELLA_PlanNode& plan, const ExecContext& ctx,
                            QueryResult* out);
   DbStatus ExecDropIndex(const cella::CELLA_PlanNode& plan, const ExecContext& ctx, QueryResult* out);
+  // ── P5：DDL 演进 ────────────────────────────────────────────
+  DbStatus ExecAlterTable(const cella::CELLA_PlanNode& plan, const ExecContext& ctx, QueryResult* out);
+  DbStatus ExecTruncateTable(const cella::CELLA_PlanNode& plan, const ExecContext& ctx,
+                             QueryResult* out);
   DbStatus ExecInsert(const cella::CELLA_PlanNode& plan, const ExecContext& ctx, QueryResult* out);
   DbStatus ExecDelete(const cella::CELLA_PlanNode& plan, const ExecContext& ctx, QueryResult* out);
   DbStatus ExecUpdate(const cella::CELLA_PlanNode& plan, const ExecContext& ctx, QueryResult* out);
@@ -300,6 +304,63 @@ class Executor : public wal::IUndoApplier {
   static std::string PrimaryIndexName(const std::string& table);
   // 该表当前是否已有主键自动索引
   bool HasPrimaryIndex(const std::string& table) const;
+
+  // ── ALTER TABLE / TRUNCATE 的重建原语（P5）────────────────────
+  // 「整表重建」：把 old_meta 的物理表按 new_meta 的结构重写一遍。
+  //   col_map[i] = 新表第 i 列的数据来自旧表第几列；-1 = 新列（老行填 NULL）。
+  //   copy_rows  = false 表示只换结构不搬数据（TRUNCATE：= 原地清空并释放数据页）。
+  // 为什么必须重建（而不是原地改 schema）：记录二进制以「列数 + 位图 + 逐列值」
+  // 编码，反序列化会校验列数 ⇔ schema（见 slotted_record_serializer.cpp），
+  // 列数一变老字节流就解不出来；存储层也没有原地改列的能力。于是走
+  // 「导出全部行 → 换 schema 重建 → 按 col_map 回填」这条最直接的路径。
+  // 副作用：行定位（页号 + 槽位）全变 → 表的索引全部失效，须由调用方随后重建。
+  // 须在 storage_mutex_ 临界区内调用。new_first_page 非空时回写新表首数据页。
+  DbStatus RebuildTableRows(const CatalogTable& old_meta, const CatalogTable& new_meta,
+                            const std::vector<int>& col_map, bool copy_rows,
+                            uint32_t* new_first_page);
+
+  // 在 table 上按 cols 建一棵索引树并回填（不改任何元数据）。
+  //   unique           —— 校验列值元组无重复（重复返回 kUniqueViolation）
+  //   require_not_null —— 校验索引列无 NULL（主键用；命中返回 kNotNullViolation）
+  // 成功时 root_out 回写新树的根页号。须在 storage_mutex_ 临界区内调用。
+  DbStatus BuildIndexTree(const CatalogTable& table, const std::vector<std::string>& cols,
+                          bool unique, bool require_not_null, uint32_t* root_out);
+
+  // 重建一张表的全部（已快照的）索引：为每条索引建新树并把元数据指向新根。
+  //   rename_from/rename_to —— 表改名时同步索引的 table 字段与 <表>_pk 索引名；
+  //                           空字符串表示表名未变。
+  // 须在 storage_mutex_ 临界区内、且目录已换到新表之后调用。
+  DbStatus RebuildTableIndexes(const CatalogTable& new_meta,
+                               const std::vector<CatalogIndex>& index_metas,
+                               const std::string& rename_from, const std::string& rename_to);
+
+  // 在另一张表上执行「按表名删索引元数据」（表改名导致 <表>_pk 也要跟着改名时用）。
+  // 须在 storage_mutex_ 临界区内调用。
+  DbStatus RenameIndexMeta(const std::string& old_index_name, const CatalogIndex& index);
+
+  // ALTER TABLE 六个动作的实现。共用 ExecAlterTable 已做好的前置：
+  // 表存在性/写保护校验、排他锁、old_meta 与索引清单的快照。
+  DbStatus AlterAddColumn(const CatalogTable& old_meta,
+                          const std::vector<CatalogIndex>& indexes,
+                          const cella::CELLA_Stmt& st, QueryResult* out);
+  DbStatus AlterDropColumn(const CatalogTable& old_meta,
+                           const std::vector<CatalogIndex>& indexes,
+                           const cella::CELLA_Stmt& st, QueryResult* out);
+  DbStatus AlterRenameTable(const CatalogTable& old_meta,
+                            const std::vector<CatalogIndex>& indexes,
+                            const cella::CELLA_Stmt& st, QueryResult* out);
+  DbStatus AlterRenameColumn(const CatalogTable& old_meta,
+                             const std::vector<CatalogIndex>& indexes,
+                             const cella::CELLA_Stmt& st, QueryResult* out);
+  DbStatus AlterAddPrimaryKey(const CatalogTable& old_meta,
+                              const std::vector<CatalogIndex>& indexes,
+                              const cella::CELLA_Stmt& st, QueryResult* out);
+  DbStatus AlterDropPrimaryKey(const CatalogTable& old_meta,
+                               const std::vector<CatalogIndex>& indexes,
+                               const cella::CELLA_Stmt& st, QueryResult* out);
+
+  // 表内行数（重建前判断「老行能否补出新列的值」用）。须在 storage_mutex_ 内调用。
+  size_t CountRowsOf(const std::string& table) const;
 
   // ── WAL（P2）──────────────────────────────────────────────
   // 写一条行变更记录。rid 只取页号用于重建脏页表；行定位靠 before/after 的内容。

@@ -138,6 +138,20 @@ class CatalogManager {
   DbStatus WriteTableRow(const CatalogTable& table);
   DbStatus DeleteTableRow(const std::string& name);
 
+  // ── ALTER TABLE 支持（P5）───────────────────────────────────
+  // 整表元数据替换（支持改名）：把 old_name 的目录行与内存条目换成 table。
+  // 为什么需要它：ADD/DROP COLUMN / RENAME / ADD|DROP PRIMARY KEY 都只改「列定义」，
+  // 而 WriteTableRow 只会**追加**一行（表名相同就会出现两行目录，重启后解码出重复表）。
+  // 因此这里显式「先删旧行（新旧两个名字都清一遍）再写新行」。
+  // 表号（table_id）保持不变 —— 它是元数据的稳定身份，不应随 ALTER 变动。
+  // 须在 storage_mutex_ 临界区内调用。
+  DbStatus ReplaceTableMeta(const std::string& old_name, const CatalogTable& table);
+
+  // 整条索引元数据替换（索引改名 / 改列清单 / 换 root 页之后调用）。
+  // 实现 = 先删同名旧行（含内存条目）再写新行，因此天然幂等。
+  // 须在 storage_mutex_ 临界区内调用。
+  DbStatus ReplaceIndexMeta(const CatalogIndex& index);
+
   // 按目录条目确保物理表存在（迁移用）：open_table 成功则跳过；
   // 返回 kTableNotFound 则按列定义在存储层创建空表。须在 storage_mutex_ 临界区内调用。
   DbStatus EnsurePhysicalTable(const CatalogTable& table);

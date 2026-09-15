@@ -528,6 +528,46 @@ namespace cella
             return s;
         }
 
+        // 索引列清单的解析：与 joinIndexColumnsText 互逆。
+        // 编译器侧的 CELLA_Index 只保留持久化形态的 column 文本（无 columns 向量），
+        // 因此改名/级联判定都要先拆开再比对。
+        std::vector<std::string> splitIndexColumnsText(const std::string &joined)
+        {
+            std::vector<std::string> cols;
+            std::string cur;
+            for (char c : joined)
+            {
+                if (c == ',')
+                {
+                    if (!cur.empty())
+                        cols.push_back(cur);
+                    cur.clear();
+                }
+                else
+                {
+                    cur.push_back(c);
+                }
+            }
+            if (!cur.empty())
+                cols.push_back(cur);
+            return cols;
+        }
+
+        // 索引列清单的持久化形态：**逗号分隔且不带空格**。
+        // 必须与 cella_db 的 CatalogIndex::JoinedColumns() 逐字节一致 —— 编译器目录里
+        // 的 index.column 会被写回 cella_index 系统表，格式不一致会让重启后解码错位。
+        std::string joinIndexColumnsText(const std::vector<std::string> &v)
+        {
+            std::string s;
+            for (size_t i = 0; i < v.size(); i++)
+            {
+                if (i)
+                    s += ",";
+                s += v[i];
+            }
+            return s;
+        }
+
         // ---------------- 各语句 ----------------
 
         bool semCreateTable(const CELLA_Stmt &st, CELLA_Catalog &cat, int idx, CELLA_SemanticResult &res)
@@ -630,6 +670,7 @@ namespace cella
                 c.name = cd.name;
                 c.type = cd.type;
                 c.notNull = cd.notNull || cd.primaryKey; // 主键隐含 NOT NULL
+                c.primaryKey = cd.primaryKey;
                 c.len = cd.hasLen ? cd.len : ((cd.type == CELLA_DataType::CHAR || cd.type == CELLA_DataType::VARCHAR) ? 255 : 0);
                 table.columns.push_back(std::move(c));
             }
@@ -769,6 +810,320 @@ namespace cella
             const std::string tname = ownerName;
             cat.dropIndex(tname, st.indexName);
             res.okMessages.push_back("[语义] OK: 语句#" + std::to_string(idx) + " DROP INDEX " + st.indexName);
+            return true;
+        }
+
+        // ---------------- ALTER TABLE / TRUNCATE TABLE（P5）----------------
+
+        // 表上「已有主键」的判定：列旗标是权威（复合主键 = 多列带旗标）
+        bool tableHasPrimaryKey(const CELLA_Table &t)
+        {
+            for (const auto &c : t.columns)
+            {
+                if (c.primaryKey)
+                    return true;
+            }
+            return false;
+        }
+
+        std::string columnNamesOf(const CELLA_Table &t)
+        {
+            std::vector<std::string> names;
+            for (const auto &c : t.columns)
+                names.push_back(c.name);
+            return joinComma(names);
+        }
+
+        bool semAlterTable(const CELLA_Stmt &st, CELLA_Catalog &cat, int idx, CELLA_SemanticResult &res)
+        {
+            CELLA_Table *table = cat.findTable(st.tableName);
+            if (!table)
+            {
+                res.errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-301", st.line, st.col,
+                                                     "表 \"" + st.tableName + "\" 不存在"));
+                return false;
+            }
+            const std::string tname = table->name;
+            const std::string okPrefix = "[语义] OK: 语句#" + std::to_string(idx) + " ALTER TABLE ";
+
+            switch (st.alterAction)
+            {
+            case CELLA_Stmt::AlterAction::ADD_COLUMN:
+            {
+                const CELLA_ColumnDef &cd = st.newColumn;
+                if (isRowidName(cd.name))
+                {
+                    res.errors.push_back(cella_makeError(
+                        CELLA_Phase::SEM, "SEM-314", cd.line, cd.col,
+                        "rowid 是每张表都有的只读伪列，不能用作列名（表 \"" + tname + "\"）"));
+                    return false;
+                }
+                if (CELLA_Catalog::findColumn(*table, cd.name))
+                {
+                    res.errors.push_back(cella_makeError(
+                        CELLA_Phase::SEM, "SEM-304", cd.line, cd.col,
+                        "列 \"" + cd.name + "\" 在表 \"" + tname + "\" 中已存在"));
+                    return false;
+                }
+                if (cd.primaryKey)
+                {
+                    res.errors.push_back(cella_makeError(
+                        CELLA_Phase::SEM, "SEM-325", cd.line, cd.col,
+                        "ADD COLUMN 不接受 PRIMARY KEY（新列无法为已有行补出主键值），"
+                        "请改用 ALTER TABLE " + tname + " ADD PRIMARY KEY (列)"));
+                    return false;
+                }
+                CELLA_Column c;
+                c.name = cd.name;
+                c.type = cd.type;
+                c.notNull = cd.notNull;
+                c.primaryKey = false;
+                c.len = cd.hasLen ? cd.len
+                                  : ((cd.type == CELLA_DataType::CHAR || cd.type == CELLA_DataType::VARCHAR)
+                                         ? 255
+                                         : 0);
+                table->columns.push_back(std::move(c));
+                res.okMessages.push_back(okPrefix + tname + " ADD COLUMN " + cd.name +
+                                          "（列: " + columnNamesOf(*table) + "）");
+                return true;
+            }
+            case CELLA_Stmt::AlterAction::DROP_COLUMN:
+            {
+                const CELLA_Column *col = CELLA_Catalog::findColumn(*table, st.alterColumnName);
+                if (!col)
+                {
+                    res.errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-303", st.line, st.col,
+                                                         "列 \"" + st.alterColumnName +
+                                                             "\" 不存在于表 \"" + tname + "\""));
+                    return false;
+                }
+                if (table->columns.size() <= 1)
+                {
+                    res.errors.push_back(cella_makeError(
+                        CELLA_Phase::SEM, "SEM-323", st.line, st.col,
+                        "不能删除表 \"" + tname + "\" 的最后一列（表至少要有一列）"));
+                    return false;
+                }
+                if (col->primaryKey)
+                {
+                    // 删主键列会让主键残缺（复合主键尤其危险），故要求先显式解除主键
+                    res.errors.push_back(cella_makeError(
+                        CELLA_Phase::SEM, "SEM-326", st.line, st.col,
+                        "列 \"" + col->name + "\" 是主键列，不能直接删除；"
+                        "请先执行 ALTER TABLE " + tname + " DROP PRIMARY KEY"));
+                    return false;
+                }
+                const std::string target = cella_toUpper(col->name);
+                // 级联：包含该列的索引一并删除（列没了，索引无从维护）
+                std::vector<std::string> cascaded;
+                for (auto it = table->indexes.begin(); it != table->indexes.end();)
+                {
+                    bool hit = false;
+                    for (const std::string &ic : splitIndexColumnsText(it->column))
+                    {
+                        if (cella_toUpper(ic) == target)
+                        {
+                            hit = true;
+                            break;
+                        }
+                    }
+                    if (hit)
+                    {
+                        cascaded.push_back(it->name);
+                        it = table->indexes.erase(it);
+                    }
+                    else
+                    {
+                        ++it;
+                    }
+                }
+                for (auto it = table->columns.begin(); it != table->columns.end(); ++it)
+                {
+                    if (cella_toUpper(it->name) == target)
+                    {
+                        table->columns.erase(it);
+                        break;
+                    }
+                }
+                std::string extra;
+                if (!cascaded.empty())
+                {
+                    extra = "（级联删除索引: " + joinComma(cascaded) + "）";
+                }
+                res.okMessages.push_back(okPrefix + tname + " DROP COLUMN " + st.alterColumnName +
+                                          "（列: " + columnNamesOf(*table) + "）" + extra);
+                return true;
+            }
+            case CELLA_Stmt::AlterAction::RENAME_TABLE:
+            {
+                if (cella_toUpper(st.newName) == cella_toUpper(tname))
+                {
+                    // 改成同一个名字是空操作，放行（否则会误报「表已存在」）
+                    res.okMessages.push_back(okPrefix + tname + " RENAME TO " + st.newName + "（无变化）");
+                    return true;
+                }
+                if (cat.findTable(st.newName))
+                {
+                    res.errors.push_back(cella_makeError(
+                        CELLA_Phase::SEM, "SEM-302", st.line, st.col,
+                        "表 \"" + st.newName + "\" 已存在，无法把 \"" + tname + "\" 改名为它"));
+                    return false;
+                }
+                if (!cat.renameTable(tname, st.newName))
+                {
+                    res.errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-302", st.line, st.col,
+                                                         "表改名失败: \"" + tname + "\" → \"" +
+                                                             st.newName + "\""));
+                    return false;
+                }
+                res.okMessages.push_back(okPrefix + tname + " RENAME TO " + st.newName);
+                return true;
+            }
+            case CELLA_Stmt::AlterAction::RENAME_COLUMN:
+            {
+                CELLA_Column *col = nullptr;
+                for (auto &c : table->columns)
+                {
+                    if (cella_toUpper(c.name) == cella_toUpper(st.alterColumnName))
+                    {
+                        col = &c;
+                        break;
+                    }
+                }
+                if (!col)
+                {
+                    res.errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-303", st.line, st.col,
+                                                         "列 \"" + st.alterColumnName +
+                                                             "\" 不存在于表 \"" + tname + "\""));
+                    return false;
+                }
+                if (isRowidName(st.newName))
+                {
+                    res.errors.push_back(cella_makeError(
+                        CELLA_Phase::SEM, "SEM-314", st.line, st.col,
+                        "rowid 是每张表都有的只读伪列，不能用作列名（表 \"" + tname + "\"）"));
+                    return false;
+                }
+                if (cella_toUpper(st.newName) != cella_toUpper(col->name) &&
+                    CELLA_Catalog::findColumn(*table, st.newName))
+                {
+                    res.errors.push_back(cella_makeError(
+                        CELLA_Phase::SEM, "SEM-304", st.line, st.col,
+                        "列 \"" + st.newName + "\" 在表 \"" + tname + "\" 中已存在"));
+                    return false;
+                }
+                const std::string oldName = col->name;
+                col->name = st.newName;
+                // 索引元数据里的列名同步改名（B+ 树键按**值**编码，不含列名 → 无需重建树）
+                for (auto &ix : table->indexes)
+                {
+                    std::vector<std::string> cols = splitIndexColumnsText(ix.column);
+                    for (auto &ic : cols)
+                    {
+                        if (cella_toUpper(ic) == cella_toUpper(oldName))
+                            ic = st.newName;
+                    }
+                    ix.column = joinIndexColumnsText(cols);
+                }
+                res.okMessages.push_back(okPrefix + tname + " RENAME COLUMN " + oldName + " TO " +
+                                          st.newName);
+                return true;
+            }
+            case CELLA_Stmt::AlterAction::ADD_PRIMARY_KEY:
+            {
+                if (tableHasPrimaryKey(*table))
+                {
+                    res.errors.push_back(cella_makeError(
+                        CELLA_Phase::SEM, "SEM-327", st.line, st.col,
+                        "表 \"" + tname + "\" 已有主键；请先 ALTER TABLE " + tname +
+                            " DROP PRIMARY KEY"));
+                    return false;
+                }
+                if (st.pkColumns.empty())
+                {
+                    res.errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-303", st.line, st.col,
+                                                         "ADD PRIMARY KEY 至少需要一列"));
+                    return false;
+                }
+                std::set<std::string> seen;
+                for (const std::string &cn : st.pkColumns)
+                {
+                    CELLA_Column *col = nullptr;
+                    for (auto &c : table->columns)
+                    {
+                        if (cella_toUpper(c.name) == cella_toUpper(cn))
+                        {
+                            col = &c;
+                            break;
+                        }
+                    }
+                    if (!col)
+                    {
+                        res.errors.push_back(cella_makeError(
+                            CELLA_Phase::SEM, "SEM-303", st.line, st.col,
+                            "主键列 \"" + cn + "\" 不存在于表 \"" + tname + "\""));
+                        return false;
+                    }
+                    if (!seen.insert(cella_toUpper(cn)).second)
+                    {
+                        res.errors.push_back(cella_makeError(
+                            CELLA_Phase::SEM, "SEM-304", st.line, st.col,
+                            "主键列 \"" + cn + "\" 在列表中重复"));
+                        return false;
+                    }
+                    // 先记下待置位，全部校验通过后统一生效（避免部分成功）
+                    (void)col;
+                }
+                for (const std::string &cn : st.pkColumns)
+                {
+                    for (auto &c : table->columns)
+                    {
+                        if (cella_toUpper(c.name) == cella_toUpper(cn))
+                        {
+                            c.primaryKey = true;
+                            c.notNull = true; // 主键隐含非空（与 CREATE TABLE 一致）
+                        }
+                    }
+                }
+                res.okMessages.push_back(okPrefix + tname + " ADD PRIMARY KEY (" +
+                                          joinComma(st.pkColumns) + ")");
+                return true;
+            }
+            case CELLA_Stmt::AlterAction::DROP_PRIMARY_KEY:
+            {
+                if (!tableHasPrimaryKey(*table))
+                {
+                    res.errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-328", st.line, st.col,
+                                                         "表 \"" + tname + "\" 没有主键"));
+                    return false;
+                }
+                for (auto &c : table->columns)
+                {
+                    // 只解除主键约束；NOT NULL 保留（MySQL 同样如此，避免「删主键顺手放宽空值」的意外）
+                    c.primaryKey = false;
+                }
+                res.okMessages.push_back(okPrefix + tname + " DROP PRIMARY KEY");
+                return true;
+            }
+            }
+            res.errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-399", st.line, st.col,
+                                                 "未知的 ALTER TABLE 动作"));
+            return false;
+        }
+
+        bool semTruncateTable(const CELLA_Stmt &st, CELLA_Catalog &cat, int idx,
+                              CELLA_SemanticResult &res)
+        {
+            const CELLA_Table *table = cat.findTable(st.tableName);
+            if (!table)
+            {
+                res.errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-301", st.line, st.col,
+                                                     "表 \"" + st.tableName + "\" 不存在"));
+                return false;
+            }
+            // TRUNCATE 不动结构，故目录无需变化（索引定义与列定义都保留）
+            res.okMessages.push_back("[语义] OK: 语句#" + std::to_string(idx) + " TRUNCATE TABLE " +
+                                     table->name);
             return true;
         }
 
@@ -1090,6 +1445,10 @@ namespace cella
                 return semCreateIndex(st, cat, idx, res);
             case CELLA_Stmt::Kind::DROP_INDEX:
                 return semDropIndex(st, cat, idx, res);
+            case CELLA_Stmt::Kind::ALTER_TABLE:
+                return semAlterTable(st, cat, idx, res);
+            case CELLA_Stmt::Kind::TRUNCATE_TABLE:
+                return semTruncateTable(st, cat, idx, res);
             case CELLA_Stmt::Kind::INSERT:
                 return semInsert(st, cat, idx, res);
             case CELLA_Stmt::Kind::DELETE:
