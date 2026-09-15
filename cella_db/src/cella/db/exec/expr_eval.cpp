@@ -354,7 +354,8 @@ DbStatus ArithNumeric(const Value& a, const Value& b, const char* op, storage::V
 
 }  // namespace
 
-DbStatus ExprEval::Eval(const cella::CELLA_Expr& expr, const EvalRow& row, storage::Value* out) {
+DbStatus ExprEval::Eval(const cella::CELLA_Expr& expr, const EvalRow& row, storage::Value* out,
+                        EvalCtx* ctx) {
   if (out == nullptr) {
     return DbStatus::Error(DbCode::kInternal, "Eval: out 为空");
   }
@@ -422,7 +423,7 @@ DbStatus ExprEval::Eval(const cella::CELLA_Expr& expr, const EvalRow& row, stora
       args.reserve(expr.args.size());
       for (const auto& arg : expr.args) {
         storage::Value v;
-        const DbStatus s = Eval(*arg, row, &v);
+        const DbStatus s = Eval(*arg, row, &v, ctx);
         if (!s.ok()) {
           return s;
         }
@@ -441,7 +442,7 @@ DbStatus ExprEval::Eval(const cella::CELLA_Expr& expr, const EvalRow& row, stora
         return DbStatus::Error(DbCode::kInternal, "IN 表达式缺少左操作数");
       }
       storage::Value lv;
-      const DbStatus s = Eval(*expr.left, row, &lv);
+      const DbStatus s = Eval(*expr.left, row, &lv, ctx);
       if (!s.ok()) {
         return s;
       }
@@ -453,7 +454,7 @@ DbStatus ExprEval::Eval(const cella::CELLA_Expr& expr, const EvalRow& row, stora
       bool any_null = false;
       for (const auto& e : expr.inList) {
         storage::Value rv;
-        const DbStatus rs = Eval(*e, row, &rv);
+        const DbStatus rs = Eval(*e, row, &rv, ctx);
         if (!rs.ok()) {
           return rs;
         }
@@ -481,16 +482,120 @@ DbStatus ExprEval::Eval(const cella::CELLA_Expr& expr, const EvalRow& row, stora
       return DbStatus::Ok();
     }
 
-    // 以下三类需要「在表达式求值过程中递归执行一条完整查询」，
-    // 而 ExprEval 目前不持有执行器句柄。给出明确错误而不是静默返回错值。
-    case cella::CELLA_Expr::Kind::IN_QUERY:
-      return DbStatus::Error(DbCode::kNotImplemented, "执行期尚未支持子查询 IN (GET ...)");
-    case cella::CELLA_Expr::Kind::EXISTS_Q:
-      return DbStatus::Error(DbCode::kNotImplemented, "执行期尚未支持 EXISTS (GET ...)");
-    case cella::CELLA_Expr::Kind::SCALAR_Q:
-      return DbStatus::Error(DbCode::kNotImplemented, "执行期尚未支持标量子查询 (GET ...)");
-    case cella::CELLA_Expr::Kind::WINDOW:
-      return DbStatus::Error(DbCode::kNotImplemented, "执行期尚未支持窗口函数 OVER (...)");
+    // ── 子查询（语义阶段已确认「不引用外层列」）─────────────────
+    // 三个分支共用一次「跑子查询、把首列物化出来」的动作（执行器内部按
+    // 子查询体地址做语句级缓存，因此 N 行外层数据也只跑一次）。
+    // 求值器本身不持有执行器句柄：能力由 EvalCtx::sub 注入。
+    case cella::CELLA_Expr::Kind::IN_QUERY: {
+      if (!expr.left) {
+        return DbStatus::Error(DbCode::kInternal, "IN 子查询缺少左操作数");
+      }
+      if (ctx == nullptr || !ctx->has_subquery_runner()) {
+        return DbStatus::Error(DbCode::kNotImplemented, "执行期尚未支持子查询 IN (GET ...)");
+      }
+      if (!expr.subquery) {
+        return DbStatus::Error(DbCode::kInternal, "IN 子查询缺少语句体");
+      }
+      storage::Value lv;
+      const DbStatus ls = Eval(*expr.left, row, &lv, ctx);
+      if (!ls.ok()) {
+        return ls;
+      }
+      if (lv.IsNull()) {
+        *out = Value::Null();  // NULL IN (...) → UNKNOWN
+        return DbStatus::Ok();
+      }
+      std::vector<storage::Value> list;
+      bool any_row = false;
+      const DbStatus rs = ctx->sub->RunSubquery(*expr.subquery, false, &list, &any_row);
+      if (!rs.ok()) {
+        return rs;
+      }
+      // 命中判定与 IN_LIST 完全同构（同一套三值逻辑），只是列表来自子查询。
+      bool hit = false;
+      bool any_null = false;
+      for (const auto& rv : list) {
+        if (rv.IsNull()) {
+          any_null = true;
+          continue;
+        }
+        bool eq = false;
+        const DbStatus es = ScalarEq(lv, rv, &eq);
+        if (!es.ok()) {
+          return es;
+        }
+        if (eq) {
+          hit = true;
+          break;
+        }
+      }
+      if (hit) {
+        *out = Value::Bool(!expr.negated);
+      } else if (any_null) {
+        *out = Value::Null();  // 未命中但子查询结果含 NULL → UNKNOWN
+      } else {
+        *out = Value::Bool(expr.negated);
+      }
+      return DbStatus::Ok();
+    }
+
+    case cella::CELLA_Expr::Kind::EXISTS_Q: {
+      if (ctx == nullptr || !ctx->has_subquery_runner()) {
+        return DbStatus::Error(DbCode::kNotImplemented, "执行期尚未支持 EXISTS (GET ...)");
+      }
+      if (!expr.subquery) {
+        return DbStatus::Error(DbCode::kInternal, "EXISTS 子查询缺少语句体");
+      }
+      bool any_row = false;
+      // EXISTS 只关心「有没有行」，不必物化首列 → exists_only 让执行器早停。
+      const DbStatus rs = ctx->sub->RunSubquery(*expr.subquery, true, nullptr, &any_row);
+      if (!rs.ok()) {
+        return rs;
+      }
+      *out = Value::Bool(expr.negated ? !any_row : any_row);
+      return DbStatus::Ok();
+    }
+
+    case cella::CELLA_Expr::Kind::SCALAR_Q: {
+      if (ctx == nullptr || !ctx->has_subquery_runner()) {
+        return DbStatus::Error(DbCode::kNotImplemented, "执行期尚未支持标量子查询 (GET ...)");
+      }
+      if (!expr.subquery) {
+        return DbStatus::Error(DbCode::kInternal, "标量子查询缺少语句体");
+      }
+      std::vector<storage::Value> col;
+      bool any_row = false;
+      const DbStatus rs = ctx->sub->RunSubquery(*expr.subquery, false, &col, &any_row);
+      if (!rs.ok()) {
+        return rs;
+      }
+      if (col.empty()) {
+        *out = Value::Null();  // 零行 → NULL（标准 SQL：标量子查询无结果即 NULL）
+        return DbStatus::Ok();
+      }
+      if (col.size() > 1) {
+        return DbStatus::Error(DbCode::kSqlError,
+                               "标量子查询返回了 " + std::to_string(col.size()) +
+                                   " 行，最多只能一行");
+      }
+      *out = col[0];
+      return DbStatus::Ok();
+    }
+
+    // 窗口函数的值由执行器在投影前整列算好，按「表达式节点地址」喂进上下文。
+    // 取不到说明有调用点没接窗口能力 —— 明确报错而不是猜一个值。
+    case cella::CELLA_Expr::Kind::WINDOW: {
+      if (ctx == nullptr || ctx->window_values == nullptr) {
+        return DbStatus::Error(DbCode::kNotImplemented, "执行期尚未支持窗口函数 OVER (...)");
+      }
+      const auto it = ctx->window_values->find(&expr);
+      if (it == ctx->window_values->end()) {
+        return DbStatus::Error(DbCode::kInternal,
+                               "窗口函数值缺失: " + expr.funcName + "（OpProject 未预算该列）");
+      }
+      *out = it->second;
+      return DbStatus::Ok();
+    }
 
     case cella::CELLA_Expr::Kind::UNARY: {
       if (!expr.child) {
@@ -500,7 +605,7 @@ DbStatus ExprEval::Eval(const cella::CELLA_Expr& expr, const EvalRow& row, stora
       if (expr.uop == cella::CELLA_Expr::UnOp::IS_NULL ||
           expr.uop == cella::CELLA_Expr::UnOp::IS_NOT_NULL) {
         storage::Value inner;
-        const DbStatus s = Eval(*expr.child, row, &inner);
+        const DbStatus s = Eval(*expr.child, row, &inner, ctx);
         if (!s.ok()) {
           return s;
         }
@@ -511,7 +616,7 @@ DbStatus ExprEval::Eval(const cella::CELLA_Expr& expr, const EvalRow& row, stora
       if (expr.uop == cella::CELLA_Expr::UnOp::NOT) {
         bool v = false;
         bool is_null = false;
-        const DbStatus s = EvalBool(*expr.child, row, &v, &is_null);
+        const DbStatus s = EvalBool(*expr.child, row, &v, &is_null, ctx);
         if (!s.ok()) {
           return s;
         }
@@ -519,7 +624,7 @@ DbStatus ExprEval::Eval(const cella::CELLA_Expr& expr, const EvalRow& row, stora
         return DbStatus::Ok();
       }
       storage::Value inner;
-      const DbStatus s = Eval(*expr.child, row, &inner);
+      const DbStatus s = Eval(*expr.child, row, &inner, ctx);
       if (!s.ok()) {
         return s;
       }
@@ -560,11 +665,11 @@ DbStatus ExprEval::Eval(const cella::CELLA_Expr& expr, const EvalRow& row, stora
   if (expr.bop == cella::CELLA_Expr::BinOp::AND || expr.bop == cella::CELLA_Expr::BinOp::OR) {
     bool l = false, r = false;
     bool ln = false, rn = false;
-    const DbStatus sl = EvalBool(*expr.left, row, &l, &ln);
+    const DbStatus sl = EvalBool(*expr.left, row, &l, &ln, ctx);
     if (!sl.ok()) {
       return sl;
     }
-    const DbStatus sr = EvalBool(*expr.right, row, &r, &rn);
+    const DbStatus sr = EvalBool(*expr.right, row, &r, &rn, ctx);
     if (!sr.ok()) {
       return sr;
     }
@@ -591,11 +696,11 @@ DbStatus ExprEval::Eval(const cella::CELLA_Expr& expr, const EvalRow& row, stora
 
   storage::Value a;
   storage::Value b;
-  const DbStatus sa = Eval(*expr.left, row, &a);
+  const DbStatus sa = Eval(*expr.left, row, &a, ctx);
   if (!sa.ok()) {
     return sa;
   }
-  const DbStatus sb = Eval(*expr.right, row, &b);
+  const DbStatus sb = Eval(*expr.right, row, &b, ctx);
   if (!sb.ok()) {
     return sb;
   }
@@ -663,12 +768,12 @@ DbStatus ExprEval::Eval(const cella::CELLA_Expr& expr, const EvalRow& row, stora
 }
 
 DbStatus ExprEval::EvalBool(const cella::CELLA_Expr& expr, const EvalRow& row, bool* out,
-                            bool* is_null) {
+                            bool* is_null, EvalCtx* ctx) {
   if (out == nullptr || is_null == nullptr) {
     return DbStatus::Error(DbCode::kInternal, "EvalBool: 输出参数为空");
   }
   storage::Value v;
-  const DbStatus s = Eval(expr, row, &v);
+  const DbStatus s = Eval(expr, row, &v, ctx);
   if (!s.ok()) {
     return s;
   }
@@ -686,13 +791,14 @@ DbStatus ExprEval::EvalBool(const cella::CELLA_Expr& expr, const EvalRow& row, b
   return DbStatus::Ok();
 }
 
-DbStatus ExprEval::EvalPredicate(const cella::CELLA_Expr& expr, const EvalRow& row, bool* pass) {
+DbStatus ExprEval::EvalPredicate(const cella::CELLA_Expr& expr, const EvalRow& row, bool* pass,
+                                 EvalCtx* ctx) {
   if (pass == nullptr) {
     return DbStatus::Error(DbCode::kInternal, "EvalPredicate: pass 为空");
   }
   bool v = false;
   bool is_null = false;
-  const DbStatus s = EvalBool(expr, row, &v, &is_null);
+  const DbStatus s = EvalBool(expr, row, &v, &is_null, ctx);
   if (!s.ok()) {
     return s;
   }
@@ -718,6 +824,68 @@ std::string ExprEval::OutputName(const cella::CELLA_Expr& expr, const std::strin
     return fn + "(" + (expr.table.empty() ? expr.column : expr.table + "." + expr.column) + ")";
   }
   return cella::cella_exprToString(expr);
+}
+
+// ── 窗口函数节点的探测与收集 ────────────────────────────────────
+// 执行器用它们决定「这个 Project 是否要先整列预算窗口值」。
+// 之所以要递归进子树：窗口表达式可能嵌在函数实参或算术式里
+// （如 ROUND(AVG(x) OVER (...) / 100, 2)），只看顶层节点会漏。
+void ExprEval::CollectWindows(const cella::CELLA_Expr& expr,
+                              std::vector<const cella::CELLA_Expr*>* out) {
+  if (out == nullptr) {
+    return;
+  }
+  if (expr.kind == cella::CELLA_Expr::Kind::WINDOW) {
+    for (const auto* seen : *out) {
+      if (seen == &expr) {
+        return;  // 同一节点只收一次（表达式树里不存在共享，这里是纯防御）
+      }
+    }
+    out->push_back(&expr);
+  }
+  if (expr.left) {
+    CollectWindows(*expr.left, out);
+  }
+  if (expr.right) {
+    CollectWindows(*expr.right, out);
+  }
+  if (expr.child) {
+    CollectWindows(*expr.child, out);
+  }
+  for (const auto& a : expr.args) {
+    CollectWindows(*a, out);
+  }
+  for (const auto& a : expr.inList) {
+    CollectWindows(*a, out);
+  }
+  // 注意：不递归进 expr.subquery —— 子查询体内的窗口函数由子查询自己的
+  // 执行过程处理（它会被编译成独立的计划树），不属于本层的分区范围。
+}
+
+bool ExprEval::HasWindow(const cella::CELLA_Expr& expr) {
+  if (expr.kind == cella::CELLA_Expr::Kind::WINDOW) {
+    return true;
+  }
+  if (expr.left && HasWindow(*expr.left)) {
+    return true;
+  }
+  if (expr.right && HasWindow(*expr.right)) {
+    return true;
+  }
+  if (expr.child && HasWindow(*expr.child)) {
+    return true;
+  }
+  for (const auto& a : expr.args) {
+    if (HasWindow(*a)) {
+      return true;
+    }
+  }
+  for (const auto& a : expr.inList) {
+    if (HasWindow(*a)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 }  // namespace cella::db

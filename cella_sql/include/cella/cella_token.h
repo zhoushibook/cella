@@ -7,9 +7,32 @@
 
 #include "cella_common.h"
 
-// NULL 可能是宏（<cstddef> 等定义），先解除再使用枚举名
+// 本头的枚举成员名与若干系统宏同名。Windows 头（windef.h / winnt.h）会把它们
+// 定义成宏，一旦某个 TU 在包含本头之前拉进了 windows.h，枚举里就会出现
+// `TRUE,` → `1,`、`CONST,` → `const,` 这样的展开，报出一堆「缺少 }」的语法错误 ——
+// 症状离原因很远（错误行号指向枚举，真正的原因在包含顺序里），很难查。
+// 这里统一解除，让本头在**任何包含顺序**下都可用。
+// （只解除与枚举成员冲突的那几个；MIN/MAX 因构建带 NOMINMAX 而不受影响。）
 #ifdef NULL
 #undef NULL
+#endif
+#ifdef CONST
+#undef CONST
+#endif
+#ifdef TRUE
+#undef TRUE
+#endif
+#ifdef FALSE
+#undef FALSE
+#endif
+#ifdef TEXT
+#undef TEXT
+#endif
+#ifdef IN
+#undef IN
+#endif
+#ifdef DELETE
+#undef DELETE
 #endif
 
 namespace cella

@@ -78,6 +78,12 @@ namespace cella::db
         return "ALTER TABLE";
       case cella::CELLA_Stmt::Kind::TRUNCATE_TABLE:
         return "TRUNCATE TABLE";
+      case cella::CELLA_Stmt::Kind::CREATE_VIEW:
+        return "CREATE VIEW";
+      case cella::CELLA_Stmt::Kind::DROP_VIEW:
+        return "DROP VIEW";
+      case cella::CELLA_Stmt::Kind::WITH:
+        return "WITH";
       }
       return "?";
     }
@@ -365,6 +371,12 @@ namespace cella::db
       {
         return is;
       }
+      // ④a' 视图元数据表（独立系统表 cella_view；视图落地）
+      const DbStatus vs = catalog_.EnsureViewTable(nullptr);
+      if (!vs.ok())
+      {
+        return vs;
+      }
     }
 
     // ④b 旧文本目录一次性迁移（catalog.meta → 系统表），迁移完改名留档
@@ -418,6 +430,12 @@ namespace cella::db
       if (!ixs.ok())
       {
         return ixs;
+      }
+      // 视图元数据随目录一并加载（无表 → 视为无视图，非错误）
+      const DbStatus vws = catalog_.LoadViewsFromStorage();
+      if (!vws.ok())
+      {
+        return vws;
       }
     }
 
@@ -985,6 +1003,11 @@ namespace cella::db
     {
       return xs;
     }
+    const DbStatus vts = catalog_.EnsureViewTable(nullptr);
+    if (!vts.ok())
+    {
+      return vts;
+    }
     const DbStatus ls = catalog_.LoadFromStorage();
     if (!ls.ok())
     {
@@ -994,6 +1017,11 @@ namespace cella::db
     if (!ixs.ok())
     {
       return ixs;
+    }
+    const DbStatus vws = catalog_.LoadViewsFromStorage();
+    if (!vws.ok())
+    {
+      return vws;
     }
     current_db_ = name;
     // WAL 按库分文件 → 打开新库的日志，并顺带跑一次崩溃恢复
@@ -2049,6 +2077,8 @@ namespace cella::db
     // rowid 伪列：只在该语句确实引用它时才让扫描在结果末尾附加（否则 `get *` 会多出一列）
     ctx.with_rowid =
         program->statements.empty() ? false : StmtRefersRowid(program->statements[0].get());
+    // 语句原文：视图定义要靠它跨重启存活（CREATE VIEW 时写进 cella_view）。
+    ctx.stmt_text = stmt_text;
 
     Executor &executor = *engine_->executor_;
     executor.ResetOperatorCalls();

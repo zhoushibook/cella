@@ -150,12 +150,15 @@ std::vector<int> CatalogTable::PrimaryKeyColumns() const {
 // ── CatalogManager：系统表 ─────────────────────────────────
 
 bool CatalogManager::IsSystemTable(const std::string& name) {
-  return ToUpper(name) == ToUpper(kSystemTableName);
+  const std::string key = ToUpper(name);
+  return key == ToUpper(kSystemTableName) || key == ToUpper(kIndexTableName) ||
+         key == ToUpper(kViewTableName);
 }
 
 bool CatalogManager::IsProtectedSystemTable(const std::string& name) {
   const std::string key = ToUpper(name);
-  return key == ToUpper(kSystemTableName) || key == ToUpper(kIndexTableName);
+  return key == ToUpper(kSystemTableName) || key == ToUpper(kIndexTableName) ||
+         key == ToUpper(kViewTableName);
 }
 
 storage::Schema CatalogManager::SystemTableSchema() {
@@ -234,6 +237,41 @@ DbStatus CatalogManager::EnsureIndexTable(bool* created) {
   return DbStatus::Ok();
 }
 
+storage::Schema CatalogManager::ViewTableSchema() {
+  storage::Schema s;
+  s.AddColumn("name", storage::ValueType::kVarchar, 64);
+  s.AddColumn("query", storage::ValueType::kVarchar, 0);   // 定义语句原文（不限长）
+  s.AddColumn("columns", storage::ValueType::kVarchar, 0); // 与 cella_catalog 同一套列编码
+  s.AddColumn("created_at", storage::ValueType::kInt32, 0);
+  return s;
+}
+
+DbStatus CatalogManager::EnsureViewTable(bool* created) {
+  if (created != nullptr) {
+    *created = false;
+  }
+  if (storage_ == nullptr) {
+    return DbStatus::Error(DbCode::kCatalogError, "目录未附加存储引擎");
+  }
+  std::shared_ptr<storage::TableHeap> heap;
+  const storage::Status s = storage_->open_table(kViewTableName, &heap);
+  if (s.ok()) {
+    return DbStatus::Ok();
+  }
+  if (s.code() != storage::StatusCode::kTableNotFound) {
+    return DbStatus::Error(DbCode::kStorageError, "打开视图元数据表失败: " + s.ToString());
+  }
+  const storage::Status cs = storage_->create_table(kViewTableName, ViewTableSchema());
+  if (!cs.ok()) {
+    return DbStatus::Error(DbCode::kStorageError, "创建视图元数据表失败: " + cs.ToString());
+  }
+  if (created != nullptr) {
+    *created = true;
+  }
+  DbLogInfo(logcat::kCatalog, "已创建视图元数据表 " + std::string(kViewTableName));
+  return DbStatus::Ok();
+}
+
 DbStatus CatalogManager::LoadFromStorage() {
   if (storage_ == nullptr) {
     return DbStatus::Error(DbCode::kCatalogError, "目录未附加存储引擎");
@@ -284,6 +322,13 @@ DbStatus CatalogManager::LoadFromStorage() {
     std::shared_ptr<storage::TableHeap> ih;
     if (storage_->open_table(kIndexTableName, &ih).ok() && ih) {
       AddIndexTableEntry();
+    }
+  }
+  // 视图系统表：同上（老库没有这张表，LoadViewsFromStorage 会容忍）
+  {
+    std::shared_ptr<storage::TableHeap> vh;
+    if (storage_->open_table(kViewTableName, &vh).ok() && vh) {
+      AddViewTableEntry();
     }
   }
   DbLogInfo(logcat::kCatalog, "目录已加载: " + std::to_string(tables_.size()) + " 张表");
@@ -338,6 +383,29 @@ void CatalogManager::AddIndexTableEntry() {
     sys.first_page_id = h->first_page_id();
   }
   tables_[ToUpper(kIndexTableName)] = std::move(sys);
+}
+
+void CatalogManager::AddViewTableEntry() {
+  CatalogTable sys;
+  sys.table_id = 0;
+  sys.name = kViewTableName;
+  sys.created_at = 0;
+
+  CatalogColumn c;
+  c.name = "name"; c.type = cella::CELLA_DataType::VARCHAR; c.len = 64; c.not_null = true;
+  sys.columns.push_back(c);
+  c = CatalogColumn{}; c.name = "query"; c.type = cella::CELLA_DataType::TEXT;
+  sys.columns.push_back(c);
+  c = CatalogColumn{}; c.name = "columns"; c.type = cella::CELLA_DataType::TEXT;
+  sys.columns.push_back(c);
+  c = CatalogColumn{}; c.name = "created_at"; c.type = cella::CELLA_DataType::INT; c.not_null = true;
+  sys.columns.push_back(c);
+
+  std::shared_ptr<storage::TableHeap> h;
+  if (storage_ != nullptr && storage_->open_table(kViewTableName, &h).ok() && h) {
+    sys.first_page_id = h->first_page_id();
+  }
+  tables_[ToUpper(kViewTableName)] = std::move(sys);
 }
 
 bool CatalogManager::DecodeRow(const storage::Record& row, CatalogTable* out) const {
@@ -615,6 +683,145 @@ std::vector<const CatalogIndex*> CatalogManager::ListIndexes() const {
   }
   std::sort(out.begin(), out.end(),
             [](const CatalogIndex* a, const CatalogIndex* b) { return a->name < b->name; });
+  return out;
+}
+
+// ── 视图元数据（cella_view）────────────────────────────────────
+// 与 cella_index 完全同构的一套 CRUD：内存视图是权威查询入口，系统表是持久载体。
+// 列定义复用 EncodeColumns/DecodeColumns —— 与 cella_catalog 的行格式一致，
+// 因此「视图列」与「表列」在编译期走同一套解码路径，不会出现两种方言。
+
+bool CatalogManager::DecodeViewRow(const storage::Record& row, CatalogView* out) const {
+  if (row.value_count() < 4) {
+    return false;
+  }
+  const storage::Value& name = row.value(0);
+  const storage::Value& query = row.value(1);
+  const storage::Value& cols = row.value(2);
+  const storage::Value& cat = row.value(3);
+  if (name.type != storage::ValueType::kVarchar ||
+      query.type != storage::ValueType::kVarchar ||
+      cols.type != storage::ValueType::kVarchar ||
+      cat.type != storage::ValueType::kInt32) {
+    return false;
+  }
+  out->name = name.str_val;
+  out->query = query.str_val;
+  out->created_at = static_cast<int64_t>(cat.int32_val);
+  if (!DecodeColumns(cols.str_val, &out->columns)) {
+    return false;
+  }
+  return out->valid();
+}
+
+DbStatus CatalogManager::LoadViewsFromStorage() {
+  views_.clear();
+  if (storage_ == nullptr) {
+    return DbStatus::Error(DbCode::kCatalogError, "目录未附加存储引擎");
+  }
+  std::shared_ptr<storage::TableHeap> heap;
+  const storage::Status os = storage_->open_table(kViewTableName, &heap);
+  if (!os.ok()) {
+    // 视图系统表尚未创建：视为「无视图」，不是错误（老库升级路径）。
+    if (os.code() == storage::StatusCode::kTableNotFound) {
+      return DbStatus::Ok();
+    }
+    return DbStatus::Error(DbCode::kStorageError, "打开视图元数据表失败: " + os.ToString());
+  }
+  for (auto it = heap->begin(); it != heap->end(); ++it) {
+    CatalogView v;
+    if (!DecodeViewRow(*it, &v)) {
+      DbLogWarn(logcat::kCatalog, "视图表中存在无法解析的行，已跳过");
+      continue;
+    }
+    const std::string key = ToUpper(v.name);
+    if (views_.count(key) != 0) {
+      DbLogWarn(logcat::kCatalog, "视图表中存在重复视图名，已跳过: " + v.name);
+      continue;
+    }
+    views_[key] = std::move(v);
+  }
+  DbLogInfo(logcat::kCatalog, "已加载视图元数据: " + std::to_string(views_.size()) + " 个");
+  return DbStatus::Ok();
+}
+
+storage::Rid CatalogManager::FindViewRow(const std::string& view_name) const {
+  storage::Rid none;
+  if (storage_ == nullptr) {
+    return none;
+  }
+  std::shared_ptr<storage::TableHeap> heap;
+  if (!storage_->open_table(kViewTableName, &heap).ok()) {
+    return none;
+  }
+  const std::string key = ToUpper(view_name);
+  for (auto it = heap->begin(); it != heap->end(); ++it) {
+    const storage::Record& rec = *it;
+    if (rec.value_count() > 0 && rec.value(0).type == storage::ValueType::kVarchar &&
+        ToUpper(rec.value(0).str_val) == key) {
+      return it.rid();
+    }
+  }
+  return none;
+}
+
+DbStatus CatalogManager::WriteViewRow(const CatalogView& view) {
+  if (storage_ == nullptr) {
+    return DbStatus::Error(DbCode::kCatalogError, "目录未附加存储引擎");
+  }
+  storage::Record rec;
+  rec.AddValue(storage::Value::Varchar(view.name));
+  rec.AddValue(storage::Value::Varchar(view.query));
+  rec.AddValue(storage::Value::Varchar(EncodeColumns(view.columns)));
+  rec.AddValue(storage::Value::Int(static_cast<int32_t>(view.created_at)));
+  storage::Rid rid;
+  const storage::Status s = storage_->insert_record(kViewTableName, rec, &rid);
+  if (!s.ok()) {
+    return CatalogStorageError("写视图元数据表失败", s);
+  }
+  views_[ToUpper(view.name)] = view;
+  return DbStatus::Ok();
+}
+
+DbStatus CatalogManager::DeleteViewRows(const std::string& view_name) {
+  if (storage_ == nullptr) {
+    return DbStatus::Error(DbCode::kCatalogError, "目录未附加存储引擎");
+  }
+  const std::string key = ToUpper(view_name);
+  std::vector<storage::Rid> victims;
+  std::shared_ptr<storage::TableHeap> heap;
+  if (storage_->open_table(kViewTableName, &heap).ok()) {
+    for (auto it = heap->begin(); it != heap->end(); ++it) {
+      const storage::Record& rec = *it;
+      if (rec.value_count() > 0 && rec.value(0).type == storage::ValueType::kVarchar &&
+          ToUpper(rec.value(0).str_val) == key) {
+        victims.push_back(it.rid());
+      }
+    }
+  }
+  for (const storage::Rid& rid : victims) {
+    const storage::Status s = storage_->delete_record(kViewTableName, rid);
+    if (!s.ok()) {
+      return CatalogStorageError("删视图元数据行失败", s);
+    }
+  }
+  views_.erase(key);
+  return DbStatus::Ok();
+}
+
+const CatalogView* CatalogManager::FindView(const std::string& view_name) const {
+  auto it = views_.find(ToUpper(view_name));
+  return it == views_.end() ? nullptr : &it->second;
+}
+
+std::vector<const CatalogView*> CatalogManager::ListViews() const {
+  std::vector<const CatalogView*> out;
+  out.reserve(views_.size());
+  for (const auto& kv : views_) {
+    out.push_back(&kv.second);
+  }
+  std::sort(out.begin(), out.end(),
+            [](const CatalogView* a, const CatalogView* b) { return a->name < b->name; });
   return out;
 }
 
@@ -1004,6 +1211,27 @@ cella::CELLA_Catalog CatalogManager::ToCompilerCatalog() const {
       ct.indexes.push_back(std::move(ci));
     }
     catalog.addTable(std::move(ct));
+  }
+  // 视图：以「一张普通表」的形态进编译器目录（列 = 建视图时推导并存下来的那份）。
+  // 这是视图能被后续语句看见的关键 —— 编译器只认 CELLA_Catalog，而每次语句结束
+  // 都会用本函数重建它；视图若不在这里出现，下一条 `get * in v` 就会报 SEM-301。
+  // 执行期再把「扫这张表」改写成「跑视图的定义查询」（见 Executor::OpTableAccess）。
+  for (const auto* v : ListViews()) {
+    cella::CELLA_Table ct;
+    ct.name = v->name;
+    for (const auto& c : v->columns) {
+      cella::CELLA_Column cc;
+      cc.name = c.name;
+      cc.type = c.type;
+      cc.len = c.len;
+      cc.notNull = c.not_null;
+      cc.primaryKey = c.primary_key;
+      ct.columns.push_back(std::move(cc));
+    }
+    if (!catalog.addTable(std::move(ct))) {
+      // 与同名表冲突：以表为准（建视图时语义层已拦过，这里只是兜底不炸）
+      DbLogWarn(logcat::kCatalog, "视图 " + v->name + " 与同名表冲突，编译器目录中已跳过");
+    }
   }
   return catalog;
 }
