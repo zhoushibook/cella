@@ -90,6 +90,26 @@ struct CatalogIndex {
 std::string JoinIndexColumns(const std::vector<std::string>& cols);
 std::vector<std::string> SplitIndexColumns(const std::string& joined);
 
+// ── 一个视图的元数据 ──────────────────────────────────────────
+// 存放在独立的系统表 cella_view 中（与 cella_index 同样的理由：不动既有行格式）。
+// 行格式：name | query | columns | created_at
+//
+// 为什么持久化「定义查询的原文」而不是编译产物：
+//   计划树/表达式树都是内存对象（含 unique_ptr），没有序列化通道；而视图要跨重启
+//   存活，就必须有一个可再生的载体。原文是唯一自包含、且与用户所见一致的形式 ——
+//   展开时重新走一遍 词法→语法→语义→计划，天然与「同一条查询直接写出来」等价。
+//
+// query 存的是**整条 CREATE VIEW 语句原文**（含 AS 之后的查询体）。这样展开时
+// 只要 parse 一次、取 stmt->viewQuery 即可，不必在文本层面切分语句。
+struct CatalogView {
+  std::string name;                    // 视图名（原始拼写）
+  std::string query;                   // CREATE VIEW 语句原文（可重新解析）
+  std::vector<CatalogColumn> columns;  // 输出列（编译期与执行期共用同一份推导结果）
+  int64_t created_at = 0;              // Unix 秒
+
+  bool valid() const { return !name.empty() && !query.empty(); }
+};
+
 // ── 目录管理器 ──────────────────────────────────────────────
 class CatalogManager {
  public:
@@ -101,8 +121,10 @@ class CatalogManager {
   static constexpr const char* kSystemTableName = "cella_catalog";
   // 二级索引元数据表（独立系统表；P1.2）
   static constexpr const char* kIndexTableName = "cella_index";
+  // 视图元数据表（独立系统表；视图落地）
+  static constexpr const char* kViewTableName = "cella_view";
   static bool IsSystemTable(const std::string& name);
-  // 是否为只读系统表（cella_catalog / cella_index 都只读）
+  // 是否为只读系统表（cella_catalog / cella_index / cella_view 都只读）
   static bool IsProtectedSystemTable(const std::string& name);
 
   // 附加存储引擎（读写系统表用）。写接口须在持有 storage_mutex_ 的临界区内调用。
@@ -114,12 +136,29 @@ class CatalogManager {
   // 确保索引系统表存在（不存在则创建）。返回是否「本次新建」。
   DbStatus EnsureIndexTable(bool* created);
 
+  // 确保视图系统表存在（不存在则创建）。返回是否「本次新建」。
+  DbStatus EnsureViewTable(bool* created);
+
   // 从系统目录表全表扫描重建内存目录；逐表 open_table 校验并补 first_page_id。
   // 校验失败的陈旧条目（表名在目录里、物理表却没了）会被剔除并告警，而不是重建。
   DbStatus LoadFromStorage();
 
   // 索引系统表：全量重建内存索引视图（在 LoadFromStorage 之后调用）。
   DbStatus LoadIndexesFromStorage();
+
+  // 视图系统表：全量重建内存视图视图（在 LoadFromStorage 之后调用）。
+  DbStatus LoadViewsFromStorage();
+
+  // ── 视图元数据 ────────────────────────────────────────────
+  // 写/删一条视图元数据（供执行器 DDL 调用；须在 storage_mutex_ 临界区内）。
+  // WriteViewRow 只追加 —— 视图名唯一由语义层保证（SEM-352），不会出现同名两行。
+  DbStatus WriteViewRow(const CatalogView& view);
+  DbStatus DeleteViewRows(const std::string& view_name);
+
+  // 内存视图查询
+  const CatalogView* FindView(const std::string& view_name) const;
+  std::vector<const CatalogView*> ListViews() const;
+  size_t view_count() const { return views_.size(); }
 
   // ── 二级索引元数据 ────────────────────────────────────────
   // 写/删一条索引元数据（供执行器 DDL 调用；须在 storage_mutex_ 临界区内）。
@@ -191,21 +230,28 @@ class CatalogManager {
   static bool DecodeColumns(const std::string& text, std::vector<CatalogColumn>* cols);
   static storage::Schema SystemTableSchema();
   static storage::Schema IndexTableSchema();
+  static storage::Schema ViewTableSchema();
   storage::Rid FindCatalogRow(const std::string& name) const;
   storage::Rid FindIndexRow(const std::string& index_name) const;
+  storage::Rid FindViewRow(const std::string& view_name) const;
   // 扫描到的每行 → CatalogTable；失败返回 false
   bool DecodeRow(const storage::Record& row, CatalogTable* out) const;
   // 索引系统表每行 → CatalogIndex；失败返回 false
   bool DecodeIndexRow(const storage::Record& row, CatalogIndex* out) const;
+  // 视图系统表每行 → CatalogView；失败返回 false
+  bool DecodeViewRow(const storage::Record& row, CatalogView* out) const;
   // 把系统表自身作为一条合成条目放进内存目录（可查、可 FindTable）
   void AddSystemTableEntry();
   // 把索引系统表作为一条合成条目放进内存目录（可查）
   void AddIndexTableEntry();
+  // 把视图系统表作为一条合成条目放进内存目录（可查）
+  void AddViewTableEntry();
 
   std::string data_dir_;
   uint32_t next_table_id_ = 1;
   std::map<std::string, CatalogTable> tables_;  // 键 = 大写表名
   std::map<std::string, CatalogIndex> indexes_; // 键 = 大写索引名
+  std::map<std::string, CatalogView> views_;    // 键 = 大写视图名
   storage::IStorage* storage_ = nullptr;
 };
 

@@ -13,6 +13,10 @@
 #include <utility>
 #include <vector>
 
+#include "cella/cella_lexer.h"
+#include "cella/cella_optimizer.h"
+#include "cella/cella_parser.h"
+#include "cella/cella_semantic.h"
 #include "cella/db/auth/auth_store.h"
 #include "cella/db/common/db_logger.h"
 #include "cella/db/common/value_bridge.h"
@@ -374,6 +378,19 @@ namespace cella::db
     ++operator_calls_;
     DbLogDebug(logcat::kExec, "执行算子 " + plan.op);
 
+    // 语句级状态复位：子查询缓存 / 窗口值 / CTE / 上一轮的编译产物。
+    // 必须在这里（而不是析构或下条语句）清 —— 缓存跨语句复用会拿到陈旧数据。
+    ResetStatementState();
+    cur_ctx_ = &ctx;
+
+    // 退出时恢复「无当前语句」：执行器是长生命周期对象，而 ExecContext 是调用方
+    // 栈上的临时量，留着悬空指针比留脏缓存更危险。
+    struct CtxGuard
+    {
+      const ExecContext **slot;
+      ~CtxGuard() { *slot = nullptr; }
+    } ctx_guard{&cur_ctx_};
+
     if (plan.op == "CreateTable")
     {
       return ExecCreateTable(plan, ctx, out);
@@ -410,7 +427,30 @@ namespace cella::db
     {
       return ExecUpdate(plan, ctx, out);
     }
+    if (plan.op == "CreateView")
+    {
+      return ExecCreateView(plan, ctx, out);
+    }
+    if (plan.op == "DropView")
+    {
+      return ExecDropView(plan, ctx, out);
+    }
+    if (plan.op == "With")
+    {
+      return ExecWith(plan, ctx, out);
+    }
     return ExecGet(plan, ctx, out);
+  }
+
+  void Executor::ResetStatementState()
+  {
+    subquery_cache_.clear();
+    window_values_.clear();
+    local_views_.clear();
+    view_parse_cache_.clear();
+    stmt_keepalive_.clear();
+    eval_ctx_.sub = this;
+    eval_ctx_.window_values = &window_values_;
   }
 
   // 表级权限判定。短路顺序：访问控制关 → 管理员 → 无需检查（DDL）→ 未绑定身份库 →
@@ -1948,7 +1988,7 @@ namespace cella::db
           continue;
         }
         storage::Value raw;
-        const DbStatus es = ExprEval::Eval(*row[static_cast<size_t>(as_target)], EvalRow::Empty(), &raw);
+        const DbStatus es = ExprEval::Eval(*row[static_cast<size_t>(as_target)], EvalRow::Empty(), &raw, &eval_ctx_);
         if (!es.ok())
         {
           return es;
@@ -2052,7 +2092,7 @@ namespace cella::db
         const std::vector<storage::Value> vals = ValuesWithRowid(it->values(), it.rid(), with_rowid);
         row.values = &vals;
         bool pass = false;
-        const DbStatus es = ExprEval::EvalPredicate(*pred, row, &pass);
+        const DbStatus es = ExprEval::EvalPredicate(*pred, row, &pass, &eval_ctx_);
         if (!es.ok())
         {
           return es;
@@ -3766,7 +3806,7 @@ namespace cella::db
         row.fields = &fields;
         row.values = &h.second.values();
         storage::Value raw;
-        const DbStatus es = ExprEval::Eval(*a->expr, row, &raw);
+        const DbStatus es = ExprEval::Eval(*a->expr, row, &raw, &eval_ctx_);
         if (!es.ok())
         {
           return es;
@@ -3899,6 +3939,28 @@ namespace cella::db
     ++operator_calls_;
     DbLogDebug(logcat::kExec, "算子 " + node.op);
 
+    // 直接驱动算子树（单测/EXPLAIN 路径）时没有走 Execute，这里补一次最外层的
+    // 语句状态初始化：cur_ctx_ 为空即代表「本层是本次执行的最外层」。
+    // 嵌套的 Run（Run → RunSingleChild → Run）看到非空即跳过，因此下面这个
+    // 守卫只有最外层那一次会装 —— 清空时机与安装时机一一对应。
+    const bool outermost = (cur_ctx_ == nullptr);
+    if (outermost)
+    {
+      ResetStatementState();
+      cur_ctx_ = &ctx;
+    }
+    struct RunCtxGuard
+    {
+      const ExecContext **slot = nullptr;
+      ~RunCtxGuard()
+      {
+        if (slot != nullptr)
+        {
+          *slot = nullptr;
+        }
+      }
+    } run_guard{outermost ? &cur_ctx_ : nullptr};
+
     const std::string &op = node.op;
     if (op == "SeqScan")
       return OpSeqScan(node, ctx, out);
@@ -3969,6 +4031,18 @@ namespace cella::db
     else if (!ParseTableDisplay(node.detail, &name, &alias))
     {
       return DbStatus::Error(DbCode::kInternal, "表访问缺少表信息: " + node.detail);
+    }
+
+    // ── 视图 / CTE：改写成「执行它的定义查询」──────────────────
+    // 计划树里它长得和普通表一模一样（编译器把视图登记成了普通表，见
+    // CatalogManager::ToCompilerCatalog），只有执行期才知道它不是物理表。
+    // 展开在这里做而不是改计划树，好处是：索引下推/列需求/谓词登记这些既有
+    // 机制完全不用改 —— 视图下方就是一棵普通的算子树。
+    // 代价：外层的 WHERE 不会下推进视图（视图先算完再过滤），
+    // 这对演示规模没有影响，但确实是与「视图展开成子查询」的语义差异，已记录。
+    if (const cella::CELLA_Stmt *vq = ResolveViewQuery(name))
+    {
+      return OpViewScan(node, ctx, out, *vq);
     }
 
     const CatalogTable *meta = catalog_->FindTable(name);
@@ -4454,7 +4528,7 @@ namespace cella::db
       er.fields = &out->fields;
       er.values = &row;
       bool pass = false;
-      const DbStatus es = ExprEval::EvalPredicate(*node.pred, er, &pass);
+      const DbStatus es = ExprEval::EvalPredicate(*node.pred, er, &pass, &eval_ctx_);
       if (!es.ok())
       {
         return es;
@@ -4521,17 +4595,51 @@ namespace cella::db
     }
 
     out->rows.reserve(in.rows.size());
-    for (const auto &row : in.rows)
+
+    // ── 窗口函数：投影之前先「整列预算」─────────────────────────
+    // 窗口值取决于同一分区的其它行（排名还要组内排序），逐行求不出来。
+    // 因此这里先把每个窗口表达式的整列算好，再逐行按「表达式节点地址」
+    // 放进 window_values_，让 ExprEval 用普通取值的路径读到它。
+    // 每个表达式只算一次（同一表达式在 SELECT 里出现两次也只算一次）。
+    std::vector<const cella::CELLA_Expr *> windows;
+    for (const auto &e : node.exprs)
     {
+      ExprEval::CollectWindows(*e, &windows);
+    }
+    std::map<const cella::CELLA_Expr *, std::vector<storage::Value>> win_cols;
+    for (const cella::CELLA_Expr *w : windows)
+    {
+      std::vector<storage::Value> col;
+      const DbStatus ws = ComputeWindowColumn(*w, in, &col);
+      if (!ws.ok())
+      {
+        return ws;
+      }
+      win_cols.emplace(w, std::move(col));
+    }
+
+    for (size_t r = 0; r < in.rows.size(); ++r)
+    {
+      const auto &row = in.rows[r];
       EvalRow er;
       er.fields = &in.fields;
       er.values = &row;
+      // 把本行的窗口值挂上（清空后重填：表达式集合每条语句是固定的，
+      // 但行与行之间必须换值，漏清会让上一行的排名泄漏到下一行）。
+      if (!windows.empty())
+      {
+        window_values_.clear();
+        for (const auto &kv : win_cols)
+        {
+          window_values_[kv.first] = kv.second[r];
+        }
+      }
       std::vector<storage::Value> produced;
       produced.reserve(visible + hidden.size());
       for (const auto &e : node.exprs)
       {
         storage::Value v;
-        const DbStatus es = ExprEval::Eval(*e, er, &v);
+        const DbStatus es = ExprEval::Eval(*e, er, &v, &eval_ctx_);
         if (!es.ok())
         {
           return es;
@@ -4541,7 +4649,7 @@ namespace cella::db
       for (const auto &he : hidden)
       {
         storage::Value v;
-        const DbStatus es = ExprEval::Eval(he, er, &v);
+        const DbStatus es = ExprEval::Eval(he, er, &v, &eval_ctx_);
         if (!es.ok())
         {
           // 未投影列有时确实无法在输入行里解析（如形似列名的表达式）；
@@ -4552,6 +4660,7 @@ namespace cella::db
       }
       out->rows.push_back(std::move(produced));
     }
+    window_values_.clear();
     return DbStatus::Ok();
   }
 
@@ -5041,7 +5150,7 @@ namespace cella::db
           EvalRow er;
           er.fields = &out->fields;
           er.values = &combined;
-          const DbStatus es = ExprEval::EvalPredicate(*node.onExpr, er, &pass);
+          const DbStatus es = ExprEval::EvalPredicate(*node.onExpr, er, &pass, &eval_ctx_);
           if (!es.ok())
           {
             return es;
@@ -5395,6 +5504,674 @@ namespace cella::db
       return FromStorage(is, "恢复重做更新(插新) " + meta->name);
     }
     return IndexRowUpdate(&indexes, *meta, before, rec.values(), old_rid, new_rid);
+  }
+
+  // ═════════════════════════════════════════════════════════════
+  // 语言生态落地：子查询 / 窗口函数 / 视图 / CTE
+  // ═════════════════════════════════════════════════════════════
+  //
+  // 这三类能力在编译器层早就通了（解析 + 语义 + 计划节点齐全），卡住它们的是
+  // 执行期的一个共同特征：**答案不在「一行值」的视野里**。
+  //   * 子查询要递归跑一条完整查询；
+  //   * 窗口函数要先看完整分区、组内排序；
+  //   * 视图/CTE 是「一张表」的名字，背后却是一条查询。
+  // 本节的实现遵循同一条原则：**不改求值器结构，也不改计划树形状**，
+  // 而是把这三件事分别收敛到三个明确的挂载点上 ——
+  //   ① ExprEval 通过 EvalCtx 回调拿子查询结果（见 RunSubquery）；
+  //   ② OpProject 在投影前把窗口值整列算好（见 ComputeWindowColumn）；
+  //   ③ OpTableAccess 在扫到视图名时改跑它的定义查询（见 OpViewScan）。
+  // 这样既保住了 golden 的计划文本契约，也让每一块都能被单独测试。
+
+  // ── 执行期编译：把一条「语句体」跑成结果集 ─────────────────────
+  // 子查询 / CTE 主语句 / 视图定义都不在本语句的计划树里，需要现场编译。
+  // 与 Session 的正常编译链路完全同构（语义 → 计划 → 优化），区别只有两点：
+  //   ① 目录里额外登记了本语句作用域内的 CTE；
+  //   ② 编译产物挂到 stmt_keepalive_（计划树里的 stmt/tableRef 是指向 AST 的裸指针）。
+  DbStatus Executor::CompileAndRunStmt(const cella::CELLA_Stmt &st, const ExecContext &ctx,
+                                       RowSet *out, bool exists_only)
+  {
+    if (catalog_ == nullptr)
+    {
+      return DbStatus::Error(DbCode::kCatalogError, "目录未附加存储引擎");
+    }
+    KeptQuery kept;
+    kept.program = std::make_unique<cella::CELLA_Program>();
+    kept.program->statements.push_back(cella::cella_cloneStmt(st));
+
+    cella::CELLA_Catalog cat = catalog_->ToCompilerCatalog();
+    RegisterLocalViews(&cat);
+
+    const cella::CELLA_SemanticResult sem = cella::cella_analyze(*kept.program, cat);
+    if (sem.stmtOk.empty() || !sem.stmtOk[0])
+    {
+      std::string detail;
+      if (!sem.errors.empty())
+      {
+        detail = "：" + sem.errors.front().code + " " + sem.errors.front().message;
+      }
+      return DbStatus::Error(DbCode::kSqlError, "子查询/视图定义未通过语义检查" + detail);
+    }
+    std::vector<cella::CELLA_Error> plan_errors;
+    auto plans = cella::cella_plan(*kept.program, sem.stmtOk, sem.insertColumns, plan_errors);
+    if (plans.empty())
+    {
+      std::string detail;
+      if (!plan_errors.empty())
+      {
+        detail = "：" + plan_errors.front().code + " " + plan_errors.front().message;
+      }
+      return DbStatus::Error(DbCode::kSqlError, "无法为子查询/视图定义生成执行计划" + detail);
+    }
+    auto opt = cella::cella_optimizePlans(plans);
+    if (opt.plans.empty())
+    {
+      return DbStatus::Error(DbCode::kInternal, "子查询/视图定义优化后计划为空");
+    }
+    kept.plans = std::move(opt.plans);
+    // EXISTS 只关心「有没有行」→ 顶上压一个 Limit 1，让扫描层尽早停。
+    // 直接构造计划节点（不经过编译器），因此不会出现在任何 golden 文本里。
+    if (exists_only)
+    {
+      auto lim = std::make_unique<cella::CELLA_PlanNode>();
+      lim->op = "Limit";
+      lim->rowLimit = 1;
+      lim->children.push_back(std::move(kept.plans[0]));
+      kept.plans[0] = std::move(lim);
+    }
+    // 计划节点本体在堆上，vector 搬移只动 unique_ptr → 指针在 Run 期间保持有效。
+    const cella::CELLA_PlanNode *root = kept.plans[0].get();
+    stmt_keepalive_.push_back(std::move(kept));
+    return Run(*root, ctx, out);
+  }
+
+  void Executor::RegisterLocalViews(cella::CELLA_Catalog *cat) const
+  {
+    if (cat == nullptr)
+    {
+      return;
+    }
+    for (const auto &kv : local_views_)
+    {
+      const LocalView &lv = kv.second;
+      if (lv.name.empty())
+      {
+        continue;
+      }
+      cella::CELLA_Table t;
+      t.name = lv.name;
+      for (const auto &c : lv.columns)
+      {
+        cella::CELLA_Column cc;
+        cc.name = c.name;
+        cc.type = c.type;
+        cc.len = c.len;
+        cc.notNull = c.not_null;
+        cc.primaryKey = c.primary_key;
+        t.columns.push_back(std::move(cc));
+      }
+      (void)cat->addTable(std::move(t));  // 重名由语义层拦（SEM-356），这里静默跳过
+    }
+  }
+
+  const cella::CELLA_Stmt *Executor::ResolveViewQuery(const std::string &name)
+  {
+    // ① 语句作用域的 CTE 优先：WITH 里定义的名字遮蔽同名持久视图（与 SQL 直觉一致）。
+    const std::string key = cella::cella_toUpper(name);
+    const auto local = local_views_.find(key);
+    if (local != local_views_.end())
+    {
+      return local->second.query;
+    }
+    if (catalog_ == nullptr)
+    {
+      return nullptr;
+    }
+    // ② 持久视图：没有现成的 AST，只能把定义原文重新解析一遍。
+    const CatalogView *v = catalog_->FindView(name);
+    if (v == nullptr || v->query.empty())
+    {
+      return nullptr;
+    }
+    const auto cached = view_parse_cache_.find(key);
+    if (cached != view_parse_cache_.end())
+    {
+      return cached->second;  // nullptr 也缓存：避免同一条语句里反复解析坏定义
+    }
+    std::vector<cella::CELLA_Error> errors;
+    const auto tokens = cella::cella_tokenize(v->query, errors);
+    auto program = cella::cella_parse(tokens, errors);
+    const cella::CELLA_Stmt *q = nullptr;
+    if (program && errors.empty() && !program->statements.empty() &&
+        program->statements[0]->kind == cella::CELLA_Stmt::Kind::CREATE_VIEW)
+    {
+      q = program->statements[0]->viewQuery.get();
+    }
+    if (q == nullptr)
+    {
+      DbLogWarn(logcat::kExec, "视图 " + name + " 的定义语句无法解析为 CREATE VIEW，已忽略");
+      view_parse_cache_[key] = nullptr;
+      return nullptr;
+    }
+    // 解析产物必须活到语句结束（计划树里的 tableRef 会指向它）。
+    KeptQuery kept;
+    kept.program = std::move(program);
+    stmt_keepalive_.push_back(std::move(kept));
+    view_parse_cache_[key] = q;
+    return q;
+  }
+
+  DbStatus Executor::OpViewScan(const cella::CELLA_PlanNode &node, const ExecContext &ctx,
+                                RowSet *out, const cella::CELLA_Stmt &query)
+  {
+    RowSet inner;
+    const DbStatus s = CompileAndRunStmt(query, ctx, &inner);
+    if (!s.ok())
+    {
+      return s;
+    }
+    // 结果列的限定符改成「视图名/别名」：外层 `v.col` 形式的引用要能解析到它们。
+    // （视图定义内部的 Project 会把 qualifier 清空，所以这里统一重设。）
+    std::string name;
+    std::string alias;
+    if (node.tableRef != nullptr)
+    {
+      name = node.tableRef->name;
+      alias = node.tableRef->alias;
+    }
+    else
+    {
+      (void)ParseTableDisplay(node.detail, &name, &alias);
+    }
+    const std::string qualifier = alias.empty() ? name : alias;
+    out->fields = std::move(inner.fields);
+    for (auto &f : out->fields)
+    {
+      f.qualifier = qualifier;
+    }
+    out->rows = std::move(inner.rows);
+    return DbStatus::Ok();
+  }
+
+  DbStatus Executor::RunSubquery(const cella::CELLA_Stmt &sub, bool exists_only,
+                                 std::vector<storage::Value> *values, bool *any_row)
+  {
+    if (values != nullptr)
+    {
+      values->clear();
+    }
+    if (any_row != nullptr)
+    {
+      *any_row = false;
+    }
+    // 语句级缓存：语义阶段保证子查询不引用外层列 → 结果与外层行无关。
+    // 没有这层缓存，WHERE 里的子查询会按外层行数重复执行（O(N·M)）。
+    const auto cached = subquery_cache_.find(&sub);
+    if (cached != subquery_cache_.end())
+    {
+      if (values != nullptr)
+      {
+        *values = cached->second.values;
+      }
+      if (any_row != nullptr)
+      {
+        *any_row = cached->second.any_row;
+      }
+      return DbStatus::Ok();
+    }
+    if (cur_ctx_ == nullptr)
+    {
+      return DbStatus::Error(DbCode::kInternal, "子查询求值缺少语句执行上下文");
+    }
+    RowSet rs;
+    const DbStatus s = CompileAndRunStmt(sub, *cur_ctx_, &rs, exists_only);
+    if (!s.ok())
+    {
+      return s;
+    }
+    SubqueryResult r;
+    r.values.reserve(rs.rows.size());
+    for (const auto &row : rs.rows)
+    {
+      // 子查询恒为单列（IN / 标量）：列数为 0 的极端情况按 NULL 处理，
+      // 让三值逻辑去决定它是否命中，而不是在这里抛内部错误。
+      r.values.push_back(row.empty() ? storage::Value::Null() : row[0]);
+    }
+    r.any_row = !rs.rows.empty();
+    subquery_cache_[&sub] = r;
+    if (values != nullptr)
+    {
+      *values = r.values;
+    }
+    if (any_row != nullptr)
+    {
+      *any_row = r.any_row;
+    }
+    return DbStatus::Ok();
+  }
+
+  // ── 视图 DDL ──────────────────────────────────────────────────
+
+  DbStatus Executor::ExecCreateView(const cella::CELLA_PlanNode &plan, const ExecContext &ctx,
+                                    QueryResult *out)
+  {
+    const cella::CELLA_Stmt *st = plan.stmt;
+    if (st == nullptr || !st->viewQuery)
+    {
+      return DbStatus::Error(DbCode::kInternal, "CreateView 缺少定义查询");
+    }
+    if (catalog_ == nullptr)
+    {
+      return DbStatus::Error(DbCode::kCatalogError, "目录未附加存储引擎");
+    }
+    const std::string name = st->viewName;
+    if (name.empty())
+    {
+      return DbStatus::Error(DbCode::kInternal, "CREATE VIEW 缺少视图名");
+    }
+    if (CatalogManager::IsProtectedSystemTable(name))
+    {
+      return DbStatus::Error(DbCode::kSystemTableProtected, "系统表名不可用作视图名: " + name);
+    }
+    if (catalog_->FindTable(name) != nullptr)
+    {
+      return DbStatus::Error(DbCode::kTableExists, "表已存在，不能建同名视图: " + name);
+    }
+    if (catalog_->FindView(name) != nullptr)
+    {
+      return DbStatus::Error(DbCode::kTableExists, "视图已存在: " + name);
+    }
+    // 视图要跨重启存活，只能持久化「定义语句原文」（计划/AST 都不可序列化）。
+    // 会话层在 ExecContext::stmt_text 里把它交下来；缺失说明调用方绕过了会话。
+    if (ctx.stmt_text.empty())
+    {
+      return DbStatus::Error(DbCode::kInternal,
+                             "CREATE VIEW 缺少语句原文，无法持久化视图定义");
+    }
+
+    cella::CELLA_Catalog cat = catalog_->ToCompilerCatalog();
+    RegisterLocalViews(&cat);
+    std::vector<cella::CELLA_Column> cols;
+    if (!cella::cella_deriveQueryColumns(*st->viewQuery, cat, &cols))
+    {
+      return DbStatus::Error(DbCode::kSqlError,
+                             "无法推导视图 \"" + name + "\" 的输出列（FROM 的表不存在？）");
+    }
+    CatalogView v;
+    v.name = name;
+    v.query = ctx.stmt_text;
+    v.created_at = static_cast<int64_t>(std::time(nullptr));
+    for (const auto &c : cols)
+    {
+      CatalogColumn cc;
+      cc.name = c.name;
+      cc.type = c.type;
+      cc.len = c.len;
+      cc.not_null = c.notNull;
+      v.columns.push_back(std::move(cc));
+    }
+    {
+      StorageGuard guard(storage_mutex_);
+      const DbStatus ws = catalog_->WriteViewRow(v);
+      if (!ws.ok())
+      {
+        return ws;
+      }
+    }
+    out->tag = "CREATE VIEW";
+    DbLogInfo(logcat::kExec, "已创建视图 " + name + "（" + std::to_string(cols.size()) + " 列）");
+    return DbStatus::Ok();
+  }
+
+  DbStatus Executor::ExecDropView(const cella::CELLA_PlanNode &plan, const ExecContext &ctx,
+                                  QueryResult *out)
+  {
+    (void)ctx;
+    const cella::CELLA_Stmt *st = plan.stmt;
+    if (st == nullptr)
+    {
+      return DbStatus::Error(DbCode::kInternal, "DropView 缺少语句回指");
+    }
+    if (catalog_ == nullptr)
+    {
+      return DbStatus::Error(DbCode::kCatalogError, "目录未附加存储引擎");
+    }
+    const std::string name = st->viewName;
+    if (catalog_->FindView(name) == nullptr)
+    {
+      return DbStatus::Error(DbCode::kTableNotFound, "视图不存在: " + name);
+    }
+    {
+      StorageGuard guard(storage_mutex_);
+      const DbStatus ds = catalog_->DeleteViewRows(name);
+      if (!ds.ok())
+      {
+        return ds;
+      }
+    }
+    out->tag = "DROP VIEW";
+    DbLogInfo(logcat::kExec, "已删除视图 " + name);
+    return DbStatus::Ok();
+  }
+
+  DbStatus Executor::ExecWith(const cella::CELLA_PlanNode &plan, const ExecContext &ctx,
+                              QueryResult *out)
+  {
+    const cella::CELLA_Stmt *st = plan.stmt;
+    if (st == nullptr || !st->cteMain)
+    {
+      return DbStatus::Error(DbCode::kInternal, "WITH 缺少主语句");
+    }
+    if (catalog_ == nullptr)
+    {
+      return DbStatus::Error(DbCode::kCatalogError, "目录未附加存储引擎");
+    }
+    // 按声明序登记：后面的 CTE 可以引用前面的（派生列要看到已登记的那些）。
+    for (size_t i = 0; i < st->cteNames.size(); ++i)
+    {
+      if (i >= st->cteQueries.size() || !st->cteQueries[i])
+      {
+        return DbStatus::Error(DbCode::kInternal, "WITH 的 CTE 定义缺失");
+      }
+      const cella::CELLA_Stmt &q = *st->cteQueries[i];
+      cella::CELLA_Catalog cat = catalog_->ToCompilerCatalog();
+      RegisterLocalViews(&cat);
+      std::vector<cella::CELLA_Column> cols;
+      if (!cella::cella_deriveQueryColumns(q, cat, &cols))
+      {
+        return DbStatus::Error(DbCode::kSqlError,
+                               "无法推导 CTE \"" + st->cteNames[i] + "\" 的输出列");
+      }
+      LocalView lv;
+      lv.name = st->cteNames[i];
+      lv.query = &q;
+      for (const auto &c : cols)
+      {
+        CatalogColumn cc;
+        cc.name = c.name;
+        cc.type = c.type;
+        cc.len = c.len;
+        cc.not_null = c.notNull;
+        lv.columns.push_back(std::move(cc));
+      }
+      local_views_[cella::cella_toUpper(lv.name)] = std::move(lv);
+    }
+
+    RowSet rs;
+    const DbStatus s = CompileAndRunStmt(*st->cteMain, ctx, &rs);
+    if (!s.ok())
+    {
+      return s;
+    }
+    out->columns.reserve(rs.fields.size());
+    for (const auto &f : rs.fields)
+    {
+      ResultColumn c;
+      c.name = f.Display();
+      out->columns.push_back(std::move(c));
+    }
+    out->rows = std::move(rs.rows);
+    out->tag = "WITH " + std::to_string(out->rows.size());
+    return DbStatus::Ok();
+  }
+
+  // ── 窗口函数：整列计算 ────────────────────────────────────────
+  //
+  // 语义（与标准 SQL 的默认帧一致）：
+  //   * PARTITION BY 分组；没写分区键 → 全表一个分区；
+  //   * ORDERED BY 决定组内顺序，也是排名函数并列判定的依据；
+  //   * 排名函数 ROW_NUMBER / RANK / DENSE_RANK 只依赖顺序，不依赖帧；
+  //   * 窗口聚合（COUNT/SUM/AVG/MIN/MAX）的默认帧是「整个分区」——
+  //     这是本项目刻意选择的简化（没有实现 ROWS/RANGE 帧），演示口径够用，
+  //     已记入已知边界：不做「累计到当前行」的滑窗。
+  DbStatus Executor::ComputeWindowColumn(const cella::CELLA_Expr &win, const RowSet &in,
+                                         std::vector<storage::Value> *out)
+  {
+    const size_t n = in.rows.size();
+    out->assign(n, storage::Value::Null());
+    if (n == 0)
+    {
+      return DbStatus::Ok();
+    }
+
+    auto resolveKey = [&](const cella::CELLA_ColName &k, const char *what, int *idx) -> DbStatus
+    {
+      const int i = in.Resolve(k.table, k.column);
+      if (i < 0)
+      {
+        const std::string shown = k.table.empty() ? k.column : (k.table + "." + k.column);
+        return DbStatus::Error(DbCode::kColumnNotFound,
+                               std::string("窗口") + what + "列不存在: " + shown);
+      }
+      *idx = i;
+      return DbStatus::Ok();
+    };
+
+    std::vector<int> part;
+    for (const auto &k : win.winPartition)
+    {
+      int i = 0;
+      const DbStatus s = resolveKey(k, "分区", &i);
+      if (!s.ok())
+      {
+        return s;
+      }
+      part.push_back(i);
+    }
+    std::vector<int> ord;
+    std::vector<bool> asc;
+    for (size_t k = 0; k < win.winOrder.size(); ++k)
+    {
+      int i = 0;
+      const DbStatus s = resolveKey(win.winOrder[k], "排序", &i);
+      if (!s.ok())
+      {
+        return s;
+      }
+      ord.push_back(i);
+      asc.push_back(k < win.winOrderAsc.size() ? win.winOrderAsc[k] : true);
+    }
+
+    // 键元组比较：NULL 恒排最后（与 OpSort 的约定一致，两处不能各写一套）。
+    // dirs 为空表示不施加方向（分区键必须如此：它只用来判等，不参与排序）。
+    auto cmpKeys = [&](const std::vector<storage::Value> &a,
+                       const std::vector<storage::Value> &b, const std::vector<int> &keys,
+                       const std::vector<bool> *dirs) -> int
+    {
+      for (size_t k = 0; k < keys.size(); ++k)
+      {
+        const storage::Value &x = a[static_cast<size_t>(keys[k])];
+        const storage::Value &y = b[static_cast<size_t>(keys[k])];
+        if (x.IsNull() && y.IsNull())
+        {
+          continue;
+        }
+        // NULL 的位置在取反**之前**就定死：DESC 下也排最后。
+        // 若把 NULL 判定混进 c 再随方向取反，DESC 会把 NULL 翻到最前面，
+        // 与 ORDERED BY 的行为不一致（同一个 DESC 排序，两处结果不同最容易被当成 bug）。
+        if (x.IsNull())
+        {
+          return 1;
+        }
+        if (y.IsNull())
+        {
+          return -1;
+        }
+        const int c = CompareValues(x, y, nullptr);
+        if (c != 0)
+        {
+          return (dirs != nullptr && !(*dirs)[k]) ? -c : c;
+        }
+      }
+      return 0;
+    };
+
+    // 先按分区键整体排序 → 同分区的行相邻，切段即得分区。
+    std::vector<size_t> order(n);
+    for (size_t i = 0; i < n; ++i)
+    {
+      order[i] = i;
+    }
+    std::stable_sort(order.begin(), order.end(),
+                     [&](size_t a, size_t b)
+                     { return cmpKeys(in.rows[a], in.rows[b], part, nullptr) < 0; });
+
+    const bool is_row_number = (win.funcName == "ROW_NUMBER");
+    const bool is_rank = (win.funcName == "RANK");
+    const bool is_dense = (win.funcName == "DENSE_RANK");
+    const bool ranking = is_row_number || is_rank || is_dense;
+    const std::string agg = win.aggFunc.empty() ? std::string("COUNT") : win.aggFunc;
+
+    // 聚合参数列（COUNT(*) 没有参数列）
+    int agg_col = -1;
+    if (!ranking && !win.aggStar)
+    {
+      agg_col = in.Resolve(win.table, win.column);
+      if (agg_col < 0 && !win.args.empty() && win.args[0])
+      {
+        agg_col = in.Resolve(win.args[0]->table, win.args[0]->column);
+      }
+      if (agg_col < 0)
+      {
+        const std::string shown = win.column.empty() ? std::string("(表达式)") : win.column;
+        return DbStatus::Error(DbCode::kColumnNotFound, "窗口聚合参数列不存在: " + shown);
+      }
+    }
+
+    size_t begin = 0;
+    while (begin < n)
+    {
+      size_t end = begin + 1;
+      while (end < n && cmpKeys(in.rows[order[begin]], in.rows[order[end]], part, nullptr) == 0)
+      {
+        ++end;
+      }
+      std::vector<size_t> grp(order.begin() + static_cast<long>(begin),
+                              order.begin() + static_cast<long>(end));
+      std::stable_sort(grp.begin(), grp.end(),
+                       [&](size_t a, size_t b)
+                       { return cmpKeys(in.rows[a], in.rows[b], ord, &asc) < 0; });
+
+      if (ranking)
+      {
+        if (is_row_number)
+        {
+          for (size_t k = 0; k < grp.size(); ++k)
+          {
+            (*out)[grp[k]] = storage::Value::Int(static_cast<int32_t>(k + 1));
+          }
+        }
+        else
+        {
+          // 并列判定：与前一行的排序键完全相同即为并列。
+          // RANK 跳号（1,1,3），DENSE_RANK 不跳号（1,1,2）。
+          int32_t rank = 0;
+          int32_t dense = 0;
+          for (size_t k = 0; k < grp.size(); ++k)
+          {
+            if (k == 0 || cmpKeys(in.rows[grp[k - 1]], in.rows[grp[k]], ord, &asc) != 0)
+            {
+              rank = static_cast<int32_t>(k + 1);
+              ++dense;
+            }
+            (*out)[grp[k]] = storage::Value::Int(is_rank ? rank : dense);
+          }
+        }
+      }
+      else
+      {
+        int64_t cnt = 0;
+        int64_t isum = 0;
+        double fsum = 0.0;
+        bool all_int = true;
+        bool has_best = false;
+        storage::Value best;
+        for (size_t k = 0; k < grp.size(); ++k)
+        {
+          if (win.aggStar)
+          {
+            ++cnt;
+            continue;
+          }
+          const storage::Value &v = in.rows[grp[k]][static_cast<size_t>(agg_col)];
+          if (v.IsNull())
+          {
+            continue;  // 聚合一律忽略 NULL（COUNT(*) 已在上面单独计数）
+          }
+          ++cnt;
+          const bool integral = (v.type == ValueType::kInt32 || v.type == ValueType::kInt64);
+          if (!integral)
+          {
+            all_int = false;
+          }
+          const double d = (v.type == ValueType::kInt32)
+                               ? static_cast<double>(v.int32_val)
+                               : (v.type == ValueType::kInt64)
+                                     ? static_cast<double>(v.int64_val)
+                                     : (v.type == ValueType::kFloat) ? static_cast<double>(v.float_val)
+                                                                     : v.double_val;
+          fsum += d;
+          isum += (v.type == ValueType::kInt32)
+                      ? static_cast<int64_t>(v.int32_val)
+                      : (v.type == ValueType::kInt64 ? v.int64_val : static_cast<int64_t>(d));
+          if (agg == "MIN" || agg == "MAX")
+          {
+            if (!has_best)
+            {
+              best = v;
+              has_best = true;
+            }
+            else
+            {
+              const int c = CompareValues(v, best, nullptr);
+              if ((agg == "MIN" && c < 0) || (agg == "MAX" && c > 0))
+              {
+                best = v;
+              }
+            }
+          }
+        }
+
+        storage::Value result;
+        if (agg == "COUNT")
+        {
+          result = storage::Value::BigInt(cnt);
+        }
+        else if (agg == "SUM")
+        {
+          if (cnt == 0)
+          {
+            result = storage::Value::Null();
+          }
+          else if (all_int)
+          {
+            result = storage::Value::BigInt(isum);
+          }
+          else
+          {
+            result = storage::Value::Double(fsum);
+          }
+        }
+        else if (agg == "AVG")
+        {
+          result = (cnt == 0) ? storage::Value::Null()
+                              : storage::Value::Double(fsum / static_cast<double>(cnt));
+        }
+        else if (agg == "MIN" || agg == "MAX")
+        {
+          result = has_best ? best : storage::Value::Null();
+        }
+        else
+        {
+          return DbStatus::Error(DbCode::kNotImplemented, "不支持的窗口聚合: " + agg);
+        }
+        for (size_t k = 0; k < grp.size(); ++k)
+        {
+          (*out)[grp[k]] = result;
+        }
+      }
+      begin = end;
+    }
+    return DbStatus::Ok();
   }
 
 } // namespace cella::db

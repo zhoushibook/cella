@@ -1892,6 +1892,16 @@ namespace cella
 
     } // namespace
 
+    // 公共包装：语义内部与执行期（视图/CTE 登记）共用同一套列推导规则。
+    bool cella_deriveQueryColumns(const CELLA_Stmt &query, const CELLA_Catalog &catalog,
+                                  std::vector<CELLA_Column> *outCols)
+    {
+        if (outCols == nullptr)
+            return false;
+        outCols->clear();
+        return deriveViewColumns(query, catalog, *outCols);
+    }
+
     CELLA_SemanticResult cella_analyze(const CELLA_Program &program, CELLA_Catalog &catalog)
     {
         CELLA_SemanticResult result;

@@ -28,9 +28,15 @@
 #include <utility>
 #include <vector>
 
+// 注意：本头**不**包含 cella_parser.h / cella_semantic.h / cella_optimizer.h。
+// 执行期展开（视图/CTE/子查询）要现场编译，但那只发生在 executor.cpp 内部；
+// 把它们放进本头会把 cella_token.h 拖进每一个用到执行器的 TU ——
+// 而 cella_token.h 的枚举成员名与 Windows 宏同名，包含顺序一变就炸（见该头注释）。
+// 保持「头文件只暴露接口、编译依赖留在 .cpp」这条线，能少一类难查的问题。
 #include "cella/cella_planner.h"
 #include "cella/db/auth/privilege.h"
 #include "cella/db/catalog/catalog_manager.h"
+#include "cella/db/exec/expr_eval.h"
 #include "cella/db/exec/query_result.h"
 #include "cella/db/exec/row_set.h"
 #include "cella/db/txn/transaction.h"
@@ -107,13 +113,17 @@ struct ExecContext {
   std::string user;             // 当前登录用户（auth_enabled 时有效）
 
   bool recording() const { return txn != nullptr; }
+  // 本条语句的原始 SQL 文本（会话层填入）。
+  // 为什么执行器需要它：视图要跨重启存活，只能把「定义语句原文」持久化下来，
+  // 展开时再解析一次 —— 而执行器拿不到这条文本的别处来源（计划树里只有 AST）。
+  std::string stmt_text;
 };
 
 // 语句是否在任何位置引用了 rowid 伪列（投影 / 条件 / 分组 / 排序 / SET 表达式）。
 // 会话层用它决定是否让扫描附加 rowid（见 ExecContext::with_rowid）。
 bool StmtRefersRowid(const cella::CELLA_Stmt* st);
 
-class Executor : public wal::IUndoApplier {
+class Executor : public wal::IUndoApplier, public SubqueryRunner {
  public:
   Executor(storage::IStorage* storage, CatalogManager* catalog, TxnManager* txn_manager,
            LockManager* locks, std::recursive_mutex* storage_mutex);
@@ -186,6 +196,13 @@ class Executor : public wal::IUndoApplier {
   // 只跑查询算子子树（GET 的各类算子也可单独驱动，便于测试）
   DbStatus Run(const cella::CELLA_PlanNode& node, const ExecContext& ctx, RowSet* out);
 
+  // ── 子查询（SubqueryRunner 实现）──────────────────────────────
+  // 语义阶段已确认子查询**不引用外层列**（见 cella_semantic.cpp::resolveSubqueryExpr），
+  // 因此同一个子查询体在一次语句里跑一次就够 —— 结果按语句缓存，
+  // 外层有 N 行也只付一次代价（否则 WHERE 里的子查询会退化成 O(N·M)）。
+  DbStatus RunSubquery(const cella::CELLA_Stmt& sub, bool exists_only,
+                       std::vector<storage::Value>* values, bool* any_row) override;
+
   // 统计：执行的算子次数（可观测「计划驱动」确实发生了）
   size_t operator_calls() const { return operator_calls_; }
   void ResetOperatorCalls() { operator_calls_ = 0; }
@@ -252,6 +269,59 @@ class Executor : public wal::IUndoApplier {
   DbStatus ExecDelete(const cella::CELLA_PlanNode& plan, const ExecContext& ctx, QueryResult* out);
   DbStatus ExecUpdate(const cella::CELLA_PlanNode& plan, const ExecContext& ctx, QueryResult* out);
   DbStatus ExecGet(const cella::CELLA_PlanNode& plan, const ExecContext& ctx, QueryResult* out);
+
+  // ── 视图 / CTE（语言生态补齐）─────────────────────────────────
+  // 视图与 CTE 在编译器侧都是「登记成一张普通表」，所以语义与计划完全复用；
+  // 真正的落地差异全在执行期，共两件事：
+  //   ① 登记：把定义查询的输出列算出来并持久化（视图）或临时登记（CTE）；
+  //   ② 展开：扫到这张「表」时，改为执行它的定义查询（见 OpViewScan）。
+  DbStatus ExecCreateView(const cella::CELLA_PlanNode& plan, const ExecContext& ctx,
+                          QueryResult* out);
+  DbStatus ExecDropView(const cella::CELLA_PlanNode& plan, const ExecContext& ctx,
+                        QueryResult* out);
+  DbStatus ExecWith(const cella::CELLA_PlanNode& plan, const ExecContext& ctx, QueryResult* out);
+
+  // 语句作用域内的临时视图（WITH 的 CTE）。
+  // 与持久视图共用同一条展开路径，区别只在「定义从哪来」：
+  //   持久视图 → cella_view 里存的 SQL 原文，展开时重新解析；
+  //   CTE      → 语句 AST 里的查询体指针（本语句存活期内有效，不落库）。
+  struct LocalView {
+    std::string name;                          // 原始拼写（登记进编译器目录时要用）
+    const cella::CELLA_Stmt* query = nullptr;  // 定义查询体（指向语句 AST）
+    std::vector<CatalogColumn> columns;        // 推导出的输出列
+  };
+
+  // 编译一条「语句体」并执行，结果写进 out。
+  // 用于执行期展开：子查询、CTE 主语句、视图定义 —— 它们在编译期只做了语义登记
+  // （或压根不属于本语句的编译单元），没有现成的计划树。
+  // 编译产物（AST + 计划树）挂在 stmt_keepalive_ 上，随语句结束一起释放。
+  DbStatus CompileAndRunStmt(const cella::CELLA_Stmt& st, const ExecContext& ctx, RowSet* out,
+                             bool exists_only = false);
+
+  // 把 local_views_ 登记进编译器目录（供主语句/子查询解析 CTE 名）。
+  void RegisterLocalViews(cella::CELLA_Catalog* cat) const;
+
+  // 取一个「视图/CTE 名」的定义查询体：先查语句作用域的 CTE，再查持久视图。
+  // 命中返回非空指针；未命中返回 nullptr（调用方按普通表继续）。
+  // 非 const：持久视图要先解析定义原文，解析产物要挂到 stmt_keepalive_ 上存活。
+  const cella::CELLA_Stmt* ResolveViewQuery(const std::string& name);
+
+  // 扫描一个视图：执行它的定义查询，把结果当作「这张表的行」返回。
+  // 字段名沿用定义查询的输出列名，因此上层的 Project/Filter/Sort 无需任何感知。
+  DbStatus OpViewScan(const cella::CELLA_PlanNode& node, const ExecContext& ctx, RowSet* out,
+                      const cella::CELLA_Stmt& query);
+
+  // 语句级状态复位（子查询缓存 / 窗口值 / CTE / 编译产物 / 当前上下文）。
+  // 每条语句开始时调一次 —— 缓存跨语句复用会拿到陈旧数据。
+  void ResetStatementState();
+
+  // ── 窗口函数（OVER）───────────────────────────────────────────
+  // 窗口值无法逐行求（要先看完整分区并按 ORDERED BY 排序），因此 OpProject 在
+  // 投影之前为每个窗口表达式**整列**算好，再按「表达式节点地址」经 EvalCtx 喂给
+  // ExprEval。这样求值器保持无状态，窗口逻辑全部收敛在下面这个函数里。
+  // 结果与 in.rows 等长；不参与分区的行按「全表一个分区」处理。
+  DbStatus ComputeWindowColumn(const cella::CELLA_Expr& win, const RowSet& in,
+                               std::vector<storage::Value>* out);
 
   // ── 查询算子（与计划节点一一对应）──
   DbStatus OpSeqScan(const cella::CELLA_PlanNode& node, const ExecContext& ctx, RowSet* out);
@@ -576,6 +646,32 @@ class Executor : public wal::IUndoApplier {
   std::map<std::string, std::vector<std::string>> needed_cols_;  // 表 → 本语句需要的列（index-only 判定）
   bool explain_mode_ = false;  // true = 只解析访问路径不取数据（Explain 期间）
   IndexUndoAdapter undo_adapter_{this};
+
+  // ── 语言生态（子查询 / 窗口 / 视图 / CTE）的语句级状态 ──────────
+  // 全部在 ResetStatementState() 里清空。之所以挂在执行器上而不是逐层传参：
+  // ExprEval 的调用点有十来处，且递归求值无法把「语句上下文」一路带下去；
+  // 而执行器本身就是「一次语句一次执行」的粒度，天然是这些状态的宿主。
+  struct SubqueryResult {
+    std::vector<storage::Value> values;  // 首列的物化结果
+    bool any_row = false;                // 是否有行（EXISTS 用；与 values 独立，允许早停）
+  };
+  std::map<const cella::CELLA_Stmt*, SubqueryResult> subquery_cache_;  // 子查询体 → 结果
+  std::map<const cella::CELLA_Expr*, storage::Value> window_values_;   // 窗口表达式 → 当前行的值
+  std::map<std::string, LocalView> local_views_;                       // 大写名 → CTE 定义
+  // 持久视图「定义原文 → 查询体 AST」的解析缓存（键 = 大写视图名）。
+  // 只缓存解析结果；AST 本体挂在 stmt_keepalive_ 上，随语句一起释放。
+  std::map<std::string, const cella::CELLA_Stmt*> view_parse_cache_;
+  // 执行期编译出的 AST / 计划树必须活到语句结束：计划节点里的 stmt/tableRef
+  // 是指向 AST 的裸指针（见文件头「执行约定」）。
+  struct KeptQuery {
+    std::unique_ptr<cella::CELLA_Program> program;
+    std::vector<std::unique_ptr<cella::CELLA_PlanNode>> plans;
+  };
+  std::vector<KeptQuery> stmt_keepalive_;
+  // 当前语句的执行上下文：子查询求值发生在表达式深处（拿不到 ctx 参数），
+  // 而它需要事务/锁/库名才能跑 —— 于是由 Execute/Run 在最外层填一次。
+  const ExecContext* cur_ctx_ = nullptr;
+  EvalCtx eval_ctx_;  // 指向上面两张表；交给 ExprEval 的窄接口
 
   // ── ORDER BY 引用未投影列时的「隐藏排序键」通道 ──
   // 计划形状固定为 Project → Distinct → Sort，而 SQL 语义里 ORDER BY 作用在
