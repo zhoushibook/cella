@@ -164,6 +164,10 @@ class CatalogManager {
   // 写/删一条索引元数据（供执行器 DDL 调用；须在 storage_mutex_ 临界区内）。
   DbStatus WriteIndexRow(const CatalogIndex& index);
   DbStatus DeleteIndexRows(const std::string& index_name);
+  // 树根分裂后回写根页号：旧元数据行打墓碑 + 追加带新根页号的行，并就地更新
+  // 内存视图。根页号没变时零开销直接返回（DML 逐行调用不会产生多余 I/O）。
+  // 须在 storage_mutex_ 临界区内调用。
+  DbStatus UpdateIndexRoot(const std::string& index_name, uint32_t root_page_id);
   // 删除一张表的全部索引元数据（DROP TABLE 级联；须在临界区内）。
   DbStatus DeleteIndexesOfTable(const std::string& table_name);
 

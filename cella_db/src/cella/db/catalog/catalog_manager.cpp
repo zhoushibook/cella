@@ -572,6 +572,32 @@ DbStatus CatalogManager::WriteIndexRow(const CatalogIndex& index) {
   return DbStatus::Ok();
 }
 
+DbStatus CatalogManager::UpdateIndexRoot(const std::string& index_name, uint32_t root_page_id) {
+  if (storage_ == nullptr) {
+    return DbStatus::Error(DbCode::kCatalogError, "目录未附加存储引擎");
+  }
+  const std::string key = ToUpper(index_name);
+  auto it = indexes_.find(key);
+  if (it == indexes_.end()) {
+    return DbStatus::Error(DbCode::kIndexNotFound, "索引不存在: " + index_name);
+  }
+  if (it->second.root_page_id == root_page_id) {
+    return DbStatus::Ok();  // 根未变：零开销快路径（DML 逐行调用不会产生多余 I/O）
+  }
+  // 旧行打墓碑，再追加带新根页号的行（cella_index 是堆表，行位置无所谓）。
+  // 顺序：先删后写。中途失败最坏情况是元数据行丢失 —— 与 DDL 既有风险一致
+  //（系统表不进 WAL，靠存盘点落盘），不会出现「两行同名索引」的歧义。
+  const storage::Rid rid = FindIndexRow(index_name);
+  if (rid.IsValid()) {
+    const storage::Status s = storage_->delete_record(kIndexTableName, rid);
+    if (!s.ok()) {
+      return CatalogStorageError("更新索引根页号：删旧元数据行失败", s);
+    }
+  }
+  it->second.root_page_id = root_page_id;
+  return WriteIndexRow(it->second);
+}
+
 DbStatus CatalogManager::DeleteIndexRows(const std::string& index_name) {
   if (storage_ == nullptr) {
     return DbStatus::Error(DbCode::kCatalogError, "目录未附加存储引擎");
