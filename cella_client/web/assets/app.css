@@ -33,7 +33,7 @@ html[data-theme="dark"] {
 html, body { height: 100%; margin: 0; }
 body {
   font-family: var(--sans);
-  font-size: 13px;
+  font-size: 14px;
   color: var(--text);
   background: var(--bg);
   display: flex;
@@ -42,7 +42,7 @@ body {
 }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 .spacer { flex: 1; }
-button { font-family: inherit; font-size: 12px; }
+button { font-family: inherit; font-size: 13px; }
 
 /* ── 顶栏 / 状态栏 ─────────────────────────── */
 .topbar, .statusbar {
@@ -52,8 +52,8 @@ button { font-family: inherit; font-size: 12px; }
 }
 .topbar { height: 42px; flex: none; }
 .statusbar { height: 26px; flex: none; border-bottom: none; border-top: 1px solid var(--border);
-  font-size: 11px; color: var(--text-dim); }
-.brand { font-weight: 500; font-size: 14px; }
+  font-size: 12px; color: var(--text-dim); }
+.brand { font-weight: 500; font-size: 15px; }
 .stlink { cursor: pointer; padding: 2px 6px; border-radius: 4px; }
 .stlink:hover { background: var(--accent-soft); color: var(--accent); }
 
@@ -69,7 +69,7 @@ button { font-family: inherit; font-size: 12px; }
 .btn.danger:hover:not(:disabled) { border-color: var(--err); color: var(--err); }
 .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
-.txnbadge { font-size: 12px; color: var(--text-dim); display: flex; align-items: center; gap: 6px; }
+.txnbadge { font-size: 13px; color: var(--text-dim); display: flex; align-items: center; gap: 6px; }
 .txnbadge::before {
   content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--ok); display: inline-block;
 }
@@ -77,17 +77,17 @@ button { font-family: inherit; font-size: 12px; }
 .txnbadge.active::before { background: var(--warn); }
 
 .dbselect select {
-  font-family: inherit; font-size: 12px; color: var(--text);
+  font-family: inherit; font-size: 13px; color: var(--text);
   background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px;
 }
 .histsel {
-  font-family: inherit; font-size: 12px; color: var(--text); max-width: 190px;
+  font-family: inherit; font-size: 13px; color: var(--text); max-width: 190px;
   background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px;
 }
 .histsel:disabled { opacity: 0.5; }
 .tabadd {
   display: flex; align-items: center; padding: 0 12px; cursor: pointer;
-  color: var(--text-dim); font-size: 15px; border-right: 1px solid var(--border);
+  color: var(--text-dim); font-size: 16px; border-right: 1px solid var(--border);
 }
 .tabadd:hover { background: var(--accent-soft); color: var(--accent); }
 .treelink { color: var(--accent); text-decoration: none; }
@@ -110,7 +110,7 @@ button { font-family: inherit; font-size: 12px; }
 }
 .sidebarhead { display: flex; gap: 4px; padding: 8px 10px; }
 .filterbox {
-  flex: 1; min-width: 0; font-family: inherit; font-size: 12px;
+  flex: 1; min-width: 0; font-family: inherit; font-size: 13px;
   border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px;
   background: var(--bg); color: var(--text);
 }
@@ -121,10 +121,10 @@ button { font-family: inherit; font-size: 12px; }
 .treenode.db { font-weight: 500; }
 .treenode.tbl { padding-left: 28px; }
 .treenode .badge {
-  font-size: 10px; color: var(--accent); border: 1px solid var(--accent);
+  font-size: 11px; color: var(--accent); border: 1px solid var(--accent);
   border-radius: 4px; padding: 0 4px; margin-left: 6px;
 }
-.treenode .cnt { color: var(--text-dim); font-size: 11px; margin-left: 6px; }
+.treenode .cnt { color: var(--text-dim); font-size: 12px; margin-left: 6px; }
 .treeempty { padding: 14px 12px; color: var(--text-dim); line-height: 1.7; }
 
 .content { flex: 1; min-width: 0; display: flex; flex-direction: column; }
@@ -135,7 +135,7 @@ button { font-family: inherit; font-size: 12px; }
 .tab {
   display: flex; align-items: center; gap: 8px; padding: 7px 14px;
   border-right: 1px solid var(--border); cursor: pointer; white-space: nowrap;
-  color: var(--text-dim); font-size: 12px;
+  color: var(--text-dim); font-size: 13px;
 }
 .tab.active { background: var(--bg); color: var(--accent); border-bottom: 2px solid var(--accent); }
 .tab .close { color: var(--text-dim); border-radius: 3px; padding: 0 3px; }
@@ -155,7 +155,7 @@ button { font-family: inherit; font-size: 12px; }
 .editorwrap .edresize:hover, .editorwrap .edresize.dragging { background: var(--accent); opacity: 0.4; }
 .editorwrap textarea, .editorwrap pre {
   position: absolute; inset: 0; margin: 0; padding: 10px 14px;
-  font-family: var(--mono); font-size: 12.5px; line-height: 1.6;
+  font-family: var(--mono); font-size: 13.5px; line-height: 1.6;
   white-space: pre-wrap; word-wrap: break-word; overflow: auto;
   border: none; tab-size: 2;
 }
@@ -175,12 +175,12 @@ html[data-theme="dark"] .tok-num { color: #fac775; }
 /* ── 结果区 ────────────────────────────────── */
 .resultbar {
   display: flex; align-items: center; gap: 10px; padding: 6px 12px;
-  border-bottom: 1px solid var(--border); font-size: 12px; color: var(--text-dim); flex: none;
+  border-bottom: 1px solid var(--border); font-size: 13px; color: var(--text-dim); flex: none;
 }
 .resultbar .chip { border: 1px solid var(--border); border-radius: 4px; padding: 1px 8px; cursor: pointer; }
 .resultbar .chip:hover { border-color: var(--accent); color: var(--accent); }
 .gridwrap { flex: 1; min-height: 0; overflow: auto; position: relative; }
-.grid { border-collapse: separate; border-spacing: 0; font-family: var(--mono); font-size: 12px; width: max-content; min-width: 100%; }
+.grid { border-collapse: separate; border-spacing: 0; font-family: var(--mono); font-size: 13px; width: max-content; min-width: 100%; }
 .grid th, .grid td {
   padding: 4px 10px; border-bottom: 1px solid var(--border); border-right: 1px solid var(--border);
   text-align: left; white-space: nowrap; max-width: 420px; overflow: hidden; text-overflow: ellipsis;
@@ -238,18 +238,18 @@ html[data-theme="dark"] .tok-num { color: #fac775; }
 }
 .bottompanel.hidden { display: none; }
 .bottomhead { display: flex; align-items: center; gap: 8px; padding: 4px 12px; border-bottom: 1px solid var(--border); flex: none; }
-.bptitle { font-size: 12px; font-weight: 500; }
+.bptitle { font-size: 13px; font-weight: 500; }
 .bottombody { flex: 1; overflow: auto; padding: 8px 12px; }
-.bottombody pre { margin: 0; font-family: var(--mono); font-size: 12px; line-height: 1.6; white-space: pre-wrap; }
+.bottombody pre { margin: 0; font-family: var(--mono); font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
 .plan2col { display: flex; gap: 16px; }
 .plan2col > div { flex: 1; min-width: 0; }
-.plan2col h4 { margin: 0 0 6px; font-size: 12px; font-weight: 500; color: var(--text-dim); }
+.plan2col h4 { margin: 0 0 6px; font-size: 13px; font-weight: 500; color: var(--text-dim); }
 .msgitem { padding: 4px 8px; border-radius: 4px; cursor: pointer; line-height: 1.5; }
 .msgitem:hover { background: var(--accent-soft); }
 .msgitem .code { color: var(--err); font-weight: 500; }
 .msgitem.ok .code { color: var(--ok); }
 .msgitem .loc { color: var(--text-dim); margin-left: 8px; }
-.msgitem .detail { color: var(--text-dim); font-family: var(--mono); font-size: 11px; margin-top: 2px; }
+.msgitem .detail { color: var(--text-dim); font-family: var(--mono); font-size: 12px; margin-top: 2px; }
 
 /* ── 加载态 / 断线横幅 ─────────────────────── */
 .busybar {
@@ -267,7 +267,7 @@ html[data-theme="dark"] .tok-num { color: #fac775; }
 .stbusy.hidden { display: none; }
 .connbanner {
   display: none; align-items: center; gap: 10px; padding: 6px 12px;
-  background: var(--err); color: #fff; font-size: 12px; flex: none; z-index: 45;
+  background: var(--err); color: #fff; font-size: 13px; flex: none; z-index: 45;
 }
 .connbanner .hint { opacity: 0.85; }
 .connbanner .btn { background: transparent; border-color: rgba(255,255,255,0.7); color: #fff; }
@@ -282,68 +282,68 @@ html[data-theme="dark"] .tok-num { color: #fac775; }
 /* ── 诊断面板（结构化）─────────────────────── */
 .diagbar { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
 .viewbar { display: flex; gap: 4px; margin-left: 8px; }
-.diagpause { margin-left: auto; color: var(--text-dim); font-size: 12px; }
+.diagpause { margin-left: auto; color: var(--text-dim); font-size: 13px; }
 .diagview { min-height: 40px; }
 .diagwrap { display: flex; flex-direction: column; gap: 10px; }
-.diagline { color: var(--text-dim); font-size: 12px; }
-.diagalert { color: var(--err); border: 1px solid var(--err); border-radius: 6px; padding: 6px 10px; font-size: 12px; }
+.diagline { color: var(--text-dim); font-size: 13px; }
+.diagalert { color: var(--err); border: 1px solid var(--err); border-radius: 6px; padding: 6px 10px; font-size: 13px; }
 .hitrate { display: flex; align-items: center; gap: 10px; }
-.hrlabel { color: var(--text-dim); font-size: 12px; width: 44px; }
+.hrlabel { color: var(--text-dim); font-size: 13px; width: 44px; }
 .hbar { flex: 1; max-width: 320px; height: 10px; border: 1px solid var(--border); border-radius: 999px; overflow: hidden; background: var(--bg-sub); }
 .hbar i { display: block; height: 100%; transition: width .25s ease; }
 .hbar i.ok { background: var(--ok); }
 .hbar i.warn { background: var(--warn); }
 .hbar i.err { background: var(--err); }
-.hrvalue { font-family: var(--mono); font-size: 12px; }
+.hrvalue { font-family: var(--mono); font-size: 13px; }
 .diagcards { display: flex; flex-wrap: wrap; gap: 8px; }
 .diagcards .card {
   min-width: 92px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px;
   background: var(--bg-sub); display: flex; flex-direction: column; gap: 2px;
 }
-.diagcards .card b { font-family: var(--mono); font-size: 13px; font-weight: 500; }
-.diagcards .card span { color: var(--text-dim); font-size: 11px; }
-.diagfold summary { cursor: pointer; color: var(--text-dim); font-size: 12px; }
-.diagfold pre { margin: 6px 0 0; font-size: 11px; color: var(--text-dim); white-space: pre-wrap; }
-table.grid.diag { font-family: var(--sans); font-size: 12px; width: 100%; }
+.diagcards .card b { font-family: var(--mono); font-size: 14px; font-weight: 500; }
+.diagcards .card span { color: var(--text-dim); font-size: 12px; }
+.diagfold summary { cursor: pointer; color: var(--text-dim); font-size: 13px; }
+.diagfold pre { margin: 6px 0 0; font-size: 12px; color: var(--text-dim); white-space: pre-wrap; }
+table.grid.diag { font-family: var(--sans); font-size: 13px; width: 100%; }
 table.grid.diag th, table.grid.diag td { user-select: text; }
 table.grid.diag code { font-family: var(--mono); }
 .lockmode { font-family: var(--mono); font-weight: 500; padding: 0 4px; border-radius: 3px; }
 .lockmode.x { color: #fff; background: var(--err); }
 .lockmode.s { color: #fff; background: var(--accent); }
 .waiter { color: var(--warn); font-family: var(--mono); }
-.tstate { font-family: var(--mono); font-size: 11px; }
+.tstate { font-family: var(--mono); font-size: 12px; }
 .tstate.ACTIVE { color: var(--warn); font-weight: 500; }
 .tstate.COMMITTED { color: var(--ok); }
 .tstate.ABORTED { color: var(--err); }
 .edges { display: flex; flex-direction: column; gap: 6px; }
-.edge { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 12px; }
+.edge { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 13px; }
 .edge.dead { border-left: 3px solid var(--err); padding-left: 8px; }
 .node { border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; background: var(--bg-sub); }
 .node.dead { border-color: var(--err); color: var(--err); }
 .node.none { color: var(--text-dim); }
 .arrow { color: var(--text-dim); }
 .res { color: var(--text-dim); }
-.planhead { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; color: var(--text-dim); font-size: 12px; }
+.planhead { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; color: var(--text-dim); font-size: 13px; }
 .planhead .chip { border: 1px solid var(--border); border-radius: 4px; padding: 1px 8px; }
 .plantree { border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
-.plantreehead { padding: 4px 10px; background: var(--bg-sub); border-bottom: 1px solid var(--border); font-size: 12px; color: var(--text-dim); }
-.planrow { font-family: var(--mono); font-size: 12px; line-height: 1.9; white-space: pre; }
+.plantreehead { padding: 4px 10px; background: var(--bg-sub); border-bottom: 1px solid var(--border); font-size: 13px; color: var(--text-dim); }
+.planrow { font-family: var(--mono); font-size: 13px; line-height: 1.9; white-space: pre; }
 .planop { color: var(--accent); font-weight: 500; }
 .planrest { color: var(--text); }
 
 /* ── 结构面板 ──────────────────────────────── */
 .structmeta { padding: 10px 14px; color: var(--text-dim); border-bottom: 1px solid var(--border); }
 .structgrid { margin: 12px 14px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
-.pkmark { color: var(--accent); font-size: 10px; border: 1px solid var(--accent); border-radius: 4px; padding: 0 4px; margin-left: 6px; }
+.pkmark { color: var(--accent); font-size: 11px; border: 1px solid var(--accent); border-radius: 4px; padding: 0 4px; margin-left: 6px; }
 
 /* ── 表设计器（P5.6）────────────────────────── */
 .designer { display: flex; flex-direction: column; height: 100%; }
 .dsgbar {
   display: flex; align-items: center; gap: 8px; padding: 6px 12px; flex: none;
-  border-bottom: 1px solid var(--border); font-size: 12px;
+  border-bottom: 1px solid var(--border); font-size: 13px;
 }
 .dsgtable { color: var(--text); }
-.dsgbar .hint { color: var(--text-dim); font-size: 11px; }
+.dsgbar .hint { color: var(--text-dim); font-size: 12px; }
 .dsgwrap { flex: 1; min-height: 0; overflow: auto; padding: 10px 12px 0; }
 .dsggrid { width: 100%; }
 /* 设计器是「表单」不是「结果网格」：行要高一点才放得下输入框，且不参与行高拖拽 */
@@ -351,14 +351,14 @@ table.grid.diag code { font-family: var(--mono); }
 .dsggrid th, .dsggrid td { white-space: nowrap; }
 .dsggrid tr.new td { background: var(--accent-soft); }
 .dsggrid td.ctr, .dsggrid th.ctr { text-align: center; }
-.dsggrid td.orig { color: var(--text-dim); font-size: 11px; }
-.newtag { color: var(--accent); border: 1px solid var(--accent); border-radius: 4px; padding: 0 4px; font-size: 10px; }
+.dsggrid td.orig { color: var(--text-dim); font-size: 12px; }
+.newtag { color: var(--accent); border: 1px solid var(--accent); border-radius: 4px; padding: 0 4px; font-size: 11px; }
 /* 墓碑行：打了删除标记但还没执行的已有列 —— 划掉以示「将要 DROP」，点 ↺ 可撤销 */
 .dsggrid tr.del td { text-decoration: line-through; color: var(--text-dim); }
 .dsggrid tr.del td.ctr { text-decoration: none; }
 .dsggrid tr.del .dsgdel { color: var(--accent); }
 .dsgin {
-  font-family: var(--mono); font-size: 12px; padding: 2px 6px;
+  font-family: var(--mono); font-size: 13px; padding: 2px 6px;
   border: 1px solid var(--border); border-radius: 4px;
   background: var(--bg); color: var(--text); user-select: text;
 }
@@ -367,12 +367,12 @@ table.grid.diag code { font-family: var(--mono); }
 .dsgin:disabled { color: var(--text-dim); background: var(--bg-sub); }
 .dsgsel { font-family: var(--sans); width: 110px; }
 .dsgnum { width: 68px; text-align: right; }
-.dsgdel { cursor: pointer; color: var(--text-dim); padding: 0 4px; font-size: 13px; }
+.dsgdel { cursor: pointer; color: var(--text-dim); padding: 0 4px; font-size: 14px; }
 .dsgdel:hover { color: var(--err); }
 .dsgpreview { flex: none; max-height: 42%; overflow: auto; border-top: 1px solid var(--border); padding: 8px 12px 12px; }
-.dsgtitle { font-size: 11px; color: var(--text-dim); margin-bottom: 6px; }
+.dsgtitle { font-size: 12px; color: var(--text-dim); margin-bottom: 6px; }
 .dsgsql {
-  margin: 0; font-family: var(--mono); font-size: 12px; line-height: 1.7;
+  margin: 0; font-family: var(--mono); font-size: 13px; line-height: 1.7;
   border: 1px solid var(--border); border-radius: 6px; padding: 10px; white-space: pre-wrap;
 }
 .dsgerr { color: var(--err); margin-top: 6px; }
@@ -381,13 +381,13 @@ table.grid.diag code { font-family: var(--mono); }
 /* ── 数据浏览工具条 ────────────────────────── */
 .databar {
   display: flex; align-items: center; gap: 8px; padding: 6px 12px;
-  border-bottom: 1px solid var(--border); flex: none; font-size: 12px;
+  border-bottom: 1px solid var(--border); flex: none; font-size: 13px;
 }
 .pager { display: flex; align-items: center; gap: 6px; color: var(--text-dim); }
-.pager input { width: 52px; font-family: inherit; font-size: 12px; text-align: center;
+.pager input { width: 52px; font-family: inherit; font-size: 13px; text-align: center;
   border: 1px solid var(--border); border-radius: 4px; padding: 2px 4px; background: var(--bg); color: var(--text); }
 .cellinput {
-  font-family: var(--mono); font-size: 12px; border: 1px solid var(--accent);
+  font-family: var(--mono); font-size: 13px; border: 1px solid var(--accent);
   border-radius: 4px; padding: 2px 6px; width: 100%; min-width: 90px;
   background: var(--bg); color: var(--text);
 }
@@ -396,7 +396,7 @@ table.grid.diag code { font-family: var(--mono); }
 /* ── 暂存编辑（Navicat 式）──────────────────── */
 .editbar {
   display: flex; align-items: center; gap: 8px; padding: 5px 12px;
-  border-top: 1px solid var(--border); flex: none; font-size: 12px;
+  border-top: 1px solid var(--border); flex: none; font-size: 13px;
   color: var(--text-dim); background: var(--bg-sub);
 }
 .editbar .pendstat.has, .editbar [data-act="pstat"].has { color: var(--warn); }
@@ -410,7 +410,7 @@ table.grid.diag code { font-family: var(--mono); }
 
 /* ── 空态 / 加载态 ─────────────────────────── */
 .empty { padding: 40px; text-align: center; color: var(--text-dim); line-height: 2; }
-.empty .hint { font-size: 12px; }
+.empty .hint { font-size: 13px; }
 .loading { padding: 24px; color: var(--text-dim); text-align: center; }
 .loading::after { content: "…"; }
 
@@ -419,12 +419,12 @@ table.grid.diag code { font-family: var(--mono); }
 .toast {
   min-width: 220px; max-width: 420px; padding: 8px 12px; border-radius: 6px;
   border: 1px solid var(--border); background: var(--bg); color: var(--text);
-  box-shadow: 0 2px 10px rgba(0,0,0,0.08); font-size: 12px;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.08); font-size: 13px;
 }
 .toast.err { border-color: var(--err); }
 .toast.ok { border-color: var(--ok); }
-.toast .more { color: var(--text-dim); cursor: pointer; text-decoration: underline; font-size: 11px; }
-.toast pre { display: none; margin: 6px 0 0; font-size: 11px; color: var(--text-dim); white-space: pre-wrap; }
+.toast .more { color: var(--text-dim); cursor: pointer; text-decoration: underline; font-size: 12px; }
+.toast pre { display: none; margin: 6px 0 0; font-size: 12px; color: var(--text-dim); white-space: pre-wrap; }
 .toast.open pre { display: block; }
 
 /* ── 右键菜单 / 对话框 ─────────────────────── */
@@ -443,10 +443,10 @@ table.grid.diag code { font-family: var(--mono); }
   background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
   min-width: 320px; max-width: 480px; padding: 16px 18px;
 }
-.modal h3 { margin: 0 0 10px; font-size: 13px; font-weight: 500; }
+.modal h3 { margin: 0 0 10px; font-size: 14px; font-weight: 500; }
 .modal .row { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
 .modal input, .modal select {
-  flex: 1; font-family: inherit; font-size: 12px; border: 1px solid var(--border);
+  flex: 1; font-family: inherit; font-size: 13px; border: 1px solid var(--border);
   border-radius: 6px; padding: 5px 8px; background: var(--bg); color: var(--text);
 }
 .modal .btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
@@ -455,7 +455,7 @@ table.grid.diag code { font-family: var(--mono); }
 .userchip {
   display: none;
   font-family: var(--sans);
-  font-size: 12px;
+  font-size: 13px;
   color: var(--text-dim);
   border: 1px solid var(--border);
   border-radius: 999px;
@@ -481,21 +481,21 @@ table.grid.diag code { font-family: var(--mono); }
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
   font-family: var(--sans);
 }
-.logintitle { font-size: 15px; font-weight: 600; color: var(--text); margin-bottom: 14px; }
-.loginrow { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 10px; }
+.logintitle { font-size: 16px; font-weight: 600; color: var(--text); margin-bottom: 14px; }
+.loginrow { display: block; font-size: 13px; color: var(--text-dim); margin-bottom: 10px; }
 .loginrow input {
   display: block;
   width: 100%;
   margin-top: 4px;
   padding: 6px 8px;
   box-sizing: border-box;
-  font-size: 13px;
+  font-size: 14px;
   color: var(--text);
   background: var(--bg-sub);
   border: 1px solid var(--border);
   border-radius: 6px;
 }
-.loginerr { min-height: 16px; font-size: 12px; color: var(--err); margin-bottom: 8px; }
+.loginerr { min-height: 16px; font-size: 13px; color: var(--err); margin-bottom: 8px; }
 .loginbox .btn { width: 100%; }
 
 /* ── 查询耗时（结果栏徽标 + 底部「耗时」面板）───────────────
@@ -504,7 +504,7 @@ table.grid.diag code { font-family: var(--mono); }
 .rbleft { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .rbtime { flex: none; display: flex; align-items: center; gap: 6px; }
 .mschip {
-  flex: none; font-family: var(--mono); font-size: 11px; line-height: 1.7;
+  flex: none; font-family: var(--mono); font-size: 12px; line-height: 1.7;
   border: 1px solid var(--border); border-radius: 4px; padding: 0 6px;
   color: var(--text-dim); white-space: nowrap; cursor: pointer;
 }
@@ -516,7 +516,7 @@ table.grid.diag code { font-family: var(--mono); }
 .mschip.plain { cursor: default; }
 /* 还没测出耗时（首次加载前 / 请求失败）就别留一个空边框占位 */
 .mschip:empty { display: none; }
-.msgitem .ms { color: var(--text-dim); margin-left: 8px; font-family: var(--mono); font-size: 11px; }
+.msgitem .ms { color: var(--text-dim); margin-left: 8px; font-family: var(--mono); font-size: 12px; }
 
 .timingwrap { display: flex; flex-direction: column; gap: 8px; }
 .timinghead { display: flex; align-items: center; gap: 6px; }
@@ -532,7 +532,7 @@ table.grid.diag code { font-family: var(--mono); }
 .msbar i.fast { background: var(--ok); }
 .msbar i.mid { background: var(--warn); }
 .msbar i.slow { background: var(--err); }
-.delta { font-family: var(--mono); font-size: 11px; }
+.delta { font-family: var(--mono); font-size: 12px; }
 .delta.up { color: var(--err); }
 .delta.down { color: var(--ok); }
 .delta.same, .delta.first { color: var(--text-dim); }

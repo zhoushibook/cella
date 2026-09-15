@@ -16,7 +16,7 @@ const MIN_W = 52;
 const MAX_W = 460;
 const ROWNUM_W_DEF = 52;
 const CK_W = 30;
-const MONO = '12px "Cascadia Mono", Consolas, "Courier New", monospace';
+const MONO = '13px "Cascadia Mono", Consolas, "Courier New", monospace';
 
 const mctx = document.createElement('canvas').getContext('2d');
 function textW(s) {
