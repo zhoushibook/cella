@@ -253,7 +253,9 @@ Windows 细节（会被 `/W4 /WX` 卡住的点）：
   **类型保真**，前端不做字符串化，网格按类型右对齐数字。
 - `rowid` 是**普通的一列**（`kInt64` 值、列名固定 `rowid`），不特殊对待；但因 `get *` 不会带上它，
   数据浏览接口必须**显式把 `rowid` 写进投影列表**（见 §6.3）。
-- `maxRows` 默认 5000，超出置 `truncated: true` 并在状态栏提示「结果已截断」。
+- `maxRows` **默认 = 硬上限 200000**（2026-09-15 修正：原默认 5000，用户查大表会莫名少数据；
+  本地单机工具 + 虚拟滚动网格，没必要设这么低的小上限）。显式传 `maxRows` 时才按它截断，
+  超出置 `truncated: true` 并在结果条提示「已截断」；`rowCount` 始终是引擎真实产出行数。
 - `error` 与 `compileErrors` 合并：编译期诊断取 `cella_errorText()`，执行期取 `DbStatus::ToString()`，
   两者都带 `code` / `message` / `line` / `col`。
 
