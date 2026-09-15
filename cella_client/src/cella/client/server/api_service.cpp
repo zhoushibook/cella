@@ -64,8 +64,11 @@ namespace cella::client
       return s;
     }
 
-    constexpr size_t kDefaultMaxRows = 5000;
+    // 结果行数默认上限 = 硬上限：本地单机工具，引擎本来就物化全量结果，网格是虚拟滚动，
+    // 5000 行这种「默认值」只会让人莫名看到结果被砍（要更少请显式传 maxRows，
+    // 或在 SQL 里用 page/每页行数 分页）。超过硬上限仍置 truncated 并在前端提示。
     constexpr size_t kHardMaxRows = 200000;
+    constexpr size_t kDefaultMaxRows = kHardMaxRows;
     constexpr int kDefaultPageSize = 100;
     constexpr int kMaxPageSize = 100000;
     const char *const kRowGone = "该行已不存在或已被修改，已为您刷新";
