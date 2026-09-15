@@ -180,7 +180,7 @@ html[data-theme="dark"] .tok-num { color: #fac775; }
 .resultbar .chip { border: 1px solid var(--border); border-radius: 4px; padding: 1px 8px; cursor: pointer; }
 .resultbar .chip:hover { border-color: var(--accent); color: var(--accent); }
 .gridwrap { flex: 1; min-height: 0; overflow: auto; position: relative; }
-.grid { border-collapse: separate; border-spacing: 0; font-family: var(--mono); font-size: 13px; width: max-content; min-width: 100%; }
+.grid { border-collapse: separate; border-spacing: 0; font-family: var(--mono); font-size: 13px; width: max-content; }
 .grid th, .grid td {
   padding: 4px 10px; border-bottom: 1px solid var(--border); border-right: 1px solid var(--border);
   text-align: left; white-space: nowrap; max-width: 420px; overflow: hidden; text-overflow: ellipsis;
@@ -207,6 +207,12 @@ html[data-theme="dark"] .tok-num { color: #fac775; }
   height: var(--row-h, 26px); padding: 0 10px;
   line-height: calc(var(--row-h, 26px) - 1px);
 }
+/* 填充列：吃掉「列宽之和 < 容器宽」的剩余空间。
+   有了它，真实列的视觉宽度恒等于 colgroup 设定值（否则浏览器会把表格拉伸到
+   容器宽度并按比例分格子，列边界与设定值脱节 → 拖拽边界对不上、列缩不下去）。 */
+.grid th.filler, .grid td.filler { border-right: 0; cursor: default; }
+.grid th.filler { background: var(--bg-sub); }
+.grid th.filler:hover { background: var(--bg-sub); }
 .grid td.rownum { cursor: pointer; }
 .grid th { position: sticky; }
 .grid tbody tr:hover td { background: color-mix(in srgb, var(--accent-soft) 45%, transparent); }

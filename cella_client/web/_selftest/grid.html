@@ -251,7 +251,7 @@ const colsH = [{ name: 'rowid', type: 'INT64' }, { name: 'id', type: 'INT32' }, 
 const rowsH = [[196608, 1, 'a'], [196609, 2, 'b']];
 g.setData(colsH, rowsH, null, { hidden: ['rowid'] });
 ok('隐藏列不出 colgroup/表头/单元格',
-  host.querySelectorAll('colgroup col').length === 4 &&          // ck + rownum + 2 个可见数据列
+  host.querySelectorAll('colgroup col').length === 5 &&          // ck + rownum + 2 可见数据列 + 填充列
   !host.querySelector('th[data-col="rowid"]') && !host.querySelector('td[data-c="0"]'));
 ok('其余列 data-c 仍是数据索引（v = data-c 2）',
   !!host.querySelector('td[data-c="2"]') && host.querySelector('tr[data-r="0"] td[data-c="2"]').textContent === 'a');
@@ -268,6 +268,45 @@ ok('脏标记按数据索引命中隐藏列之外的列', !!host.querySelector('
 g.setData(cols, rows);
 ok('不带 hidden 恢复完整展示（id 列回来到 data-c 0）',
   !!host.querySelector('th[data-col="id"]') && host.querySelectorAll('td[data-c="0"]').length === 3);
+
+// ⑯ 填充列：真实列宽恒等于 colgroup 设定值（表格不再被拉伸），
+//    否则列边界与设定值脱节 → 拖边界对不上、# 列缩不下去
+g.setData(cols, rows);
+const gridwrapEl = host;
+const cgSum = () => [...host.querySelectorAll('colgroup col')].slice(0, -1)
+  .reduce((a, c) => a + parseFloat(c.style.width || 0), 0);
+const fillerCol = () => host.querySelector('colgroup col.filler');
+ok('存在填充列', !!fillerCol());
+ok('表宽 = 真实列宽之和 + 填充（' + Math.round(parseFloat(host.querySelector('table').style.width)) + 'px）',
+  Math.abs(parseFloat(host.querySelector('table').style.width) - (cgSum() + parseFloat(fillerCol().style.width))) < 1);
+ok('填充列让表宽铺满容器（' + gridwrapEl.clientWidth + 'px）',
+  Math.abs(parseFloat(host.querySelector('table').style.width) - gridwrapEl.clientWidth) < 2);
+// 每列实际 td 宽 == colgroup 设定宽（这是拖拽 1:1 跟手的前提）
+const widthsOk = [...host.querySelectorAll('tbody tr[data-r="0"] td')].every((td, i) => {
+  const col = host.querySelectorAll('colgroup col')[i];
+  const set = parseFloat(col.style.width || 0);
+  return set === 0 || Math.abs(td.getBoundingClientRect().width - set) <= 1;
+});
+ok('实际 td 宽 == colgroup 设定宽（无拉伸）', widthsOk);
+// 填充列表头不可排序
+const sortsBefore2 = sorts.length;
+host.querySelector('th.filler').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+ok('点填充列表头不排序', sorts.length === sortsBefore2);
+// # 列左缘（与复选框列的交界）也能拖：把 # 列往左缩到最小
+g.resetLayout();
+const rnColEl = host.querySelectorAll('colgroup col')[1];
+const rnBefore = parseFloat(rnColEl.style.width);
+let rnTdL = host.querySelector('tr[data-r="0"] td.rownum');
+let rl = rnTdL.getBoundingClientRect();
+rnTdL.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: rl.left + 3, clientY: rl.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: rl.left + 3 - 40, clientY: rl.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+rnTdL = host.querySelector('tr[data-r="0"] td.rownum');
+ok('# 列左缘可拖：' + rnBefore + ' → ' + parseFloat(rnColEl.style.width) +
+   '（视觉 ' + Math.round(rnTdL.getBoundingClientRect().width) + '）',
+  parseFloat(rnColEl.style.width) < rnBefore &&
+  Math.abs(rnTdL.getBoundingClientRect().width - parseFloat(rnColEl.style.width)) <= 1);
+ok('# 列缩到下限 34 仍与视觉一致', parseFloat(rnColEl.style.width) === 34);
 
 document.getElementById('out').textContent = L.join('\n');
 </script>
