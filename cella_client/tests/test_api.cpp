@@ -532,3 +532,37 @@ MT_TEST(API_权限不足)
   MT_EQ(static_cast<int>(dbs_data.Find("databases")->size()), 1);
   MT_EQ(dbs_data.Find("databases")->items()[0].Find("name")->AsString(), std::string("main"));
 }
+
+  // 默认 maxRows 不得在 5000 行处悄悄截断：曾经默认 5000，用户查大表会莫名少数据
+  // （前端网格是虚拟滚动，能扛；要更少请显式传 maxRows）
+  MT_TEST(API_默认不截断超过5000行)
+  {
+    Fixture f("default_max_rows");
+    f.Run("CREATE TABLE big(id INT PRIMARY KEY);");
+    for (int b = 0; b < 52; ++b)
+    {
+      std::string sql = "INSERT INTO big VALUES ";
+      for (int i = 0; i < 100; ++i)
+      {
+        if (i != 0)
+        {
+          sql += ",";
+        }
+        sql += "(" + std::to_string(b * 100 + i) + ")";
+      }
+      f.Run(sql + ";");
+    }
+    const JsonValue q = f.Run("get id in big;");
+    const JsonValue &st = q.Find("statements")->items()[0];
+    MT_EQ(static_cast<int>(st.Find("rows")->size()), 5200);
+    MT_EQ(static_cast<int>(st.Find("rowCount")->AsInt()), 5200);
+    MT_CHECK(st.Find("truncated")->AsBool() == false);
+
+    // 显式传 maxRows 时上限仍然生效（契约不变）
+    const auto tr = Fixture::Data(f.service.Handle(Fixture::Make(
+        "POST", "/api/query", R"({"sql":"get id in big;","maxRows":10})")));
+    const auto &st2 = tr.Find("statements")->items()[0];
+    MT_EQ(static_cast<int>(st2.Find("rows")->size()), 10);
+    MT_CHECK(st2.Find("truncated")->AsBool());
+    MT_EQ(static_cast<int>(st2.Find("rowCount")->AsInt()), 5200);
+  }

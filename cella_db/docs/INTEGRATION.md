@@ -296,6 +296,7 @@ BlockersLocked(txn) = { 与 txn 的待满足请求冲突的持有者 }
 | 11 | `CatalogTable::first_page_id` | `IStorage` 未导出「首数据页」查询，建表后用 `open_table` 句柄补齐，仅作诊断展示 |
 | 12 | 事务表只增不删 | `TxnManager` 保留已结束事务用于诊断；长期运行的进程需要定期重置（未来可加回收） |
 | 13 | 🐛 树根分裂后回写根页号 | **缺陷修复（2026-09-15，10 万行测试数据踩出）**：B+ 树插入触发根分裂（树长高）后，`cella_index.root_page_id` 从不更新 → 每条语句 `OpenTableIndexes` 按旧根 `Attach`，等于从残树插/查：主键与二级索引的等值/范围查询在第一叶之外**大面积静默返回 0 行**，跨语句唯一性检查同样失守（教学测试表 < 单叶容量 ~215 键，永远踩不到）。修复：新增 `CatalogManager::UpdateIndexRoot`（根没变零开销；变了 = 旧元数据行打墓碑 + 追加新行 + 就地更新内存视图），在 `IndexRowInsert` / `IndexRowUpdate` 的 `tree->Insert` 成功后比对 `tree->root_page()` 与目录值并回写。`Remove` 不做合并、树不会变矮，无需处理。验证：10 万行重灌后此前失败的等值查询（109/216/500/15000/25000/29500/orders-12345）全部命中；四层回归全绿（58 / 10802 / 244 / 31 + e2e 68）；副作用 = 灌库 30s → 6s（残树路径消失） |
+| 14 | 行数统计下沉到存储层（P1.6 统计税清零） | **2026-09-15**：原先 `ChooseIndex` 每次查询调 `CountTableRows` 全表迭代数行数（`TableIterator` 每行一次 `get_page`，10 万行表 = 每查询 ~3-5 万次缓冲池访问的「统计税」）。修复：`TableHeap` 惰性行数 `RowCount()` —— 首查沿链表数一遍并记住，此后 `InsertRecord/DeleteRecord` 增量维护（O(1)）；`DeleteRecord` 先探活再递减（对墓碑重复删语义不变、计数不重复递减）；TRUNCATE/ALTER 走「drop+create+回填」，新堆未知态自然回落懒扫描，无需特判。`Executor::CountTableRows` 改为转发 `heap->RowCount()`。实测（10 万行、同进程）：users 首查 26.56ms（含懒扫描）→ 后续 **5.02ms**；orders 首查 29.04ms → **5.00ms**（此前带税 19-41ms）。局限：计数器进程内有效，重启后每表首查再扫一次（持久化到目录页留作扩展）。 |
 
 ---
 

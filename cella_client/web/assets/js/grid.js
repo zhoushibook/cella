@@ -16,7 +16,7 @@ const MIN_W = 52;
 const MAX_W = 460;
 const ROWNUM_W_DEF = 52;
 const CK_W = 30;
-const MONO = '12px "Cascadia Mono", Consolas, "Courier New", monospace';
+const MONO = '13px "Cascadia Mono", Consolas, "Courier New", monospace';
 
 const mctx = document.createElement('canvas').getContext('2d');
 function textW(s) {
@@ -94,11 +94,15 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
   const inSel = (r, c) => inR(r) && c >= Math.min(sel.c1, sel.c2) && c <= Math.max(sel.c1, sel.c2);
   const isRowSel = (r) => inR(r) && sel && sel.c1 === 0 && sel.c2 === cols.length - 1;
 
+  // 填充列宽：吃掉「列宽之和 < 容器宽」的剩余空间（0 = 列已超宽，走横向滚动）
+  let fillerW = 0;
+
   function colgroupHtml() {
     let h = '<colgroup>';
     if (checkable) h += `<col style="width:${CK_W}px">`;
     h += `<col style="width:${rownumW}px">`;
     for (const di of visList) h += `<col style="width:${widths[di]}px">`;
+    h += `<col class="filler" style="width:${fillerW}px">`;
     return h + '</colgroup>';
   }
 
@@ -129,9 +133,10 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
         ` title="${esc(col.name)}${localSort ? '（点击排序，三次取消）' : '（点击排序，三次恢复默认序）'}">` +
         `${esc(col.name)}${arrow}<span class="resize" data-ci="${di}"></span></th>`;
     }
+    html += '<th class="filler"></th>';
     html += '</tr></thead><tbody>';
 
-    const span = cols.length + (checkable ? 2 : 1);
+    const span = cols.length + (checkable ? 2 : 1) + 1;   // +1 = 填充列
     if (start > 0) {
       html += `<tr class="pad"><td colspan="${span}" style="height:${start * rowH}px"></td></tr>`;
     }
@@ -151,6 +156,7 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
           (v === null || v === undefined ? 'nullv ' : '') + (kind ? kind + ' ' : '');
         html += `<td data-c="${di}" class="${cls.trim()}" title="${esc(cellText(v))}">${esc(cellText(v))}</td>`;
       }
+      html += '<td class="filler"></td>';
       html += '</tr>';
     }
     if (end < total) {
@@ -166,8 +172,9 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
   function applyColWidths() {
     let sum = rownumW + (checkable ? CK_W : 0);
     for (const di of visList) sum += widths[di];   // 只算可见列（隐藏列不占 col）
+    fillerW = Math.max(0, (container.clientWidth || 0) - sum);
     table.style.tableLayout = 'fixed';
-    table.style.width = sum + 'px';
+    table.style.width = (sum + fillerW) + 'px';    // 真实列 + 填充列；不靠浏览器拉伸
     table.style.setProperty('--row-h', rowH + 'px');
     const els = table.querySelectorAll('colgroup col');
     if (checkable && els[CK_COL]) els[CK_COL].style.width = CK_W + 'px';
@@ -176,6 +183,8 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
       const el = els[ROWNUM_COL + 1 + pos];
       if (el) el.style.width = widths[di] + 'px';
     });
+    const filler = els[els.length - 1];
+    if (filler) filler.style.width = fillerW + 'px';
   }
 
   function syncCkAll() {
@@ -238,16 +247,25 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
     if (fromR <= EDGE && fromR >= -1) {
       if (td.hasAttribute('data-c')) return { kind: 'col', ci: +td.getAttribute('data-c'), side: 'r' };
       if (td.classList.contains('rownum')) return { kind: 'rownum', side: 'r' };
-      return null;   // 复选框列宽固定，不给拖
+      // 复选框列的右缘 = 复选框列与「#」列的交界：归「#」列（复选框列宽固定，不给拖）。
+      // 交界两侧都抓同一个结果，否则从 ck 一侧抓会「没反应」。
+      if (td.classList.contains('ck')) return { kind: 'rownum', side: 'r' };
+      return null;
     }
     if (fromB <= EDGE && fromB >= -1) return { kind: 'row', side: 'b' };
-    // 边界的另一侧：下一列的左缘 = 上一列的右缘（首数据列左缘 = 行号列边界）。
+    // 边界的另一侧：本格左缘 = 上一个**可见**列的右界（首可见列左缘 = 行号列边界）。
+    // ⚠️ 必须按 visList 找上一个可见列：数据浏览的 rowid 是隐藏列（不渲染），
+    // 若简单用 ci-1 就会改到看不见的列上 —— 表现就是「拖了没反应」。
     // 放在下缘之后：左下角是「行交界」，不是列交界。
     if (fromL <= EDGE && fromL >= -1) {
       if (td.hasAttribute('data-c')) {
         const ci = +td.getAttribute('data-c');
-        return ci > 0 ? { kind: 'col', ci: ci - 1, side: 'l' } : { kind: 'rownum', side: 'l' };
+        const pos = visList.indexOf(ci);
+        if (pos > 0) return { kind: 'col', ci: visList[pos - 1], side: 'l' };
+        return { kind: 'rownum', side: 'l' };
       }
+      // 「#」格的左缘 = 复选框列与「#」列的交界：同样归「#」列
+      if (td.classList.contains('rownum')) return { kind: 'rownum', side: 'l' };
       return null;
     }
     return null;
@@ -470,6 +488,18 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
       render();
     }
   });
+
+  // 容器宽度变化（窗口缩放 / 侧边栏与面板拖拽）→ 重算填充列宽（只改 colgroup，不重渲染）
+  if (typeof ResizeObserver !== 'undefined') {
+    let lastW = container.clientWidth;
+    const ro = new ResizeObserver(() => {
+      if (container.clientWidth !== lastW) {
+        lastW = container.clientWidth;
+        applyColWidths();
+      }
+    });
+    ro.observe(container);
+  }
 
   container.addEventListener('mousedown', () => {
     if (document.activeElement !== container) container.focus({ preventScroll: true });

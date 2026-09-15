@@ -27,13 +27,14 @@ f.addEventListener('load', async () => { if (!started) { started = true; await r
 
 async function run() {
   const w = f.contentWindow, d = f.contentDocument;
-  await until(() => d.querySelector('.treenode.tbl'));
+  // 数据目录可能是全新的（harness 每次 rm -rf），启动时未必有表 ——
+  // 只等「库节点」出现；表节点在下面自建 __selftest 并 fullRefresh 之后再断言。
+  await until(() => d.querySelector('.treenode.db'));
   w.confirm = () => true;
   w.prompt = () => '__selftest';
 
   // ① 启动与两层树
   ok('库节点（两层树）', !!d.querySelector('.treenode.db'));
-  ok('表节点存在', !!d.querySelector('.treenode.tbl'));
   ok('标签栏有「+」新建入口', !!d.querySelector('.tabadd'));
 
   // 用自建临时表做隔离（避免和用户正在看的表互相干扰）
@@ -47,6 +48,7 @@ async function run() {
   await sqlExec("INSERT INTO " + scratch + " VALUES (1, 'a'), (2, 'b');");
   await w.__cella.fullRefresh();
   await until(() => [...d.querySelectorAll('.treenode.tbl')].some((t) => t.textContent === scratch));
+  ok('表节点存在（自建后）', !!d.querySelector('.treenode.tbl'));
 
   // ② 打开临时表的数据标签
   const snode = [...d.querySelectorAll('.treenode.tbl')].find((t) => t.textContent === scratch);

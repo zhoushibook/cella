@@ -119,12 +119,13 @@ ok('resetLayout 复位行高 26', g3.rowHeight() === 26);
 
 // ⑩ 回归：拖列宽/行高后浏览器补发的 click，不能当成「点列头排序」或「点 # 全选」
 const sortsBefore = sorts.length;
+const scoreW0 = wOf(2);
 host.querySelector('th[data-col="score"] .resize').dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: 100, clientY: 0 }));
 document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 130, clientY: 0, buttons: 1 }));
 document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
 host.querySelector('th[data-col="score"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
 ok('拖列宽后的尾随 click 不触发排序（sorts=' + sorts.length + '）', sorts.length === sortsBefore);
-ok('拖列宽后的尾随 click 不清掉列宽 ' + colEl(2).style.width, parseInt(colEl(2).style.width, 10) === 96);
+ok('拖列宽后的尾随 click 不清掉列宽 ' + colEl(2).style.width, wOf(2) === scoreW0 + 30);
 g.clearSelection();
 host.querySelector('th.rownum .rowresize').dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: 0, clientY: 0 }));
 document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 0, clientY: 10, buttons: 1 }));
@@ -250,7 +251,7 @@ const colsH = [{ name: 'rowid', type: 'INT64' }, { name: 'id', type: 'INT32' }, 
 const rowsH = [[196608, 1, 'a'], [196609, 2, 'b']];
 g.setData(colsH, rowsH, null, { hidden: ['rowid'] });
 ok('隐藏列不出 colgroup/表头/单元格',
-  host.querySelectorAll('colgroup col').length === 4 &&          // ck + rownum + 2 个可见数据列
+  host.querySelectorAll('colgroup col').length === 5 &&          // ck + rownum + 2 可见数据列 + 填充列
   !host.querySelector('th[data-col="rowid"]') && !host.querySelector('td[data-c="0"]'));
 ok('其余列 data-c 仍是数据索引（v = data-c 2）',
   !!host.querySelector('td[data-c="2"]') && host.querySelector('tr[data-r="0"] td[data-c="2"]').textContent === 'a');
@@ -267,6 +268,87 @@ ok('脏标记按数据索引命中隐藏列之外的列', !!host.querySelector('
 g.setData(cols, rows);
 ok('不带 hidden 恢复完整展示（id 列回来到 data-c 0）',
   !!host.querySelector('th[data-col="id"]') && host.querySelectorAll('td[data-c="0"]').length === 3);
+
+// ⑯ 填充列：真实列宽恒等于 colgroup 设定值（表格不再被拉伸），
+//    否则列边界与设定值脱节 → 拖边界对不上、# 列缩不下去
+g.setData(cols, rows);
+const gridwrapEl = host;
+const cgSum = () => [...host.querySelectorAll('colgroup col')].slice(0, -1)
+  .reduce((a, c) => a + parseFloat(c.style.width || 0), 0);
+const fillerCol = () => host.querySelector('colgroup col.filler');
+ok('存在填充列', !!fillerCol());
+ok('表宽 = 真实列宽之和 + 填充（' + Math.round(parseFloat(host.querySelector('table').style.width)) + 'px）',
+  Math.abs(parseFloat(host.querySelector('table').style.width) - (cgSum() + parseFloat(fillerCol().style.width))) < 1);
+ok('填充列让表宽铺满容器（' + gridwrapEl.clientWidth + 'px）',
+  Math.abs(parseFloat(host.querySelector('table').style.width) - gridwrapEl.clientWidth) < 2);
+// 每列实际 td 宽 == colgroup 设定宽（这是拖拽 1:1 跟手的前提）
+const widthsOk = [...host.querySelectorAll('tbody tr[data-r="0"] td')].every((td, i) => {
+  const col = host.querySelectorAll('colgroup col')[i];
+  const set = parseFloat(col.style.width || 0);
+  return set === 0 || Math.abs(td.getBoundingClientRect().width - set) <= 1;
+});
+ok('实际 td 宽 == colgroup 设定宽（无拉伸）', widthsOk);
+// 填充列表头不可排序
+const sortsBefore2 = sorts.length;
+host.querySelector('th.filler').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+ok('点填充列表头不排序', sorts.length === sortsBefore2);
+// # 列左缘（与复选框列的交界）也能拖：把 # 列往左缩到最小
+g.resetLayout();
+const rnColEl = host.querySelectorAll('colgroup col')[1];
+const rnBefore = parseFloat(rnColEl.style.width);
+let rnTdL = host.querySelector('tr[data-r="0"] td.rownum');
+let rl = rnTdL.getBoundingClientRect();
+rnTdL.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: rl.left + 3, clientY: rl.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: rl.left + 3 - 40, clientY: rl.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+rnTdL = host.querySelector('tr[data-r="0"] td.rownum');
+ok('# 列左缘可拖：' + rnBefore + ' → ' + parseFloat(rnColEl.style.width) +
+   '（视觉 ' + Math.round(rnTdL.getBoundingClientRect().width) + '）',
+  parseFloat(rnColEl.style.width) < rnBefore &&
+  Math.abs(rnTdL.getBoundingClientRect().width - parseFloat(rnColEl.style.width)) <= 1);
+ok('# 列缩到下限 34 仍与视觉一致', parseFloat(rnColEl.style.width) === 34);
+
+// ⑰ 隐藏列不能成为交界的目标（数据浏览里 rowid 隐藏）：
+//    从「# 右侧那一列」的**左缘**抓交界，必须改到 # 列，而不是改到看不见的 rowid 列
+g.setData([{ name: 'rowid', type: 'INT64' }, { name: 'id', type: 'INT32' }, { name: 'v', type: 'VARCHAR' }],
+  [[1, 10, 'a'], [2, 20, 'b']], null, { hidden: ['rowid'] });
+g.resetLayout();
+const rnColH = host.querySelectorAll('colgroup col')[1];      // ck, rownum, id, v, filler
+const rnWH = parseFloat(rnColH.style.width);
+const idTdH = host.querySelector('tr[data-r="0"] td[data-c="1"]');   // 首个可见数据列（id）
+const irH = idTdH.getBoundingClientRect();
+idTdH.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: irH.left + 2, clientY: irH.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: irH.left + 2 + 26, clientY: irH.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+ok('隐藏列不抢交界：首可见数据列左缘 → 改 # 列 ' + rnWH + '→' + parseFloat(rnColH.style.width),
+  parseFloat(rnColH.style.width) === rnWH + 26);
+
+// 中间有隐藏列时，左邻必须是「上一个可见列」
+g.setData([{ name: 'a', type: 'INT32' }, { name: 'h', type: 'INT32' }, { name: 'b', type: 'INT32' }],
+  [[1, 2, 3]], null, { hidden: ['h'] });
+g.resetLayout();
+const aColH = host.querySelectorAll('colgroup col')[2];              // ck, rownum, a, b, filler
+const aWH = parseFloat(aColH.style.width);
+const bTdH = host.querySelector('tr[data-r="0"] td[data-c="2"]');
+const brH = bTdH.getBoundingClientRect();
+bTdH.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: brH.left + 2, clientY: brH.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: brH.left + 2 + 18, clientY: brH.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+ok('隔着隐藏列：b 的左缘改到上一个可见列 a ' + aWH + '→' + parseFloat(aColH.style.width),
+  parseFloat(aColH.style.width) === aWH + 18);
+
+// 复选框列右缘（交界另一侧）也归 # 列
+g.resetLayout();
+const rnColCk = host.querySelectorAll('colgroup col')[1];
+const rnWCk = parseFloat(rnColCk.style.width);
+const ckTd = host.querySelector('tr[data-r="0"] td.ck');
+const crCk = ckTd.getBoundingClientRect();
+ckTd.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: crCk.right - 2, clientY: crCk.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: crCk.right - 2 + 16, clientY: crCk.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+ok('复选框列右缘也归 # 列 ' + rnWCk + '→' + parseFloat(rnColCk.style.width),
+  parseFloat(rnColCk.style.width) === rnWCk + 16);
+g.setData(cols, rows);
 
 document.getElementById('out').textContent = L.join('\n');
 </script>

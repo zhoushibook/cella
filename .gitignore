@@ -17,6 +17,12 @@ cella_storage/demo_data/
 **/test_data/
 *_data/
 
+# ── testdata：只跟踪生成脚本与 SQL（gen_testdata.py / testdata.sql）──
+# 运行期数据库目录（main.db / main.wal / cella-client.lock）不入库，一键重建：
+#   python testdata/gen_testdata.py --out testdata/testdata.sql
+#   cella_db.exe --data testdata/db_fixed --pool 3000 -f testdata/testdata.sql
+testdata/db*/
+
 # ── 日志与临时文件 ────────────────────────────────────────────
 *.log
 _*.txt
@@ -37,5 +43,4 @@ Thumbs.db
 # ── 历史遗留（沿用 cella_sql 原有 .gitignore 的规则）────────────
 cella_prompt/
 sys_process.md
-docs
 .workbuddy-ai
