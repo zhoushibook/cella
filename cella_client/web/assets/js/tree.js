@@ -32,10 +32,13 @@ export function createTree(container, { store, actions }) {
     menuEl.style.top = Math.min(y, window.innerHeight - r.height - 8) + 'px';
   }
 
+  // 引擎系统表（cella_catalog / cella_index / …）是实现细节，不在树里展示；
+  // SQL 里仍可正常查询（用户显式写即可）
+  const isSysTable = (name) => name.toLowerCase().startsWith('cella_');
+
   function tableNode(s, t) {
-    const sys = t.name.toLowerCase() === 'cella_catalog';
     const el = document.createElement('div');
-    el.className = 'treenode tbl' + (sys ? ' sys' : '');
+    el.className = 'treenode tbl';
     el.textContent = t.name;
     el.title = `${t.name}（${(t.columns || []).length} 列）`;
     el.addEventListener('click', () => actions.openTable(t.name));
@@ -61,6 +64,7 @@ export function createTree(container, { store, actions }) {
 
     const dbs = (s.databases && s.databases.length) ? s.databases : [{ name: s.currentDb, current: true }];
 
+    const userTables = (s.tables || []).filter((t) => !isSysTable(t.name));
     for (const d of dbs) {
       const cur = !!d.current || d.name === s.currentDb;
       const node = document.createElement('div');
@@ -68,7 +72,7 @@ export function createTree(container, { store, actions }) {
       if (cur) {
         // 过滤时自动展开
         node.innerHTML = `▾ ${esc(d.name)}<span class="badge">当前</span>` +
-          `<span class="cnt">${(s.tables || []).length}</span>`;
+          `<span class="cnt">${userTables.length}</span>`;
         node.addEventListener('contextmenu', (e) => {
           e.preventDefault();
           e.stopPropagation();
@@ -79,7 +83,7 @@ export function createTree(container, { store, actions }) {
         });
         container.appendChild(node);
 
-        const tables = (s.tables || []).filter((t) => !kw || t.name.toLowerCase().includes(kw));
+        const tables = userTables.filter((t) => !kw || t.name.toLowerCase().includes(kw));
         for (const t of tables) container.appendChild(tableNode(s, t));
 
         if (!tables.length) {

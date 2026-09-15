@@ -120,7 +120,6 @@ button { font-family: inherit; font-size: 12px; }
 .treenode:hover { background: var(--accent-soft); }
 .treenode.db { font-weight: 500; }
 .treenode.tbl { padding-left: 28px; }
-.treenode.sys { color: var(--text-dim); }
 .treenode .badge {
   font-size: 10px; color: var(--accent); border: 1px solid var(--accent);
   border-radius: 4px; padding: 0 4px; margin-left: 6px;
