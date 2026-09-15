@@ -97,13 +97,24 @@ int main(int argc, char** argv) {
   (void)fail_at;
 
   std::printf("=== 树结构 ===\n");
+  // 注意：必须用 t.root_page() 而不是 Create() 时拿到的局部 root ——
+  // 插入过程中根可能分裂（树长高一层），此时 root_ 已指向新的内部根，
+  // 而局部变量还停在最初的叶子页上（用旧根遍历会「只看到第一片叶子」，
+  // 表现为「收集到 184 个键（期望 600）」这种假故障）。
+  {
+    const page_id_t final_root = t.root_page();
+    std::printf("初始 root=%u → 最终 root=%u%s\n", root, final_root,
+                final_root == root ? "（未发生根分裂）" : "（根已分裂，树长高）");
+    std::printf("树高 = %u 层，叶子页 = %llu 页\n", t.Height(),
+                static_cast<unsigned long long>(t.LeafPageCount()));
+  }
   std::vector<std::string> leaves;
   int nodes = 0, leaves_n = 0;
-  DumpTree(bpm.get(), root, 0, &leaves, &nodes, &leaves_n);
+  DumpTree(bpm.get(), t.root_page(), 0, &leaves, &nodes, &leaves_n);
 
   // 另用叶子链把整棵树串一遍（DumpTree 只走父子路径，看不到兄弟链）
   {
-    PageGuard g(bpm.get(), bpm->get_page(root));
+    PageGuard g(bpm.get(), bpm->get_page(t.root_page()));
     IndexNode n(g.get());
     std::printf("root type=%s\n", n.type() == IndexNodeType::kLeaf ? "LEAF" : "INT");
   }
