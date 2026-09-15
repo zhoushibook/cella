@@ -14,6 +14,38 @@ namespace cella
 
         // ---------------- 表达式文本 ----------------
 
+        // 语句打印（定义在后）；子查询内联展示复用同一实现，避免两套格式漂移
+        void printStmt(const CELLA_Stmt &st, std::ostream &os, int level);
+        // 限定名文本（定义在后；表达式打印需要）
+        std::string colNameText(const CELLA_ColName &cn);
+
+        // 把语句压成单行文本：走 printStmt 再把换行与缩进折叠为单个空格。
+        // 这样内联子查询的文本与独立打印逐字一致，golden 不会出现双份格式。
+        std::string inlineStmtText(const CELLA_Stmt &st)
+        {
+            std::ostringstream raw;
+            printStmt(st, raw, 0);
+            std::string s = raw.str();
+            std::string out;
+            bool pending_space = false;
+            for (char c : s)
+            {
+                if (c == '\n')
+                {
+                    pending_space = true;
+                    continue;
+                }
+                if (pending_space)
+                {
+                    if (c != ' ')
+                        out += ' ';
+                    pending_space = false;
+                }
+                out += c;
+            }
+            return out;
+        }
+
         std::string opText(CELLA_Expr::BinOp op)
         {
             switch (op)
@@ -57,9 +89,16 @@ namespace cella
             case CELLA_Expr::Kind::LITERAL:
             case CELLA_Expr::Kind::COLUMN_REF:
             case CELLA_Expr::Kind::AGGREGATE:
+            case CELLA_Expr::Kind::FUNCTION:
+            case CELLA_Expr::Kind::SCALAR_Q:
+            case CELLA_Expr::Kind::WINDOW:
                 return 7;
             case CELLA_Expr::Kind::UNARY:
                 return 6;
+            case CELLA_Expr::Kind::IN_LIST:
+            case CELLA_Expr::Kind::IN_QUERY:
+            case CELLA_Expr::Kind::EXISTS_Q:
+                return 3;
             case CELLA_Expr::Kind::BINARY:
                 switch (e.bop)
                 {
@@ -123,6 +162,9 @@ namespace cella
                 case CELLA_LiteralKind::BOOL_LIT:
                     s = e.boolVal ? "TRUE" : "FALSE";
                     break;
+                case CELLA_LiteralKind::DEFAULT_LIT:
+                    s = "DEFAULT";
+                    break;
                 }
                 break;
             case CELLA_Expr::Kind::COLUMN_REF:
@@ -164,6 +206,100 @@ namespace cella
                     exprToStringMin(*e.right, p + 1);
                 break;
             }
+            case CELLA_Expr::Kind::FUNCTION:
+            {
+                s = e.funcName + "(";
+                for (size_t i = 0; i < e.args.size(); i++)
+                {
+                    if (i != 0)
+                        s += ", ";
+                    s += exprToStringMin(*e.args[i], 0);
+                }
+                s += ")";
+                break;
+            }
+            case CELLA_Expr::Kind::WINDOW:
+            {
+                // 两种形态共用同一节点：
+                //   ① 排名函数 ROW_NUMBER() OVER (...)  → funcName 非空、args 空
+                //   ② 窗口聚合 SUM(x) OVER (...)        → funcName 空、aggFunc/column 非空
+                // 名字取二者之一，否则窗口聚合会打印成 "()"。
+                const std::string wname = e.funcName.empty() ? e.aggFunc : e.funcName;
+                s = wname + "(";
+                if (!e.aggFunc.empty())
+                {
+                    s += e.aggStar ? "*" : (e.table.empty() ? e.column : e.table + "." + e.column);
+                }
+                else
+                {
+                    for (size_t i = 0; i < e.args.size(); i++)
+                    {
+                        if (i != 0)
+                            s += ", ";
+                        s += exprToStringMin(*e.args[i], 0);
+                    }
+                }
+                s += ") OVER (";
+                bool first = true;
+                if (!e.winPartition.empty())
+                {
+                    s += "PARTITION BY ";
+                    for (size_t i = 0; i < e.winPartition.size(); i++)
+                    {
+                        if (i != 0)
+                            s += ", ";
+                        s += colNameText(e.winPartition[i]);
+                    }
+                    first = false;
+                }
+                if (!e.winOrder.empty())
+                {
+                    if (!first)
+                        s += " ";
+                    s += "ORDERED BY ";
+                    for (size_t i = 0; i < e.winOrder.size(); i++)
+                    {
+                        if (i != 0)
+                            s += ", ";
+                        s += colNameText(e.winOrder[i]);
+                        const bool asc = (i < e.winOrderAsc.size()) ? e.winOrderAsc[i] : true;
+                        s += asc ? " ASC" : " DESC";
+                    }
+                }
+                s += ")";
+                break;
+            }
+            case CELLA_Expr::Kind::IN_LIST:
+            case CELLA_Expr::Kind::IN_QUERY:
+            {
+                s = exprToStringMin(*e.left, 4) + (e.negated ? " NOT IN (" : " IN (");
+                if (e.kind == CELLA_Expr::Kind::IN_QUERY && e.subquery)
+                {
+                    s += inlineStmtText(*e.subquery);
+                }
+                else
+                {
+                    for (size_t i = 0; i < e.inList.size(); i++)
+                    {
+                        if (i != 0)
+                            s += ", ";
+                        s += exprToStringMin(*e.inList[i], 0);
+                    }
+                }
+                s += ")";
+                break;
+            }
+            case CELLA_Expr::Kind::EXISTS_Q:
+            {
+                s = std::string(e.negated ? "NOT EXISTS (" : "EXISTS (") +
+                    (e.subquery ? inlineStmtText(*e.subquery) : std::string()) + ")";
+                break;
+            }
+            case CELLA_Expr::Kind::SCALAR_Q:
+            {
+                s = "(" + (e.subquery ? inlineStmtText(*e.subquery) : std::string()) + ")";
+                break;
+            }
             }
             if (exprPrec(e) < minPrec)
                 s = "(" + s + ")";
@@ -185,6 +321,29 @@ namespace cella
                 s += " NOT NULL";
             if (cd.primaryKey)
                 s += " PRIMARY KEY";
+            if (cd.unique)
+                s += " UNIQUE";
+            if (cd.hasDefault && cd.defaultExpr)
+                s += " DEFAULT " + exprToStringMin(*cd.defaultExpr, 0);
+            if (cd.hasCheck && cd.checkExpr)
+                s += " CHECK (" + exprToStringMin(*cd.checkExpr, 0) + ")";
+            if (cd.hasReferences)
+            {
+                s += " REFERENCES " + cd.refTable;
+                if (!cd.refColumns.empty())
+                {
+                    s += "(";
+                    for (size_t i = 0; i < cd.refColumns.size(); i++)
+                    {
+                        if (i != 0)
+                            s += ", ";
+                        s += cd.refColumns[i];
+                    }
+                    s += ")";
+                }
+                if (!cd.onDelete.empty())
+                    s += " ON DELETE " + cd.onDelete;
+            }
             return s;
         }
 
@@ -208,6 +367,52 @@ namespace cella
                 for (const auto &cd : st.columns)
                 {
                     os << indent(level + 2) << cd.name << "  " << columnTypeText(cd) << "\n";
+                }
+                // 表级约束（收尾补齐）：仅在存在时打印，既有用例输出逐字节不变
+                if (!st.tableUniques.empty() || !st.tableChecks.empty() || !st.foreignKeys.empty())
+                {
+                    os << indent(level + 1) << "constraints:\n";
+                    for (const auto &tu : st.tableUniques)
+                    {
+                        os << indent(level + 2) << "UNIQUE (";
+                        for (size_t i = 0; i < tu.columns.size(); i++)
+                        {
+                            if (i != 0)
+                                os << ", ";
+                            os << tu.columns[i];
+                        }
+                        os << ")\n";
+                    }
+                    for (const auto &tc : st.tableChecks)
+                    {
+                        os << indent(level + 2) << "CHECK ("
+                           << (tc.expr ? exprToStringMin(*tc.expr, 0) : std::string()) << ")\n";
+                    }
+                    for (const auto &f : st.foreignKeys)
+                    {
+                        os << indent(level + 2) << "FOREIGN KEY (";
+                        for (size_t i = 0; i < f.columns.size(); i++)
+                        {
+                            if (i != 0)
+                                os << ", ";
+                            os << f.columns[i];
+                        }
+                        os << ") REFERENCES " << f.refTable;
+                        if (!f.refColumns.empty())
+                        {
+                            os << " (";
+                            for (size_t i = 0; i < f.refColumns.size(); i++)
+                            {
+                                if (i != 0)
+                                    os << ", ";
+                                os << f.refColumns[i];
+                            }
+                            os << ")";
+                        }
+                        if (!f.onDelete.empty())
+                            os << " ON DELETE " << f.onDelete;
+                        os << "\n";
+                    }
                 }
                 break;
             case CELLA_Stmt::Kind::INSERT:
@@ -394,6 +599,33 @@ namespace cella
             case CELLA_Stmt::Kind::TRUNCATE_TABLE:
                 os << indent(level) << "TruncateTableStmt @" << st.line << ":" << st.col
                    << "  table=" << st.tableName << "\n";
+                break;
+            case CELLA_Stmt::Kind::CREATE_VIEW:
+                os << indent(level) << "CreateViewStmt @" << st.line << ":" << st.col
+                   << "  name=" << st.viewName << "\n";
+                if (st.viewQuery)
+                {
+                    os << indent(level + 1) << "query:\n";
+                    printStmt(*st.viewQuery, os, level + 2);
+                }
+                break;
+            case CELLA_Stmt::Kind::DROP_VIEW:
+                os << indent(level) << "DropViewStmt @" << st.line << ":" << st.col
+                   << "  name=" << st.viewName << "\n";
+                break;
+            case CELLA_Stmt::Kind::WITH:
+                os << indent(level) << "WithStmt @" << st.line << ":" << st.col << "\n";
+                for (size_t i = 0; i < st.cteNames.size(); i++)
+                {
+                    os << indent(level + 1) << "cte " << st.cteNames[i] << ":\n";
+                    if (i < st.cteQueries.size() && st.cteQueries[i])
+                        printStmt(*st.cteQueries[i], os, level + 2);
+                }
+                if (st.cteMain)
+                {
+                    os << indent(level + 1) << "main:\n";
+                    printStmt(*st.cteMain, os, level + 2);
+                }
                 break;
             }
         }

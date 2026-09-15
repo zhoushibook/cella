@@ -131,6 +131,8 @@ namespace cella
                 return CELLA_ValueType::TIME;
             case CELLA_DataType::DATETIME:
                 return CELLA_ValueType::DATETIME;
+            case CELLA_DataType::BOOL:
+                return CELLA_ValueType::BOOL;
             }
             return CELLA_ValueType::UNKNOWN;
         }
@@ -275,6 +277,72 @@ namespace cella
                 return false;
             }
             return true;
+        }
+
+        // 语句级语义分析（定义在文件末尾，子查询需要递归调用它）
+        bool analyzeStmt(const CELLA_Stmt &st, CELLA_Catalog &cat, int idx, CELLA_SemanticResult &res);
+
+        // 列引用校验（定义在下方，窗口子句需要提前用到）
+        bool resolveColName(const CELLA_ColName &cn, const std::vector<CELLA_ScopeEntry> &scope,
+                            const CELLA_Catalog &cat, std::vector<CELLA_Error> &errors);
+
+        // 标量/窗口函数的结果类型。
+        // ABS/ROUND 的结果依赖于实参类型，此处保守取 DOUBLE —— 结果类型只用于
+        // 条件表达式的 BOOL 判定与列类型推导，不参与存储，保守取值不会造成错误放行。
+        CELLA_ValueType scalarFuncResultType(const std::string &name)
+        {
+            if (name == "UPPER" || name == "LOWER" || name == "SUBSTR" || name == "SUBSTRING" ||
+                name == "TRIM" || name == "LTRIM" || name == "RTRIM" || name == "REPLACE" ||
+                name == "CONCAT" || name == "DATE_ADD" || name == "DATE_SUB")
+                return CELLA_ValueType::TEXT;
+            if (name == "ABS" || name == "ROUND")
+                return CELLA_ValueType::DOUBLE;
+            return CELLA_ValueType::INT; // LENGTH/CHAR_LENGTH/YEAR/MONTH/DAY/DATEDIFF/CEIL/FLOOR
+        }
+
+        // 子查询：在目录副本上跑完整的语句级分析。
+        // 用副本是为了避免子查询里的 DDL 副作用污染外层目录；诊断并入外层 errors。
+        // 已知边界：不做相关子查询（子查询内引用外层列会报 SEM-303），演示口径足够。
+        bool resolveSubqueryExpr(const CELLA_Expr &e, const std::vector<CELLA_ScopeEntry> &scope,
+                                 const CELLA_Catalog &cat, std::vector<CELLA_Error> &errors)
+        {
+            (void)scope;
+            if (!e.subquery)
+            {
+                errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-340", e.line, e.col,
+                                                 "子查询缺少语句体"));
+                return false;
+            }
+            CELLA_Catalog sub = cat;
+            CELLA_SemanticResult res;
+            if (!analyzeStmt(*e.subquery, sub, 0, res))
+            {
+                for (const auto &err : res.errors)
+                    errors.push_back(err);
+                errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-341", e.line, e.col,
+                                                 "子查询语义检查未通过"));
+                return false;
+            }
+            return true;
+        }
+
+        // 标量子查询的结果类型：取首个选择项的类型。
+        // 聚合项按 COUNT/SUM 的既有规则推导；其余返回 UNKNOWN（由外层比较决定相容性）。
+        CELLA_ValueType subqueryScalarType(const CELLA_Expr &e)
+        {
+            if (!e.subquery || e.subquery->selectItems.empty())
+                return CELLA_ValueType::UNKNOWN;
+            const CELLA_SelectItem &it = e.subquery->selectItems[0];
+            if (!it.expr)
+                return CELLA_ValueType::UNKNOWN;
+            if (it.expr->kind == CELLA_Expr::Kind::AGGREGATE)
+            {
+                return (it.expr->aggFunc == "AVG") ? CELLA_ValueType::DOUBLE
+                                                   : CELLA_ValueType::INT;
+            }
+            if (it.expr->kind == CELLA_Expr::Kind::COLUMN_REF)
+                return CELLA_ValueType::UNKNOWN; // 列类型需子查询作用域，交由执行期确定
+            return scalarFuncResultType(it.expr->funcName);
         }
 
         // 存在性 + 类型检查；成功时通过 outType 输出表达式类型
@@ -473,6 +541,124 @@ namespace cella
                 }
                 break;
             }
+            case CELLA_Expr::Kind::FUNCTION:
+            {
+                const CELLA_FuncSpec *spec = cella_findFunc(e.funcName);
+                if (spec == nullptr)
+                {
+                    errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-330", e.line, e.col,
+                                                     "未知函数 \"" + e.funcName +
+                                                         "\"（可用：字符串 UPPER/LOWER/LENGTH/SUBSTR/"
+                                                         "TRIM/LTRIM/RTRIM/REPLACE/CONCAT，数值 ABS/ROUND/"
+                                                         "CEIL/FLOOR，日期 YEAR/MONTH/DAY/DATEDIFF/DATE_ADD/"
+                                                         "DATE_SUB）"));
+                    return false;
+                }
+                if (spec->windowOnly)
+                {
+                    errors.push_back(cella_makeError(
+                        CELLA_Phase::SEM, "SEM-331", e.line, e.col,
+                        spec->name + std::string(" 是窗口函数，必须带 OVER (...) 子句")));
+                    return false;
+                }
+                const int n = static_cast<int>(e.args.size());
+                if (n < spec->minArgs || (spec->maxArgs >= 0 && n > spec->maxArgs))
+                {
+                    std::string range = (spec->minArgs == spec->maxArgs)
+                                            ? std::to_string(spec->minArgs)
+                                            : (std::to_string(spec->minArgs) + "~" +
+                                               std::to_string(spec->maxArgs));
+                    errors.push_back(cella_makeError(
+                        CELLA_Phase::SEM, "SEM-332", e.line, e.col,
+                        std::string(spec->name) + " 实参个数为 " + range + "，实际 " +
+                            std::to_string(n) + "（" + std::string(spec->note) + "）"));
+                    return false;
+                }
+                for (const auto &a : e.args)
+                {
+                    if (!resolveExpr(*a, scope, cat, errors))
+                        return false;
+                }
+                t = scalarFuncResultType(e.funcName);
+                break;
+            }
+            case CELLA_Expr::Kind::WINDOW:
+            {
+                // 两种形态：
+                //   ① 排名函数 ROW_NUMBER()/RANK()/DENSE_RANK() OVER (...)  —— 无实参
+                //   ② 窗口聚合 SUM(x)/COUNT(*) OVER (...)                   —— 复用聚合列字段
+                // 分区/排序列在这里就地校验（已经持有 scope，不必另设阶段）。
+                for (const auto &cn : e.winPartition)
+                {
+                    if (!resolveColName(cn, scope, cat, errors))
+                        return false;
+                }
+                for (const auto &cn : e.winOrder)
+                {
+                    if (!resolveColName(cn, scope, cat, errors))
+                        return false;
+                }
+                for (const auto &a : e.args)
+                {
+                    if (!resolveExpr(*a, scope, cat, errors))
+                        return false;
+                }
+                if (!e.aggFunc.empty())
+                {
+                    const std::string fn = e.aggFunc;
+                    if (!e.aggStar &&
+                        !resolveColumn(e.table, e.column, e.line, e.col, scope, cat, errors))
+                        return false;
+                    if (e.aggStar && fn != "COUNT")
+                    {
+                        errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-323", e.line, e.col,
+                                                         fn + "(*) 不合法：只有 COUNT 接受 *"));
+                        return false;
+                    }
+                    if (fn == "COUNT")
+                        t = CELLA_ValueType::INT;
+                    else if (fn == "AVG")
+                        t = CELLA_ValueType::DOUBLE;
+                    else
+                        t = CELLA_ValueType::INT; // SUM/MIN/MAX 在此保守取 INT
+                }
+                else
+                {
+                    t = (e.funcName == "ROW_NUMBER" || e.funcName == "RANK" ||
+                         e.funcName == "DENSE_RANK")
+                            ? CELLA_ValueType::INT
+                            : scalarFuncResultType(e.funcName);
+                }
+                break;
+            }
+            case CELLA_Expr::Kind::IN_LIST:
+                // 常量列表：只校验被比较项与列表项，没有子查询体
+                if (!resolveExpr(*e.left, scope, cat, errors))
+                    return false;
+                for (const auto &v : e.inList)
+                {
+                    if (!resolveExpr(*v, scope, cat, errors))
+                        return false;
+                }
+                t = CELLA_ValueType::BOOL;
+                break;
+            case CELLA_Expr::Kind::IN_QUERY:
+                if (!resolveExpr(*e.left, scope, cat, errors))
+                    return false;
+                if (!resolveSubqueryExpr(e, scope, cat, errors))
+                    return false;
+                t = CELLA_ValueType::BOOL;
+                break;
+            case CELLA_Expr::Kind::EXISTS_Q:
+                if (!resolveSubqueryExpr(e, scope, cat, errors))
+                    return false;
+                t = CELLA_ValueType::BOOL;
+                break;
+            case CELLA_Expr::Kind::SCALAR_Q:
+                if (!resolveSubqueryExpr(e, scope, cat, errors))
+                    return false;
+                t = subqueryScalarType(e);
+                break;
             }
             if (outType)
                 *outType = t;
@@ -515,6 +701,8 @@ namespace cella
                 return "NULL";
             case CELLA_LiteralKind::BOOL_LIT:
                 return e.boolVal ? "TRUE" : "FALSE";
+            case CELLA_LiteralKind::DEFAULT_LIT:
+                return "DEFAULT";
             }
             return "?";
         }
@@ -533,6 +721,8 @@ namespace cella
                 return "NULL";
             case CELLA_LiteralKind::BOOL_LIT:
                 return "BOOLEAN";
+            case CELLA_LiteralKind::DEFAULT_LIT:
+                return "DEFAULT";
             }
             return "?";
         }
@@ -564,8 +754,12 @@ namespace cella
                 }
                 return true;
             case CELLA_LiteralKind::BOOL_LIT:
-                ok = false;
+                // BOOL 字面量只能赋给 BOOL 列（不隐式转 INT，避免 TRUE 被当作 1 的歧义）
+                ok = col.type == CELLA_DataType::BOOL;
                 break;
+            case CELLA_LiteralKind::DEFAULT_LIT:
+                // VALUES ( DEFAULT )：实际取值由执行层按列默认值决定，编译期不判类型
+                return true;
             }
             if (!ok)
             {
@@ -1495,6 +1689,171 @@ namespace cella
             return true;
         }
 
+        // 从定义查询推导视图的输出列。
+        // 编译器侧把视图登记成一张普通表（列即推导结果），这样 semGet 完全复用，
+        // 不必为视图单独写一套列解析；执行期再按视图定义展开。
+        bool deriveViewColumns(const CELLA_Stmt &q, const CELLA_Catalog &cat,
+                               std::vector<CELLA_Column> &outCols)
+        {
+            const CELLA_Table *base = cat.findTable(q.from.name);
+            if (!base)
+                return false;
+            if (q.star)
+            {
+                outCols = base->columns;
+                return true;
+            }
+            for (const auto &si : q.selectItems)
+            {
+                if (!si.expr)
+                    continue;
+                const CELLA_Expr &e = *si.expr;
+                CELLA_Column c;
+                if (!si.alias.empty())
+                {
+                    c.name = si.alias;
+                }
+                else if (e.kind == CELLA_Expr::Kind::COLUMN_REF)
+                {
+                    c.name = e.column;
+                }
+                else if (e.kind == CELLA_Expr::Kind::AGGREGATE)
+                {
+                    c.name = e.aggFunc;
+                }
+                else
+                {
+                    c.name = e.funcName.empty() ? std::string("expr") : e.funcName;
+                }
+                if (e.kind == CELLA_Expr::Kind::COLUMN_REF)
+                {
+                    if (const CELLA_Column *src = CELLA_Catalog::findColumn(*base, e.column))
+                        c.type = src->type;
+                }
+                else if (e.kind == CELLA_Expr::Kind::AGGREGATE)
+                {
+                    c.type = (e.aggFunc == "AVG") ? CELLA_DataType::DOUBLE : CELLA_DataType::INT;
+                }
+                else if (e.kind == CELLA_Expr::Kind::WINDOW)
+                {
+                    c.type = (e.funcName == "ROW_NUMBER" || e.funcName == "RANK" ||
+                              e.funcName == "DENSE_RANK" || e.aggFunc == "COUNT")
+                                 ? CELLA_DataType::INT
+                                 : CELLA_DataType::DOUBLE;
+                }
+                else
+                {
+                    c.type = CELLA_DataType::INT;
+                }
+                outCols.push_back(c);
+            }
+            return true;
+        }
+
+        // CREATE VIEW name AS <get>
+        bool semCreateView(const CELLA_Stmt &st, CELLA_Catalog &cat, int idx, CELLA_SemanticResult &res)
+        {
+            if (!st.viewQuery)
+            {
+                res.errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-350", st.line, st.col,
+                                                     "CREATE VIEW 缺少定义查询"));
+                return false;
+            }
+            // 定义查询在目录副本上校验：视图定义不得产生目录副作用。
+            CELLA_Catalog sub = cat;
+            CELLA_SemanticResult subRes;
+            if (!analyzeStmt(*st.viewQuery, sub, idx, subRes))
+            {
+                for (const auto &e : subRes.errors)
+                    res.errors.push_back(e);
+                res.errors.push_back(cella_makeError(
+                    CELLA_Phase::SEM, "SEM-351", st.line, st.col,
+                    "视图 \"" + st.viewName + "\" 的定义查询未通过语义检查"));
+                return false;
+            }
+            if (cat.findTable(st.viewName) != nullptr)
+            {
+                res.errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-352", st.line, st.col,
+                                                     "视图名 \"" + st.viewName +
+                                                         "\" 与已存在的表/视图重名"));
+                return false;
+            }
+            CELLA_Table vt;
+            vt.name = st.viewName;
+            if (!deriveViewColumns(*st.viewQuery, cat, vt.columns))
+            {
+                res.errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-353", st.line, st.col,
+                                                     "无法推导视图 \"" + st.viewName + "\" 的输出列"));
+                return false;
+            }
+            if (!cat.addTable(std::move(vt)))
+            {
+                res.errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-352", st.line, st.col,
+                                                     "视图 \"" + st.viewName + "\" 创建失败"));
+                return false;
+            }
+            return true;
+        }
+
+        // DROP VIEW name
+        bool semDropView(const CELLA_Stmt &st, CELLA_Catalog &cat, int idx, CELLA_SemanticResult &res)
+        {
+            (void)idx;
+            if (cat.findTable(st.viewName) == nullptr)
+            {
+                res.errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-354", st.line, st.col,
+                                                     "视图 \"" + st.viewName + "\" 不存在"));
+                return false;
+            }
+            cat.dropTable(st.viewName);
+            return true;
+        }
+
+        // WITH n1 AS ( get ... ) [, ...] <主语句>
+        // CTE 只在语句作用域内可见，故全部登记在目录副本上，不写回外层目录。
+        bool semWith(const CELLA_Stmt &st, CELLA_Catalog &cat, int idx, CELLA_SemanticResult &res)
+        {
+            CELLA_Catalog sub = cat;
+            for (size_t i = 0; i < st.cteNames.size(); i++)
+            {
+                CELLA_SemanticResult r;
+                if (!analyzeStmt(*st.cteQueries[i], sub, idx, r))
+                {
+                    for (const auto &e : r.errors)
+                        res.errors.push_back(e);
+                    res.errors.push_back(cella_makeError(
+                        CELLA_Phase::SEM, "SEM-355", st.line, st.col,
+                        "CTE \"" + st.cteNames[i] + "\" 的定义查询未通过语义检查"));
+                    return false;
+                }
+                CELLA_Table vt;
+                vt.name = st.cteNames[i];
+                if (!deriveViewColumns(*st.cteQueries[i], sub, vt.columns) || !sub.addTable(std::move(vt)))
+                {
+                    res.errors.push_back(cella_makeError(
+                        CELLA_Phase::SEM, "SEM-356", st.line, st.col,
+                        "CTE \"" + st.cteNames[i] + "\" 登记失败（重名或无法推导列）"));
+                    return false;
+                }
+            }
+            if (!st.cteMain)
+            {
+                res.errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-357", st.line, st.col,
+                                                     "WITH 缺少主语句"));
+                return false;
+            }
+            CELLA_SemanticResult r2;
+            if (!analyzeStmt(*st.cteMain, sub, idx, r2))
+            {
+                for (const auto &e : r2.errors)
+                    res.errors.push_back(e);
+                res.errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-358", st.line, st.col,
+                                                     "WITH 主语句未通过语义检查"));
+                return false;
+            }
+            return true;
+        }
+
         bool analyzeStmt(const CELLA_Stmt &st, CELLA_Catalog &cat, int idx, CELLA_SemanticResult &res)
         {
             switch (st.kind)
@@ -1519,6 +1878,12 @@ namespace cella
                 return semUpdate(st, cat, idx, res);
             case CELLA_Stmt::Kind::GET:
                 return semGet(st, cat, idx, res, true);
+            case CELLA_Stmt::Kind::CREATE_VIEW:
+                return semCreateView(st, cat, idx, res);
+            case CELLA_Stmt::Kind::DROP_VIEW:
+                return semDropView(st, cat, idx, res);
+            case CELLA_Stmt::Kind::WITH:
+                return semWith(st, cat, idx, res);
             }
             res.errors.push_back(cella_makeError(CELLA_Phase::SEM, "SEM-399", st.line, st.col,
                                                  "未知语句类型"));

@@ -104,7 +104,21 @@ namespace cella
         AVG,     // 聚合函数 AVG(col)（数值列求平均，结果恒为 DOUBLE）
         MIN,     // 聚合函数 MIN(col)（可比列最小值，保持原列类型）
         MAX,     // 聚合函数 MAX(col)（可比列最大值，保持原列类型）
-        LIKE     // 字符串通配比较：x LIKE 'A%' / x NOT LIKE 'A_'
+        LIKE,    // 字符串通配比较：x LIKE 'A%' / x NOT LIKE 'A_'
+        // ── 约束族（收尾补齐）────────────────────────────────
+        DEFAULT,    // 列默认值：col INT DEFAULT 0
+        CHECK,      // 检查约束：CHECK ( expr )（列级 / 表级）
+        REFERENCES, // 外键引用：col INT REFERENCES t ( c )
+        FOREIGN,    // 表级外键：FOREIGN KEY ( a ) REFERENCES t ( c )
+        // ── 语言生态（收尾补齐）──────────────────────────────
+        VIEW,     // CREATE VIEW / DROP VIEW
+        WITH,     // 公共表表达式：WITH name AS ( get ... ) get ...
+        EXISTS,   // EXISTS ( 子查询 ) / NOT EXISTS ( 子查询 )
+        BOOL,     // 布尔列类型
+        BOOLEAN,  // BOOL 的等价拼写
+        OVER,     // 窗口函数：fn ( ... ) OVER ( ... )
+        PARTITION,// 窗口分区：OVER ( PARTITION BY ... )
+        BY        // PARTITION BY / ORDERED BY 的可选连接词（本方言里可省略）
     };
 
     // 内部别名：防止后续头文件再次定义 NULL 宏导致使用处被展开
@@ -254,6 +268,30 @@ namespace cella
             return "MAX";
         case CELLA_Keyword::LIKE:
             return "LIKE";
+        case CELLA_Keyword::DEFAULT:
+            return "DEFAULT";
+        case CELLA_Keyword::CHECK:
+            return "CHECK";
+        case CELLA_Keyword::REFERENCES:
+            return "REFERENCES";
+        case CELLA_Keyword::FOREIGN:
+            return "FOREIGN";
+        case CELLA_Keyword::VIEW:
+            return "VIEW";
+        case CELLA_Keyword::WITH:
+            return "WITH";
+        case CELLA_Keyword::EXISTS:
+            return "EXISTS";
+        case CELLA_Keyword::BOOL:
+            return "BOOL";
+        case CELLA_Keyword::BOOLEAN:
+            return "BOOLEAN";
+        case CELLA_Keyword::OVER:
+            return "OVER";
+        case CELLA_Keyword::PARTITION:
+            return "PARTITION";
+        case CELLA_Keyword::BY:
+            return "BY";
         }
         return "";
     }
@@ -324,6 +362,18 @@ namespace cella
             {"MIN", CELLA_Keyword::MIN},
             {"MAX", CELLA_Keyword::MAX},
             {"LIKE", CELLA_Keyword::LIKE},
+            {"DEFAULT", CELLA_Keyword::DEFAULT},
+            {"CHECK", CELLA_Keyword::CHECK},
+            {"REFERENCES", CELLA_Keyword::REFERENCES},
+            {"FOREIGN", CELLA_Keyword::FOREIGN},
+            {"VIEW", CELLA_Keyword::VIEW},
+            {"WITH", CELLA_Keyword::WITH},
+            {"EXISTS", CELLA_Keyword::EXISTS},
+            {"BOOL", CELLA_Keyword::BOOL},
+            {"BOOLEAN", CELLA_Keyword::BOOLEAN},
+            {"OVER", CELLA_Keyword::OVER},
+            {"PARTITION", CELLA_Keyword::PARTITION},
+            {"BY", CELLA_Keyword::BY},
         };
         auto it = table.find(cella_toUpper(lexeme));
         return it == table.end() ? CELLA_Keyword::NONE : it->second;

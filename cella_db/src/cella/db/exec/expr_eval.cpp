@@ -1,9 +1,12 @@
 #include "cella/db/exec/expr_eval.h"
 
+#include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <string>
+#include <vector>
 
 #include "cella/cella_printer.h"
 #include "cella/db/common/value_bridge.h"
@@ -65,6 +68,205 @@ bool LikeMatch(const std::string& s, const std::string& p) {
 
 // 表达式里的数值字面量在语义阶段已确认可比较（SEM-309/310），
 // 这里只做运行期兜底：两侧族不同即报错，避免静默给出错误结果。
+// ── 标量函数支持（与 cella_common.h::cella_findFunc 的规格表一一对应）────
+std::string ScalarToText(const storage::Value& v) {
+  switch (v.type) {
+    case ValueType::kVarchar:
+    case ValueType::kChar:
+    case ValueType::kDate:  return v.str_val;
+    case ValueType::kBool:  return v.bool_val ? "TRUE" : "FALSE";
+    case ValueType::kInt32: return std::to_string(v.int32_val);
+    case ValueType::kInt64: return std::to_string(v.int64_val);
+    case ValueType::kFloat:  return std::to_string(v.float_val);
+    case ValueType::kDouble: return std::to_string(v.double_val);
+    default:                 return std::string();
+  }
+}
+
+// 日期以 YYYY-MM-DD 文本存储，日期运算统一换算成「距 1970-01-01 的天数」再做整数加减。
+bool ParseDate(const std::string& s, int* y, int* m, int* d) {
+  if (s.size() < 10 || s[4] != '-' || s[7] != '-') {
+    return false;
+  }
+  for (int i : {0, 1, 2, 3, 5, 6, 8, 9}) {
+    if (!std::isdigit(static_cast<unsigned char>(s[i]))) {
+      return false;
+    }
+  }
+  *y = std::stoi(s.substr(0, 4));
+  *m = std::stoi(s.substr(5, 2));
+  *d = std::stoi(s.substr(8, 2));
+  return true;
+}
+
+int DateToSerial(int y, int m, int d) {
+  y -= (m <= 2) ? 1 : 0;
+  const int era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = static_cast<unsigned>(y - era * 400);
+  const unsigned mp = static_cast<unsigned>(m + (m > 2 ? -3 : 9));
+  const unsigned doy = (153u * mp + 2) / 5 + static_cast<unsigned>(d) - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + static_cast<int>(doe) - 719468;
+}
+
+void SerialToDate(int z, int* y, int* m, int* d) {
+  z += 719468;
+  const int era = (z >= 0 ? z : z - 146096) / 146097;
+  const unsigned doe = static_cast<unsigned>(z - era * 146097);
+  const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  const int yy = static_cast<int>(yoe) + era * 400;
+  const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  const unsigned mp = (5 * doy + 2) / 153;
+  const unsigned dd = doy - (153 * mp + 2) / 5 + 1;
+  const unsigned mm = mp + (mp < 10 ? 3 : -9);
+  *y = yy + (mm <= 2 ? 1 : 0);
+  *m = static_cast<int>(mm);
+  *d = static_cast<int>(dd);
+}
+
+std::string FormatDate(int y, int m, int d) {
+  char buf[16];
+  std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", y, m, d);
+  return std::string(buf);
+}
+
+std::string TrimLeft(const std::string& s) {
+  size_t i = 0;
+  while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i;
+  return s.substr(i);
+}
+std::string TrimRight(const std::string& s) {
+  size_t n = s.size();
+  while (n > 0 && std::isspace(static_cast<unsigned char>(s[n - 1]))) --n;
+  return s.substr(0, n);
+}
+
+DbStatus EvalScalarFunc(const std::string& fn, const std::vector<storage::Value>& a,
+                        storage::Value* out) {
+  const std::string text0 = a.empty() ? std::string() : ScalarToText(a[0]);
+  // 字符串族
+  if (fn == "UPPER") {
+    std::string r = text0;
+    for (char& c : r) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    *out = Value::Varchar(r);
+    return DbStatus::Ok();
+  }
+  if (fn == "LOWER") {
+    std::string r = text0;
+    for (char& c : r) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    *out = Value::Varchar(r);
+    return DbStatus::Ok();
+  }
+  if (fn == "LENGTH" || fn == "CHAR_LENGTH") {
+    *out = Value::BigInt(static_cast<int64_t>(text0.size()));
+    return DbStatus::Ok();
+  }
+  if (fn == "TRIM") {
+    *out = Value::Varchar(TrimRight(TrimLeft(text0)));
+    return DbStatus::Ok();
+  }
+  if (fn == "LTRIM") {
+    *out = Value::Varchar(TrimLeft(text0));
+    return DbStatus::Ok();
+  }
+  if (fn == "RTRIM") {
+    *out = Value::Varchar(TrimRight(text0));
+    return DbStatus::Ok();
+  }
+  if (fn == "SUBSTR" || fn == "SUBSTRING") {
+    // 下标从 1 起；起点越界返回空串；长度缺省表示取到末尾
+    const int64_t start = static_cast<int64_t>(AsDouble(a[1]));
+    int64_t len = (a.size() >= 3) ? static_cast<int64_t>(AsDouble(a[2]))
+                                  : static_cast<int64_t>(text0.size());
+    if (start < 1 || len <= 0 || static_cast<size_t>(start) > text0.size()) {
+      *out = Value::Varchar(std::string());
+      return DbStatus::Ok();
+    }
+    *out = Value::Varchar(text0.substr(static_cast<size_t>(start - 1), static_cast<size_t>(len)));
+    return DbStatus::Ok();
+  }
+  if (fn == "REPLACE") {
+    const std::string from = ScalarToText(a[1]);
+    const std::string to = ScalarToText(a[2]);
+    std::string r;
+    if (from.empty()) {
+      r = text0;
+    } else {
+      size_t pos = 0;
+      for (;;) {
+        const size_t hit = text0.find(from, pos);
+        if (hit == std::string::npos) {
+          r += text0.substr(pos);
+          break;
+        }
+        r += text0.substr(pos, hit - pos) + to;
+        pos = hit + from.size();
+      }
+    }
+    *out = Value::Varchar(r);
+    return DbStatus::Ok();
+  }
+  if (fn == "CONCAT") {
+    std::string r;
+    for (const auto& v : a) r += ScalarToText(v);
+    *out = Value::Varchar(r);
+    return DbStatus::Ok();
+  }
+  // 数值族
+  if (fn == "ABS") {
+    const double x = AsDouble(a[0]);
+    *out = (a[0].type == ValueType::kInt32 || a[0].type == ValueType::kInt64)
+               ? Value::BigInt(static_cast<int64_t>(x < 0 ? -x : x))
+               : Value::Double(x < 0 ? -x : x);
+    return DbStatus::Ok();
+  }
+  if (fn == "ROUND") {
+    const double x = AsDouble(a[0]);
+    const int n = (a.size() >= 2) ? static_cast<int>(AsDouble(a[1])) : 0;
+    const double p = std::pow(10.0, n);
+    *out = Value::Double(std::round(x * p) / p);
+    return DbStatus::Ok();
+  }
+  if (fn == "CEIL") {
+    *out = Value::BigInt(static_cast<int64_t>(std::ceil(AsDouble(a[0]))));
+    return DbStatus::Ok();
+  }
+  if (fn == "FLOOR") {
+    *out = Value::BigInt(static_cast<int64_t>(std::floor(AsDouble(a[0]))));
+    return DbStatus::Ok();
+  }
+  // 日期族
+  if (fn == "YEAR" || fn == "MONTH" || fn == "DAY") {
+    int y = 0, m = 0, d = 0;
+    if (!ParseDate(text0, &y, &m, &d)) {
+      return DbStatus::Error(DbCode::kTypeMismatch, fn + " 需要 YYYY-MM-DD 格式的日期，实际为 " + text0);
+    }
+    *out = Value::BigInt(fn == "YEAR" ? y : (fn == "MONTH" ? m : d));
+    return DbStatus::Ok();
+  }
+  if (fn == "DATEDIFF") {
+    int y1 = 0, m1 = 0, d1 = 0, y2 = 0, m2 = 0, d2 = 0;
+    if (!ParseDate(ScalarToText(a[0]), &y1, &m1, &d1) ||
+        !ParseDate(ScalarToText(a[1]), &y2, &m2, &d2)) {
+      return DbStatus::Error(DbCode::kTypeMismatch, "DATEDIFF 需要两个 YYYY-MM-DD 格式的日期");
+    }
+    *out = Value::BigInt(static_cast<int64_t>(DateToSerial(y1, m1, d1) - DateToSerial(y2, m2, d2)));
+    return DbStatus::Ok();
+  }
+  if (fn == "DATE_ADD" || fn == "DATE_SUB") {
+    int y = 0, m = 0, d = 0;
+    if (!ParseDate(text0, &y, &m, &d)) {
+      return DbStatus::Error(DbCode::kTypeMismatch, fn + " 需要 YYYY-MM-DD 格式的日期，实际为 " + text0);
+    }
+    const int64_t delta = static_cast<int64_t>(AsDouble(a[1])) * (fn == "DATE_SUB" ? -1 : 1);
+    int ry = 0, rm = 0, rd = 0;
+    SerialToDate(DateToSerial(y, m, d) + static_cast<int>(delta), &ry, &rm, &rd);
+    *out = Value::Varchar(FormatDate(ry, rm, rd));
+    return DbStatus::Ok();
+  }
+  return DbStatus::Error(DbCode::kInternal, "未知标量函数: " + fn);
+}
+
 DbStatus CheckComparable(const Value& a, const Value& b) {
   const bool an = IsNumeric(a.type);
   const bool bn = IsNumeric(b.type);
@@ -82,6 +284,24 @@ DbStatus CheckComparable(const Value& a, const Value& b) {
   return DbStatus::Error(DbCode::kTypeMismatch,
                          std::string("无法比较 ") + storage::ToString(a.type) + " 与 " +
                              storage::ToString(b.type));
+}
+
+// 标量相等比较（供 IN 列表使用）：先按族的相容性把关，再逐族比较
+DbStatus ScalarEq(const storage::Value& a, const storage::Value& b, bool* eq) {
+  const DbStatus s = CheckComparable(a, b);
+  if (!s.ok()) {
+    return s;
+  }
+  if (IsNumeric(a.type) && IsNumeric(b.type)) {
+    *eq = (AsDouble(a) == AsDouble(b));
+    return DbStatus::Ok();
+  }
+  if (a.type == ValueType::kBool && b.type == ValueType::kBool) {
+    *eq = (a.bool_val == b.bool_val);
+    return DbStatus::Ok();
+  }
+  *eq = (ScalarToText(a) == ScalarToText(b));
+  return DbStatus::Ok();
 }
 
 DbStatus ArithNumeric(const Value& a, const Value& b, const char* op, storage::Value* out) {
@@ -196,6 +416,81 @@ DbStatus ExprEval::Eval(const cella::CELLA_Expr& expr, const EvalRow& row, stora
       return DbStatus::Error(DbCode::kColumnNotFound,
                              "聚合结果列不存在: " + want + "（OpAggregate 未产出该列）");
     }
+
+    case cella::CELLA_Expr::Kind::FUNCTION: {
+      std::vector<storage::Value> args;
+      args.reserve(expr.args.size());
+      for (const auto& arg : expr.args) {
+        storage::Value v;
+        const DbStatus s = Eval(*arg, row, &v);
+        if (!s.ok()) {
+          return s;
+        }
+        // 除 CONCAT（约定 NULL 视作空串）外一律 NULL 传播
+        if (v.IsNull() && expr.funcName != "CONCAT") {
+          *out = Value::Null();
+          return DbStatus::Ok();
+        }
+        args.push_back(v);
+      }
+      return EvalScalarFunc(expr.funcName, args, out);
+    }
+
+    case cella::CELLA_Expr::Kind::IN_LIST: {
+      if (!expr.left) {
+        return DbStatus::Error(DbCode::kInternal, "IN 表达式缺少左操作数");
+      }
+      storage::Value lv;
+      const DbStatus s = Eval(*expr.left, row, &lv);
+      if (!s.ok()) {
+        return s;
+      }
+      if (lv.IsNull()) {
+        *out = Value::Null();  // NULL IN (...) → UNKNOWN
+        return DbStatus::Ok();
+      }
+      bool hit = false;
+      bool any_null = false;
+      for (const auto& e : expr.inList) {
+        storage::Value rv;
+        const DbStatus rs = Eval(*e, row, &rv);
+        if (!rs.ok()) {
+          return rs;
+        }
+        if (rv.IsNull()) {
+          any_null = true;
+          continue;
+        }
+        bool eq = false;
+        const DbStatus es = ScalarEq(lv, rv, &eq);
+        if (!es.ok()) {
+          return es;
+        }
+        if (eq) {
+          hit = true;
+          break;
+        }
+      }
+      if (hit) {
+        *out = Value::Bool(!expr.negated);
+      } else if (any_null) {
+        *out = Value::Null();  // 未命中但存在 NULL → UNKNOWN
+      } else {
+        *out = Value::Bool(expr.negated);
+      }
+      return DbStatus::Ok();
+    }
+
+    // 以下三类需要「在表达式求值过程中递归执行一条完整查询」，
+    // 而 ExprEval 目前不持有执行器句柄。给出明确错误而不是静默返回错值。
+    case cella::CELLA_Expr::Kind::IN_QUERY:
+      return DbStatus::Error(DbCode::kNotImplemented, "执行期尚未支持子查询 IN (GET ...)");
+    case cella::CELLA_Expr::Kind::EXISTS_Q:
+      return DbStatus::Error(DbCode::kNotImplemented, "执行期尚未支持 EXISTS (GET ...)");
+    case cella::CELLA_Expr::Kind::SCALAR_Q:
+      return DbStatus::Error(DbCode::kNotImplemented, "执行期尚未支持标量子查询 (GET ...)");
+    case cella::CELLA_Expr::Kind::WINDOW:
+      return DbStatus::Error(DbCode::kNotImplemented, "执行期尚未支持窗口函数 OVER (...)");
 
     case cella::CELLA_Expr::Kind::UNARY: {
       if (!expr.child) {
