@@ -616,9 +616,9 @@ TEST_CASE(composite_key_roundtrip_all_types) {
       // 布尔 + 浮点 + 日期文本
       {{Value::Bool(true), Value::Float(-1.5f), Varchar("2026-01-02")},
        {ValueType::kBool, ValueType::kFloat, ValueType::kVarchar}},
-      // NULL 与「编码以 00 01 开头的 INT32」同场：位图必须消歧
+      // NULL 与「编码以 00 01 开头的 INT32」（-2147387271，bits 0x8001xxxx）同场：位图必须消歧
       {{Value::Null(), Varchar("xy")}, {ValueType::kInt32, ValueType::kVarchar}},
-      {{Int32(-2147417223), Varchar("")}, {ValueType::kInt32, ValueType::kVarchar}},
+      {{Int32(-2147387271), Varchar("")}, {ValueType::kInt32, ValueType::kVarchar}},
   };
   for (const Row& r : rows) {
     std::vector<ValueType> types;
@@ -655,22 +655,42 @@ TEST_CASE(composite_key_roundtrip_all_types) {
   }
 }
 
-// 历史歧义回归：下面两行的**元组编码必须不同**（NULL 标记 00 01 与
-// INT32 极小值编码共享前缀，复合键靠 NULL 位图消除歧义），
-// 且各自都能按完整消费规则解码回自己。
+// 历史歧义回归：NULL 标记 00 01 与 INT32 值 -2147387271 的保序编码
+// （00 01 78 79）共享前缀，**不加位图时**两个不同元组会拼出完全相同的键；
+// 复合键靠 NULL 位图消除该歧义。
+// 注意：这个数值不是随手挑的 —— 它必须满足 enc(v) 以 00 01 开头，
+// 即 v 的补码为 0x8001xxxx（-2147418112 .. -2147387271 这一段）。
+// 用例同时断言「无位图会撞」与「有位图不撞」，否则它只是空转。
 TEST_CASE(composite_key_null_bitmap_disambiguates) {
+  // ① 先复现歧义：手工做「无位图」的朴素拼接
+  auto naive_concat = [](const std::vector<Value>& vals) {
+    std::string out;
+    for (const Value& v : vals) {
+      EncodeIndexColumn(v, &out);
+    }
+    return out;
+  };
+  const std::string naive_a = naive_concat({Value::Null(), Varchar("xy")});
+  const std::string naive_b = naive_concat({Int32(-2147387271), Varchar("")});
+  EXPECT_TRUE(naive_a == naive_b);           // ← 歧义真实存在（两条元组同一字节串）
+  EXPECT_EQ(naive_a.size(), 6u);             // 00 01 | 78 79 00 00
+
+  // ② 加位图后必须区分开（位图是第一个字节：01 = 第 1 列 NULL，00 = 非 NULL）
   const std::string a = EncodeColumnKeys({Value::Null(), Varchar("xy")});
-  const std::string b = EncodeColumnKeys({Int32(-2147417223), Varchar("")});
+  const std::string b = EncodeColumnKeys({Int32(-2147387271), Varchar("")});
   EXPECT_TRUE(a != b);
-  // 补一个哑行定位，变成合法叶子键后再解码（长度 ≥ 6 的键会按「尾部 6B
-  // 是行定位」切分 —— 这正是行定位恒在键尾的约定）
+  EXPECT_EQ(static_cast<unsigned char>(a[0]), 0x01u);
+  EXPECT_EQ(static_cast<unsigned char>(b[0]), 0x00u);
+
+  // ③ 补一个哑行定位变成合法叶子键，各自都能精确解码回自己
+  //（长度 ≥ 6 会按「尾部 6B 是行定位」切分 —— 这正是行定位恒在键尾的约定）
   const std::string dummy_rid(6, '\0');
   std::vector<Value> da, db;
   EXPECT_TRUE(DecodeLeafKeyColumns(a + dummy_rid, {ValueType::kInt32, ValueType::kVarchar}, &da));
   EXPECT_TRUE(da[0].IsNull());
   EXPECT_TRUE(da[1].str_val == "xy");
   EXPECT_TRUE(DecodeLeafKeyColumns(b + dummy_rid, {ValueType::kInt32, ValueType::kVarchar}, &db));
-  EXPECT_EQ(db[0].int32_val, -2147417223);
+  EXPECT_EQ(db[0].int32_val, -2147387271);
   EXPECT_TRUE(db[1].str_val == "");
 }
 

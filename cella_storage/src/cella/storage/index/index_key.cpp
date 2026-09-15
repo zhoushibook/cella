@@ -283,7 +283,7 @@ std::string EncodeColumnKeys(const std::vector<Value>& vals) {
   std::string key;
   // 复合键：先写 NULL 位图（第 i 位 = 第 i 列是否 NULL），再逐列拼接。
   // 位图让解码端的列边界完全确定 —— 否则 NULL 标记（00 01，2 字节）与
-  // 定宽列的值编码可能共享前缀（例：INT32 0x80017879 编码 = 00 01 78 79），
+  // 定宽列的值编码可能共享前缀（例：INT32 -2147387271 的编码 = 00 01 78 79），
   // 两个不同元组会拼出同一个键。位图是权威判定，歧义从机制上消失。
   if (vals.size() >= 2) {
     AppendNullBitmap(vals, &key);
