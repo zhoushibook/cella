@@ -308,6 +308,48 @@ ok('# 列左缘可拖：' + rnBefore + ' → ' + parseFloat(rnColEl.style.width)
   Math.abs(rnTdL.getBoundingClientRect().width - parseFloat(rnColEl.style.width)) <= 1);
 ok('# 列缩到下限 34 仍与视觉一致', parseFloat(rnColEl.style.width) === 34);
 
+// ⑰ 隐藏列不能成为交界的目标（数据浏览里 rowid 隐藏）：
+//    从「# 右侧那一列」的**左缘**抓交界，必须改到 # 列，而不是改到看不见的 rowid 列
+g.setData([{ name: 'rowid', type: 'INT64' }, { name: 'id', type: 'INT32' }, { name: 'v', type: 'VARCHAR' }],
+  [[1, 10, 'a'], [2, 20, 'b']], null, { hidden: ['rowid'] });
+g.resetLayout();
+const rnColH = host.querySelectorAll('colgroup col')[1];      // ck, rownum, id, v, filler
+const rnWH = parseFloat(rnColH.style.width);
+const idTdH = host.querySelector('tr[data-r="0"] td[data-c="1"]');   // 首个可见数据列（id）
+const irH = idTdH.getBoundingClientRect();
+idTdH.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: irH.left + 2, clientY: irH.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: irH.left + 2 + 26, clientY: irH.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+ok('隐藏列不抢交界：首可见数据列左缘 → 改 # 列 ' + rnWH + '→' + parseFloat(rnColH.style.width),
+  parseFloat(rnColH.style.width) === rnWH + 26);
+
+// 中间有隐藏列时，左邻必须是「上一个可见列」
+g.setData([{ name: 'a', type: 'INT32' }, { name: 'h', type: 'INT32' }, { name: 'b', type: 'INT32' }],
+  [[1, 2, 3]], null, { hidden: ['h'] });
+g.resetLayout();
+const aColH = host.querySelectorAll('colgroup col')[2];              // ck, rownum, a, b, filler
+const aWH = parseFloat(aColH.style.width);
+const bTdH = host.querySelector('tr[data-r="0"] td[data-c="2"]');
+const brH = bTdH.getBoundingClientRect();
+bTdH.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: brH.left + 2, clientY: brH.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: brH.left + 2 + 18, clientY: brH.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+ok('隔着隐藏列：b 的左缘改到上一个可见列 a ' + aWH + '→' + parseFloat(aColH.style.width),
+  parseFloat(aColH.style.width) === aWH + 18);
+
+// 复选框列右缘（交界另一侧）也归 # 列
+g.resetLayout();
+const rnColCk = host.querySelectorAll('colgroup col')[1];
+const rnWCk = parseFloat(rnColCk.style.width);
+const ckTd = host.querySelector('tr[data-r="0"] td.ck');
+const crCk = ckTd.getBoundingClientRect();
+ckTd.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: crCk.right - 2, clientY: crCk.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: crCk.right - 2 + 16, clientY: crCk.top + 3, buttons: 1 }));
+document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+ok('复选框列右缘也归 # 列 ' + rnWCk + '→' + parseFloat(rnColCk.style.width),
+  parseFloat(rnColCk.style.width) === rnWCk + 16);
+g.setData(cols, rows);
+
 document.getElementById('out').textContent = L.join('\n');
 </script>
 </body></html>

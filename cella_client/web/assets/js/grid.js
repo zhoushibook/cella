@@ -247,17 +247,24 @@ export function createGrid(container, { onSort, checkable = false, onCheckChange
     if (fromR <= EDGE && fromR >= -1) {
       if (td.hasAttribute('data-c')) return { kind: 'col', ci: +td.getAttribute('data-c'), side: 'r' };
       if (td.classList.contains('rownum')) return { kind: 'rownum', side: 'r' };
-      return null;   // 复选框列宽固定，不给拖
+      // 复选框列的右缘 = 复选框列与「#」列的交界：归「#」列（复选框列宽固定，不给拖）。
+      // 交界两侧都抓同一个结果，否则从 ck 一侧抓会「没反应」。
+      if (td.classList.contains('ck')) return { kind: 'rownum', side: 'r' };
+      return null;
     }
     if (fromB <= EDGE && fromB >= -1) return { kind: 'row', side: 'b' };
-    // 边界的另一侧：下一列的左缘 = 上一列的右缘（首数据列左缘 = 行号列边界）。
+    // 边界的另一侧：本格左缘 = 上一个**可见**列的右界（首可见列左缘 = 行号列边界）。
+    // ⚠️ 必须按 visList 找上一个可见列：数据浏览的 rowid 是隐藏列（不渲染），
+    // 若简单用 ci-1 就会改到看不见的列上 —— 表现就是「拖了没反应」。
     // 放在下缘之后：左下角是「行交界」，不是列交界。
     if (fromL <= EDGE && fromL >= -1) {
       if (td.hasAttribute('data-c')) {
         const ci = +td.getAttribute('data-c');
-        return ci > 0 ? { kind: 'col', ci: ci - 1, side: 'l' } : { kind: 'rownum', side: 'l' };
+        const pos = visList.indexOf(ci);
+        if (pos > 0) return { kind: 'col', ci: visList[pos - 1], side: 'l' };
+        return { kind: 'rownum', side: 'l' };
       }
-      // 「#」格的左缘 = 复选框列与「#」列的交界：归「#」列（复选框列宽固定，不给拖）
+      // 「#」格的左缘 = 复选框列与「#」列的交界：同样归「#」列
       if (td.classList.contains('rownum')) return { kind: 'rownum', side: 'l' };
       return null;
     }
