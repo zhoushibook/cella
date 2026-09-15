@@ -13,6 +13,7 @@
 #include "types.h"
 #include "value.h"
 #include "table_heap.h"
+#include "console_utf8.h"   // 扁平名：demo/examples 只挂了扁平公共目录
 
 using namespace cella::storage;
 
@@ -91,6 +92,7 @@ void PrintRow(const BenchResult& r) {
 }  // namespace
 
 int main() {
+  cella::storage::EnableUtf8Console();   // 控制台按 UTF-8 显示中文
   setvbuf(stdout, nullptr, _IONBF, 0);   // 无缓冲，便于实时观察
   StorageConfig config;
   config.data_dir = "./demo_data";

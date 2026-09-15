@@ -11,8 +11,10 @@
 #include "schema.h"
 #include "value.h"
 #include "table_heap.h"
+#include "console_utf8.h"   // 扁平名：demo/examples 只挂了扁平公共目录
 
 int main() {
+  cella::storage::EnableUtf8Console();   // 控制台按 UTF-8 显示中文
   using namespace cella::storage;
 
   StorageConfig config;

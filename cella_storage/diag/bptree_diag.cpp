@@ -14,6 +14,7 @@
 #include "cella/storage/index/index_key.h"
 #include "cella/storage/index/index_node.h"
 #include "cella/storage/page/page.h"
+#include "console_utf8.h"   // 扁平名：demo/examples 只挂了扁平公共目录
 
 using namespace cella::storage;
 
@@ -75,6 +76,7 @@ void DumpTree(BufferPoolManager* bpm, page_id_t pid, int depth,
 }  // namespace
 
 int main(int argc, char** argv) {
+  cella::storage::EnableUtf8Console();   // 控制台按 UTF-8 显示中文
   const int32_t N = (argc > 1) ? std::atoi(argv[1]) : 600;
   auto bpm = MakeBpm(512);
   BPlusTree::KeySpec spec = BPlusTree::KeySpec::Single(ValueType::kInt32, 0);
