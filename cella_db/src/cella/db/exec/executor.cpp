@@ -5821,6 +5821,45 @@ namespace cella::db
     // 计划节点本体在堆上，vector 搬移只动 unique_ptr → 指针在 Run 期间保持有效。
     const cella::CELLA_PlanNode *root = kept.plans[0].get();
     stmt_keepalive_.push_back(std::move(kept));
+
+    // ── 嵌套执行的「语句级状态隔离」（重入保护）───────────────────
+    // 本函数会在外层语句执行到一半时被调用（SELECT 列表里的标量子查询 /
+    // IN / EXISTS / 视图与 CTE 扫描 / WITH 主语句），而下面这些成员是**执行器
+    // 级共享**的语句临时状态，内层算子会按自己的语义改写它们：
+    //   * OpProject 收尾无条件 window_values_.clear()（防止行间值泄漏）；
+    //   * OpProject 依 sort_hint_ 追加隐藏排序列后写 visible_fields_。
+    // 不隔离的后果是实测过的两类错误：
+    //   ① 外层窗口列求值时查不到值 → 「DB-704 窗口函数值缺失」；
+    //   ② 外层 OpSort 读到被污染的 visible_fields_ → 排序键错位 + 结果被裁剪，
+    //      静默返回错误结果（比报错更危险）。
+    // 进入前用 move 交换保存并复位，退出时由 RAII 还原（覆盖所有提前 return 的
+    // 路径）。必须交换而不是换成新 map：eval_ctx_.window_values 指向该成员对象
+    // 本身，换对象会让指针悬空。
+    struct NestedStateGuard
+    {
+      Executor *self = nullptr;
+      std::map<const cella::CELLA_Expr *, storage::Value> windows;
+      size_t visible = 0;
+      const std::vector<cella::CELLA_ColName> *sort_hint = nullptr;
+      ~NestedStateGuard()
+      {
+        if (self == nullptr)
+        {
+          return;
+        }
+        self->window_values_ = std::move(windows);
+        self->visible_fields_ = visible;
+        self->sort_hint_ = sort_hint;
+      }
+    } nested_guard;
+    nested_guard.self = this;
+    nested_guard.windows = std::move(window_values_);
+    nested_guard.visible = visible_fields_;
+    nested_guard.sort_hint = sort_hint_;
+    window_values_.clear();
+    visible_fields_ = 0;
+    sort_hint_ = nullptr; // 内层 Project 不许把外层的排序键当成自己的隐藏列追加
+
     return Run(*root, ctx, out);
   }
 
