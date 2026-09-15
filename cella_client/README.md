@@ -180,8 +180,8 @@ cella_web.exe
   - **C++ 层** `build/cella_client/cella_client_tests.exe`（JSON 往返与容错 / HTTP 解析与畸形请求 /
     SQL 生成 / API 端到端 / 坐标换算黄金样本）。`run_all.ps1` 已纳入。
   - **前端行为层** `web/_selftest/`（零依赖、零 npm）：在真实浏览器里 import 真实模块、派发真实事件、
-    把断言写回页面。grid 68 / editor 17 / panels 27 / layout 42 / app 集成 46 / designer 53，
-    共 **253 项**。
+    把断言写回页面。grid 71 / editor 17 / panels 27 / layout 42 / app 集成 46 / designer 53，
+    共 **256 项**。
 
     ```bash
     ./cella_client/run_web_tests.sh        # 自己起停服务 + 汇总统计，有 FAIL 就非 0 退出
