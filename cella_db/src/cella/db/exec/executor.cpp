@@ -2311,6 +2311,17 @@ namespace cella::db
         return FromStorage(is, "插入索引项 " + ix.meta->name);
       }
       ++index_stats_.inserts;
+      // 🐛 树根分裂回写目录：Insert 可能触发根分裂（树长高），根页号一变，
+      // 下一条语句按目录里的旧根 Attach 就等于从残树开始插/查 —— 10 万行实测
+      // 主键等值查询大面积静默 0 行。根没变时这里是一次指针比较，零开销。
+      if (ix.tree->root_page() != ix.meta->root_page_id)
+      {
+        const DbStatus rs = catalog_->UpdateIndexRoot(ix.meta->name, ix.tree->root_page());
+        if (!rs.ok())
+        {
+          return rs;
+        }
+      }
     }
     return DbStatus::Ok();
   }
@@ -2392,6 +2403,15 @@ namespace cella::db
         return FromStorage(is, "更新索引(插新) " + ix.meta->name);
       }
       ++index_stats_.inserts;
+      // 🐛 同 IndexRowInsert：插新键可能触发根分裂，根页号必须回写目录。
+      if (ix.tree->root_page() != ix.meta->root_page_id)
+      {
+        const DbStatus rs = catalog_->UpdateIndexRoot(ix.meta->name, ix.tree->root_page());
+        if (!rs.ok())
+        {
+          return rs;
+        }
+      }
       ++index_stats_.updates;
     }
     return DbStatus::Ok();

@@ -295,6 +295,7 @@ BlockersLocked(txn) = { 与 txn 的待满足请求冲突的持有者 }
 | 10 | `ORDER BY` 未投影列 | 计划形状固定为 `Project → Distinct → Sort`，执行期用「隐藏排序列」通道实现合法语义（详见 ARCHITECTURE.md §5.3） |
 | 11 | `CatalogTable::first_page_id` | `IStorage` 未导出「首数据页」查询，建表后用 `open_table` 句柄补齐，仅作诊断展示 |
 | 12 | 事务表只增不删 | `TxnManager` 保留已结束事务用于诊断；长期运行的进程需要定期重置（未来可加回收） |
+| 13 | 🐛 树根分裂后回写根页号 | **缺陷修复（2026-09-15，10 万行测试数据踩出）**：B+ 树插入触发根分裂（树长高）后，`cella_index.root_page_id` 从不更新 → 每条语句 `OpenTableIndexes` 按旧根 `Attach`，等于从残树插/查：主键与二级索引的等值/范围查询在第一叶之外**大面积静默返回 0 行**，跨语句唯一性检查同样失守（教学测试表 < 单叶容量 ~215 键，永远踩不到）。修复：新增 `CatalogManager::UpdateIndexRoot`（根没变零开销；变了 = 旧元数据行打墓碑 + 追加新行 + 就地更新内存视图），在 `IndexRowInsert` / `IndexRowUpdate` 的 `tree->Insert` 成功后比对 `tree->root_page()` 与目录值并回写。`Remove` 不做合并、树不会变矮，无需处理。验证：10 万行重灌后此前失败的等值查询（109/216/500/15000/25000/29500/orders-12345）全部命中；四层回归全绿（58 / 10802 / 244 / 31 + e2e 68）；副作用 = 灌库 30s → 6s（残树路径消失） |
 
 ---
 
