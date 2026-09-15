@@ -185,6 +185,10 @@ namespace cella
 
         // CREATE TABLE
         std::vector<CELLA_ColumnDef> columns;
+        // 表级主键：PRIMARY KEY (a, b [, ...])。与列级主键互斥（SEM-313）；
+        // 语义阶段把命中的列标记 primaryKey，后续流程（目录/执行/打印）复用列级机制。
+        std::vector<std::string> tablePrimaryKey;
+        int tablePkLine = 0, tablePkCol = 0;
 
         // INSERT
         std::vector<std::string> insertColumns; // 空 = 省略列清单
@@ -215,7 +219,9 @@ namespace cella
         // CREATE INDEX / DROP INDEX
         std::string indexName;   // 索引名（原始拼写）
         bool unique = false;     // CREATE UNIQUE INDEX 标志
-        std::string indexColumn; // 被索引的列名（单列索引）
+        std::string indexColumn; // 被索引的列（单列 = 列名；复合 = "a,b" 逗号拼接，
+                                 // 兼容既有打印/golden 输出；新代码请用 indexColumns）
+        std::vector<std::string> indexColumns; // 复合索引的列清单（按声明序，≥1 项）
     };
 
     struct CELLA_Program

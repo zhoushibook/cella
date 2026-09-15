@@ -77,8 +77,7 @@ void DumpTree(BufferPoolManager* bpm, page_id_t pid, int depth,
 int main(int argc, char** argv) {
   const int32_t N = (argc > 1) ? std::atoi(argv[1]) : 600;
   auto bpm = MakeBpm(512);
-  BPlusTree::KeySpec spec;
-  spec.type = ValueType::kInt32;
+  BPlusTree::KeySpec spec = BPlusTree::KeySpec::Single(ValueType::kInt32, 0);
   BPlusTree t(bpm.get(), spec);
   page_id_t root = kInvalidPageId;
   (void)t.Create(&root);

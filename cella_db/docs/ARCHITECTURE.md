@@ -37,7 +37,7 @@
 | `include/cella/db/engine/` | 门面、会话、SQL 文本工具 | ✅ |
 | `include/cella/db/auth/` | 身份库、口令哈希、权限模型、访问控制语句解析 | ✅ |
 | `src/cella/db/**` | 与头文件一一对应的实现 | ❌ |
-| `tests/` | mini_test + 8 个测试文件（108 用例） | ❌ |
+| `tests/` | mini_test + 12 个测试文件（194 用例，含索引/代价模型套件） | ❌ |
 | `examples/` | API 速览 + 并发现场演示 | ❌ |
 | `sql/` | 3 个可执行演示脚本 | ❌ |
 
@@ -316,7 +316,7 @@ OpSort   排序（可见列优先解析，解析不到才用隐藏列），最�
 | 产物 | 说明 |
 | --- | --- |
 | `build/cella_db/cella_db.exe` | 完整系统 CLI（REPL / 脚本 / 元命令） |
-| `build/cella_db/cella_db_tests.exe` | 108 用例 / 989 断言 |
+| `build/cella_db/cella_db_tests.exe` | 194 用例 / 1525 断言 |
 | `build/cella_db/api_quickstart.exe` | 30 秒 API 速览 |
 | `build/cella_db/concurrency_demo.exe` | 并发与死锁现场演示 |
 | `build/cella_sql/cella_sql.exe` | 原编译器 CLI（保留，行为不变） |

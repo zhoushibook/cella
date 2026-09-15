@@ -125,12 +125,23 @@ uint16_t CatalogTable::MaxLenAt(size_t index) const {
 }
 
 int CatalogTable::PrimaryKeyColumnIndex() const {
+  // 仅在「单列主键」时返回下标；无主键或复合主键返回 -1 ——
+  // 所有单列主键索引（<table>_pk）相关路径据此自动跳过复合主键表。
+  const std::vector<int> cols = PrimaryKeyColumns();
+  return cols.size() == 1 ? cols[0] : -1;
+}
+
+std::vector<int> CatalogTable::PrimaryKeyColumns() const {
+  // 复合主键的列序 = 列声明序。一旦为复合主键建 B+ 树索引，键序就有了语义
+  //（最左前缀匹配、唯一性判定的元组顺序都依赖它）——本系统约定：
+  // **主键序 = 声明序**（5 段旗标编码不保留书写序，故按列下标自然序返回）。
+  std::vector<int> out;
   for (size_t i = 0; i < columns.size(); ++i) {
     if (columns[i].primary_key) {
-      return static_cast<int>(i);
+      out.push_back(static_cast<int>(i));
     }
   }
-  return -1;
+  return out;
 }
 
 // ── CatalogManager：系统表 ─────────────────────────────────
@@ -347,6 +358,46 @@ bool CatalogManager::DecodeRow(const storage::Record& row, CatalogTable* out) co
   return DecodeColumns(cols.str_val, &out->columns);
 }
 
+// ── 索引列清单 ⇄ 逗号拼接文本 ──────────────────────────────
+// 标识符不含逗号，因此 "a,b" 拼接是无歧义的（cella_index 行格式不变）。
+std::string JoinIndexColumns(const std::vector<std::string>& cols) {
+  std::string joined;
+  for (size_t i = 0; i < cols.size(); ++i) {
+    if (i > 0) {
+      joined += ",";
+    }
+    joined += cols[i];
+  }
+  return joined;
+}
+
+std::vector<std::string> SplitIndexColumns(const std::string& joined) {
+  std::vector<std::string> cols;
+  std::string cur;
+  for (char c : joined) {
+    if (c == ',') {
+      if (!cur.empty()) {
+        cols.push_back(cur);
+      }
+      cur.clear();
+    } else {
+      cur.push_back(c);
+    }
+  }
+  if (!cur.empty()) {
+    cols.push_back(cur);
+  }
+  return cols;
+}
+
+std::string CatalogIndex::JoinedColumns() const {
+  // columns 是权威字段；column 是它的持久化形态，两者保持一致
+  if (!columns.empty()) {
+    return JoinIndexColumns(columns);
+  }
+  return column;
+}
+
 bool CatalogManager::DecodeIndexRow(const storage::Record& row, CatalogIndex* out) const {
   if (row.value_count() < 6) {
     return false;
@@ -368,6 +419,8 @@ bool CatalogManager::DecodeIndexRow(const storage::Record& row, CatalogIndex* ou
   out->name = name.str_val;
   out->table = tbl.str_val;
   out->column = col.str_val;
+  // 复合适配：column 列是逗号拼接的列清单（单列 = 单个名字）
+  out->columns = SplitIndexColumns(col.str_val);
   out->unique = uniq.int32_val != 0;
   out->root_page_id = static_cast<uint32_t>(root.int32_val);
   out->created_at = static_cast<int64_t>(cat.int32_val);
@@ -434,7 +487,8 @@ DbStatus CatalogManager::WriteIndexRow(const CatalogIndex& index) {
   storage::Record rec;
   rec.AddValue(storage::Value::Varchar(index.name));
   rec.AddValue(storage::Value::Varchar(index.table));
-  rec.AddValue(storage::Value::Varchar(index.column));
+  // 列清单统一逗号拼接落库（单列 = 原名，与历史行逐字节一致）
+  rec.AddValue(storage::Value::Varchar(index.JoinedColumns()));
   rec.AddValue(storage::Value::Int(index.unique ? 1 : 0));
   rec.AddValue(storage::Value::Int(static_cast<int32_t>(index.root_page_id)));
   rec.AddValue(storage::Value::Int(static_cast<int32_t>(index.created_at)));
@@ -870,8 +924,21 @@ std::string CatalogManager::DescribeTable(const std::string& name) const {
   }
   std::ostringstream os;
   os << t->name << " (表号 #" << t->table_id << ", 首数据页 " << t->first_page_id;
-  if (t->PrimaryKeyColumnIndex() >= 0) {
-    os << ", 主键 " << t->columns[static_cast<size_t>(t->PrimaryKeyColumnIndex())].name;
+  const std::vector<int> pk_cols = t->PrimaryKeyColumns();
+  if (!pk_cols.empty()) {
+    os << ", 主键 ";
+    if (pk_cols.size() == 1) {
+      os << t->columns[static_cast<size_t>(pk_cols[0])].name;
+    } else {
+      os << "(";
+      for (size_t i = 0; i < pk_cols.size(); ++i) {
+        if (i != 0) {
+          os << ", ";
+        }
+        os << t->columns[static_cast<size_t>(pk_cols[i])].name;
+      }
+      os << ")";
+    }
   }
   os << ")\n";
   for (size_t i = 0; i < t->columns.size(); ++i) {

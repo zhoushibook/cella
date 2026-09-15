@@ -69,24 +69,33 @@ size_t ChildIndexFor(const IndexNode& node, const std::string& target) {
 
 BPlusTree::BPlusTree(BufferPoolManager* bpm, KeySpec spec) : bpm_(bpm), spec_(spec) {}
 
+// ── 键长上限（建索引时校验用）───────────────────────────────
+// 最坏叶子键 = NULL 位图（复合键）+ Σ(各列最大编码) + 行定位 5B。
+size_t BPlusTree::MaxLeafKeyBytes(const KeySpec& spec) {
+  size_t total = NullBitmapBytes(spec.columns.size());
+  for (const Column& c : spec.columns) {
+    total += MaxEncodedColumnLen(c.type, c.max_len);
+  }
+  return total + kIndexLeafRidBytes;
+}
+
+bool BPlusTree::KeyFitsPage(uint32_t page_size, const KeySpec& spec, size_t min_keys) {
+  if (spec.empty()) {
+    return false;
+  }
+  // 每个最坏键占：键本体 + 槽项 4B（行定位已计入 MaxLeafKeyBytes）
+  const size_t per_key = MaxLeafKeyBytes(spec) + 4;
+  // 页内可用 = 页大小 - 数据区起点 - 至少 1 个子指针位（内部节点骨架）
+  const size_t avail = static_cast<size_t>(page_size) - kIndexDataBegin - 4;
+  return avail / per_key >= min_keys;
+}
+
 uint16_t BPlusTree::MaxKeys(bool internal) const {
-  // 键的最大编码长度：定长类型可精确算，变长按 max_len 上限 + 结尾标记 + 转义余量
-  size_t max_key = 0;
-  switch (spec_.type) {
-    case ValueType::kBool:
-      max_key = 2;
-      break;
-    case ValueType::kInt32:
-    case ValueType::kFloat:
-      max_key = 4;
-      break;
-    case ValueType::kInt64:
-    case ValueType::kDouble:
-      max_key = 8;
-      break;
-    default:
-      max_key = static_cast<size_t>(spec_.max_len > 0 ? spec_.max_len : 255) * 2 + 2 + 2;
-      break;
+  // 键的最大编码长度：定长列可精确算，变长按 max_len 上限 + 结尾标记 + 转义余量；
+  // 复合键还要加 NULL 位图。对单列与复合键用同一套求和逻辑（单列 = 1 项）。
+  size_t max_key = NullBitmapBytes(spec_.columns.size());
+  for (const Column& c : spec_.columns) {
+    max_key += MaxEncodedColumnLen(c.type, c.max_len);
   }
   const uint32_t page_size = bpm_->page_size();
   return MaxKeysPerIndexPage(page_size, max_key, internal);
@@ -494,6 +503,52 @@ Status BPlusTree::ScanRange(const std::string* lo_column_key, const std::string*
 
 Status BPlusTree::Scan(ScanLeafCallback cb) {
   return ScanRange(nullptr, nullptr, true, std::move(cb));
+}
+
+// ── 前缀扫描（复合索引「最左前缀」原语）─────────────────────
+// 实现：定位到 prefix 应落入的叶子（FindLeaf 直接吃列值键形态的 probe，
+// 前缀本身就是合法的「部分元组编码」，下降比较按前缀语义进行），
+// 然后沿叶子链表扫描：
+//   * 列值部分 < prefix          → 还没到，跳过；
+//   * 列值部分以 prefix 开头      → 命中，回调；
+//   * 列值部分 > prefix 且非前缀  → 已越过前缀区（键有序，后面不会再有）→ 停。
+// 判断只做**字节前缀比较**，完全不依赖解码 —— 因此对含任意字节
+// （包括 0x00/0xFF）的 VARCHAR 也正确。
+Status BPlusTree::ScanPrefix(const std::string& prefix, const ScanCallback& cb) {
+  if (!valid() || prefix.empty()) {
+    return Status::OK();
+  }
+  page_id_t leaf = kInvalidPageId;
+  const Status s = FindLeaf(&leaf, prefix);
+  if (!s.ok()) {
+    return s;
+  }
+  page_id_t cur = leaf;
+  while (cur != kInvalidPageId) {
+    PageGuard g(bpm_, bpm_->get_page(cur));
+    if (!g.valid()) {
+      return Status::Error(StatusCode::kPageNotFound, "索引叶子页不存在");
+    }
+    IndexNode node(g.get());
+    for (size_t i = 0; i < node.key_count(); ++i) {
+      std::string k;
+      if (!node.GetKey(i, &k)) {
+        continue;
+      }
+      const std::string k_col = StripLeafRowId(k);
+      if (k_col < prefix) {
+        continue;                       // 还没到前缀区
+      }
+      if (k_col.size() < prefix.size() || k_col.compare(0, prefix.size(), prefix) != 0) {
+        return Status::OK();            // 越过前缀区 → 结束
+      }
+      if (!cb(k)) {
+        return Status::OK();            // 回调要求提前终止
+      }
+    }
+    cur = node.right_sibling();
+  }
+  return Status::OK();
 }
 
 Status BPlusTree::ScanAll(std::vector<std::string>* out) {

@@ -38,8 +38,7 @@ int main(int argc, char** argv) {
   const bool desc = (argc > 2 && std::string(argv[2]) == "desc");
 
   auto bpm = MakeBpm(2048);
-  BPlusTree::KeySpec spec;
-  spec.type = ValueType::kInt32;
+  BPlusTree::KeySpec spec = BPlusTree::KeySpec::Single(ValueType::kInt32, 0);
   BPlusTree t(bpm.get(), spec);
   page_id_t root = kInvalidPageId;
   (void)t.Create(&root);

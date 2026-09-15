@@ -480,3 +480,59 @@ MT_TEST(执行_rowid伪列) {
   // ⑦ 排序键也能用 rowid
   MT_CHECK(e.Run("get id in d ordered rowid desc;").all_ok());
 }
+
+MT_TEST(执行_复合主键) {
+  Engine e("exec_pk_composite");
+  // 表级复合主键：PRIMARY KEY (sid, cid)
+  MT_CHECK(e
+               .Run("CREATE TABLE enroll(sid INT, cid INT, grade FLOAT, PRIMARY KEY (sid, cid));")
+               .all_ok());
+  // 目录：两个主键列（声明序），均隐含 NOT NULL
+  const CatalogTable *meta = e.engine.catalog().FindTable("enroll");
+  MT_CHECK(meta != nullptr);
+  const std::vector<int> pk_cols = meta->PrimaryKeyColumns();
+  MT_EQ(pk_cols.size(), 2u);
+  MT_EQ(pk_cols[0], 0);
+  MT_EQ(pk_cols[1], 1);
+  MT_CHECK(meta->columns[0].not_null);
+  MT_CHECK(meta->columns[1].not_null);
+  // 复合主键现在也建唯一 B+ 树（B+ 树已支持复合键）：enroll_pk，
+  // 键 = (sid, cid) 按声明序编码，唯一性由索引元组前缀比较保证
+  const CatalogIndex *pk_ix = e.engine.catalog().FindIndex("enroll_pk");
+  MT_CHECK(pk_ix != nullptr);
+  MT_CHECK(pk_ix != nullptr && pk_ix->unique);
+  MT_CHECK(pk_ix != nullptr && pk_ix->columns.size() == 2u);
+
+  MT_CHECK(e.Run("INSERT INTO enroll VALUES (1,10,88.5),(1,11,90.0),(2,10,75.0);").all_ok());
+  // 组合值重复 → DB-516（首列相同但次列不同则合法）
+  MT_CHECK(e.Run("INSERT INTO enroll VALUES (1,10,50.0);").statements[0].status.code() ==
+           DbCode::kPrimaryKeyViolation);
+  // 任意一个主键列写 NULL 被隐含 NOT NULL 拦下（编译期）
+  MT_CHECK(!e.Run("INSERT INTO enroll VALUES (NULL,10,50.0);").all_ok());
+  MT_CHECK(!e.Run("INSERT INTO enroll VALUES (1,NULL,50.0);").all_ok());
+
+  // 更新涉及主键列：撞其它行 → 拒绝；改回自身原值 → 允许；多行改成同键 → 拒绝
+  // 当前行：(1,10) (1,11) (2,10)
+  MT_CHECK(e.Run("UPDATE enroll SET cid = 99 limit sid = 1 and cid = 10;").all_ok()); // → (1,99)
+  // (1,99) 改成 cid=11 → 与 (1,11) 的组合键 (1,11) 撞车
+  MT_CHECK(e.Run("UPDATE enroll SET cid = 11 limit sid = 1 and cid = 99;").statements[0]
+               .status.code() == DbCode::kPrimaryKeyViolation);
+  // 改回自身原值 (1,99) → (1,99)：排除自身，放行
+  MT_CHECK(e.Run("UPDATE enroll SET cid = 99 limit sid = 1 and cid = 99;").all_ok());
+  // 全表改 cid=50 → (1,50) 出现两次（多行改成同一组合键）→ 拒绝
+  MT_CHECK(e.Run("UPDATE enroll SET cid = 50;").statements[0].status.code() ==
+           DbCode::kPrimaryKeyViolation);
+
+  // 删除后组合键可重用；重启后目录与约束都还在
+  MT_CHECK(e.Run("DELETE in enroll limit sid = 1 and cid = 99;").all_ok()); // 行：(1,11) (2,10)
+  MT_CHECK(e.Run("INSERT INTO enroll VALUES (1,99,60.0);").all_ok());
+  e.Close();
+  MT_CHECK(e.Reopen());
+  const CatalogTable *meta2 = e.engine.catalog().FindTable("enroll");
+  MT_CHECK(meta2 != nullptr);
+  MT_EQ(meta2->PrimaryKeyColumns().size(), 2u);
+  MT_CHECK(e.Run("INSERT INTO enroll VALUES (1,99,1.0);").statements[0].status.code() ==
+           DbCode::kPrimaryKeyViolation);
+  MT_EQ(RowsText(e.Run("get cid in enroll ordered cid asc;").statements[0].result),
+        std::string("10\n11\n99"));
+}

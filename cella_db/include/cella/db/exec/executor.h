@@ -71,6 +71,10 @@ struct AccessPathChoice {
   storage::Value lower;
   storage::Value upper;
   bool equality = false;         // 等值定位（比范围更省）
+  // 复合索引「全键等值」：每列都有 `列 = 常量` 下推（按索引声明序排列）。
+  // 非空时 ScanIndexRids 走前缀扫描原语（ScanPrefix），不再用 lower/upper。
+  // 最左前缀规则：只约束了前几列的谓词暂不下推（第一版只做全键等值）。
+  std::vector<storage::Value> eq_tuple;
   // 范围选择率 = 谓词区间宽度 / 索引列值域宽度（0 = 无统计，用经验值）。
   // 由 ChooseAccessPath 从索引的 min/max（首末叶子键）算出 —— 索引有序，
   // 这等价于一份免费的一维统计。没有它，窄范围与宽范围会被估成同一选择率。
@@ -310,11 +314,13 @@ class Executor : public wal::IUndoApplier {
                             storage::Record* row);
 
   // ── 索引维护（P1.5）──────────────────────────────────────────  // 表上全部有效索引的运行时句柄：元数据 + 已 Attach 的 B+ 树。
-  // 键按列下标升序，便于多列维护时保持稳定顺序。
+  // 键按首个索引列下标升序，便于多索引维护时保持稳定顺序。
   struct IndexHandle {
     const CatalogIndex* meta = nullptr;
     std::unique_ptr<storage::BPlusTree> tree;
-    int column = -1;  // 索引列在表内的下标；< 0 表示索引已失效（列被删）
+    // 索引列在表内的下标（按索引声明序；单列索引 = 1 个元素）。
+    // 列已被删 → 该索引整条失效（跳过维护），不会出现部分下标无效。
+    std::vector<int> columns;
   };
 
   // 打开一张表的全部索引（元数据 + B+ 树句柄）。须在 storage_mutex_ 临界区内调用。
@@ -322,15 +328,19 @@ class Executor : public wal::IUndoApplier {
   DbStatus OpenTableIndexes(const CatalogTable& table, std::vector<IndexHandle>* out);
 
   // 把一个已（反）规范化的行值编码成该索引的叶子键。
-  // row_values 必须与表列一一对齐（含被索引列）。
+  // row_values 必须与表列一一对齐（含全部被索引列）。
+  // 编码输入是 CoerceValue 截断后的同一行值 —— DELETE 旧键与 INSERT 新键
+  // 两侧字节必然一致（VARCHAR 截断场景的一致性由同一数据源保证）。
   static bool IndexKeyOf(const IndexHandle& ix, const std::vector<storage::Value>& row_values,
                          const storage::Rid& rid, std::string* leaf_key);
 
-  // 唯一性检查：值 v 是否已被「rid 之外」的行占用。
-  // 返回 true 表示可用（unique_ok=true 且 busy=false），busy=true 表示冲突。
-  // 仅对 ix.meta->unique 有意义；非唯一索引直接判为可用。
-  DbStatus IndexValueFree(const IndexHandle& ix, const storage::Value& v, const storage::Rid& rid,
-                          bool* busy);
+  // 唯一性检查：行值元组是否已被「rid 之外」的行占用。
+  // 实现是**字节前缀比较**（ScanPrefix 圈出同元组的叶子键），不经过解码 ——
+  // 编码（含 NULL 位图）是单射，字节相等 ⇔ 元组相等。
+  // NULL 语义（与单列时代一致，已文档化）：元组任一列为 NULL → 不参与唯一
+  // 判定，直接放行（标准 SQL 行为；PK 列隐含 NOT NULL，不受影响）。
+  DbStatus IndexValueFree(const IndexHandle& ix, const std::vector<storage::Value>& row_values,
+                          const storage::Rid& rid, bool* busy);
 
   // 向全部索引插入某行的索引项（唯一索引先查重）。冲突返回 kUniqueViolation / kPrimaryKeyViolation。
   DbStatus IndexRowInsert(std::vector<IndexHandle>* indexes, const CatalogTable& table,
@@ -370,11 +380,19 @@ class Executor : public wal::IUndoApplier {
   bool TryIndexRange(const CatalogTable& table, const CatalogIndex& index, int column,
                      const cella::CELLA_Expr* pred, AccessPathChoice* choice) const;
 
+  // 复合索引的谓词下推（第一版：全键等值）。要求谓词（AND 树）为**每一列**
+  // 都提供 `列 = 常量` 约束（列匹配大小写不敏感），否则不下推 ——
+  // 部分前缀匹配列为第二步扩展。成功时填 eq_tuple 并返回 true。
+  bool TryCompositeEquality(const CatalogTable& table, const CatalogIndex& index,
+                            const std::vector<int>& columns, const cella::CELLA_Expr* pred,
+                            AccessPathChoice* choice) const;
+
   // 谓词里是否引用了某个列（用于判断索引覆盖扫描的可行性）。
   static bool PredRefsColumn(const cella::CELLA_Expr* pred, const std::string& column);
   // 谓词是否引用了「索引列之外」的表列（引用则必须回表，不能 index-only）。
+  // 接收索引列集合（单列索引 = 1 个元素），复合索引天然支持。
   static bool PredRefsColumnOutside(const cella::CELLA_Expr* pred, const CatalogTable& table,
-                                    int index_column);
+                                    const std::vector<int>& index_columns);
 
   // 为一次表访问挑选访问路径。pred 是该表上方最近的过滤谓词（可为空）。
   // 决策顺序：
@@ -462,8 +480,10 @@ class Executor : public wal::IUndoApplier {
   // 规则：索引列的集合 ⊇ 语句需要的列 → 可以 index-only；否则必须回表。
   // 保守取向：**只要不确定就回表**（多读一次只是慢，漏列是错的）。
   void SetNeededColumns(const std::string& table, std::vector<std::string> columns);
-  // 该表在本语句中是否用到了 index_column 之外的列（true = 需要回表）
-  bool StmtNeedsOtherColumn(const std::string& table, int index_column) const;
+  // 该表在本语句中是否用到了「索引列集合之外」的列（true = 需要回表）。
+  // 单列与复合索引统一走列集合判定。
+  bool StmtNeedsOtherColumn(const std::string& table,
+                            const std::vector<int>& index_columns) const;
   // 遍历优化后计划，把各表需要的列登记进 needed_cols_
   void RegisterNeededColumns(const cella::CELLA_PlanNode& plan);
   void CollectNeededColumns(const cella::CELLA_PlanNode& node, Executor* self);
